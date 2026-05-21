@@ -48,3 +48,8 @@ ExampleDesigns/Sandbox/*
 # Override the parent repo's broad ignores: README screenshots are intentional
 !screenshots/
 !screenshots/*.png
+
+# Local-only sanitisation script. NOT committed: it hardcodes the strings it
+# scrubs from the Sandbox example (incl. the employer name), so publishing it
+# would re-leak exactly what it removes. Run it before each commit.
+sanitize_sandbox.ps1
