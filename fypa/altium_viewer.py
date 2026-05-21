@@ -44,7 +44,7 @@ import numpy as np
 import shapely.geometry as _sg
 import shapely.prepared as _sp
 
-from gl_mesh_viewer import GLMeshViewer, MarkerGroup, _install_default_surface_format
+from fypa.gl_mesh_viewer import GLMeshViewer, MarkerGroup, _install_default_surface_format
 
 
 # Application icon — shown in the title bar AND Windows taskbar.
@@ -55,7 +55,10 @@ from gl_mesh_viewer import GLMeshViewer, MarkerGroup, _install_default_surface_f
 # Windows because Qt's setWindowIcon → WM_SETICON path uses native
 # Windows icon resources to populate the taskbar; an SVG-derived
 # QPixmap doesn't always make that round-trip reliably.
-_ICON_DIR: Path = Path(__file__).parent / "assets"
+# assets/ sits at the repo root — and at the bundle root when frozen by
+# PyInstaller (the spec maps it there) — i.e. one level up from this fypa/
+# package, hence ``.parent.parent``.
+_ICON_DIR: Path = Path(__file__).resolve().parent.parent / "assets"
 _ICON_PATH_ICO: Path = _ICON_DIR / "icon.ico"
 _ICON_PATH_SVG: Path = _ICON_DIR / "icon.svg"
 # Title-bar variant — text-only "FYPA" wordmark. Used as ICON_SMALL so the
@@ -2118,19 +2121,19 @@ class _SolveWorker(QThread):
         # Windows flags the window "Not Responding" on large boards.
         self.setPriority(QThread.LowPriority)
         try:
-            from altium_loader import (
+            from fypa.altium_loader import (
                 build_problem,
                 build_solve_metadata,
                 load_project,
             )
-            from lean_solution import to_lean_solution
+            from fypa.lean_solution import to_lean_solution
             from pdnsolver import mesh as _pdn_mesh
             from pdnsolver import solver as _pdn_solver
 
             # Resolve the PcbDoc up-front so the cache key is stable.
             pcbdoc_resolved: Path | None = None
             try:
-                from FYPA import _resolve_pcbdoc
+                from fypa.cli import _resolve_pcbdoc
                 pcbdoc_resolved = _resolve_pcbdoc(
                     self._prjpcb_path,
                     str(self._pcbdoc_selector) if self._pcbdoc_selector else None,
@@ -2183,7 +2186,7 @@ class _SolveWorker(QThread):
             if self._use_design_cache and pcbdoc_resolved is not None:
                 self.stage_changed.emit("Checking design-info cache…")
                 try:
-                    from FYPA import (
+                    from fypa.cli import (
                         _design_info_fingerprint,
                         _try_load_cached_design_info,
                     )
@@ -2222,7 +2225,7 @@ class _SolveWorker(QThread):
                 # first subsequent *non-clean* load repopulates it.
                 if self._use_design_cache and pcbdoc_resolved is not None:
                     try:
-                        from FYPA import (
+                        from fypa.cli import (
                             _design_info_fingerprint,
                             _save_cached_design_info,
                         )
@@ -2249,7 +2252,7 @@ class _SolveWorker(QThread):
 
             if not loaded.is_solveable:
                 _log = logging.getLogger(__name__)
-                _log_file = Path(__file__).parent / "log" / "fypa.log"
+                from fypa.cli import _LOG_FILE as _log_file
                 try:
                     # diagnostic_summary() touches loaded.geometry, which
                     # lazily runs the heavy per-layer polygon union. Give
@@ -2382,7 +2385,7 @@ class _SolveWorker(QThread):
                 )
             else:
                 try:
-                    from FYPA import (
+                    from fypa.cli import (
                         _project_fingerprint,
                         _save_cached_solution,
                         _solve_cache_path,
@@ -2442,8 +2445,8 @@ class _SolveWorker(QThread):
         Skipped overrides (layer not in stackup) are silently ignored.
         """
         from dataclasses import replace as _dc_replace
-        from altium_geometry import build_layer_geometries
-        from altium_loader import LoadedProject
+        from fypa.altium_geometry import build_layer_geometries
+        from fypa.altium_loader import LoadedProject
 
         new_stackup = []
         for s in loaded.extracted.stackup:
@@ -2476,7 +2479,7 @@ class _SolveWorker(QThread):
         user deleted a SINK directive (or removed an indexed channel) in
         Altium between solves."""
         from dataclasses import replace as _dc_replace
-        from altium_annotations import SinkSpec
+        from fypa.altium_annotations import SinkSpec
         directives = loaded.annotations.directives
         for i, d in enumerate(directives):
             if not isinstance(d, SinkSpec):
@@ -2495,7 +2498,7 @@ def _try_solve_cache(prjpcb_path: Path,
     handlers don't have to know about fingerprints; cache misses + import
     failures are silently treated as ``None``."""
     try:
-        from FYPA import (
+        from fypa.cli import (
             _project_fingerprint,
             _try_load_cached_solution,
         )
@@ -2530,7 +2533,7 @@ def _choose_pcbdoc(parent: QWidget | None, prjpcb_path: Path,
     pre-selected (handy for re-runs of a previously-chosen board).
     """
     try:
-        from altium_extract import list_pcbdoc_paths
+        from fypa.altium_extract import list_pcbdoc_paths
         paths = list_pcbdoc_paths(prjpcb_path)
     except Exception as e:
         logging.getLogger(__name__).warning(
@@ -2634,20 +2637,18 @@ def _abort_solve_worker(owner) -> None:
 # module-level handlers below back its actions so the behaviour is
 # identical from either window.
 
-# Project home page, shown in the About dialog. PLACEHOLDER — once the real
-# repository URL is confirmed, set it here and restore the clickable <a> link
-# in _show_about_dialog (drop the plain-text rendering for the placeholder).
-_GITHUB_URL: str = "{ GITHUB LINK TBD }"
+# Project home page, shown as a clickable link in the About dialog.
+_GITHUB_URL: str = "https://github.com/anarthrous-eda/FYPA"
 
 
 def _open_log_file(parent: QWidget) -> None:
     """Help > Open Log — open FYPA's log file with the OS default handler.
 
-    The path comes from :data:`FYPA._LOG_FILE`, which is anchored next to
+    The path comes from :data:`fypa.cli._LOG_FILE`, which is anchored next to
     FYPA.exe in a PyInstaller build and in the source tree's ``log/`` folder
     in a dev checkout — so this works identically either way."""
     try:
-        from FYPA import _LOG_FILE
+        from fypa.cli import _LOG_FILE
         log_path = Path(_LOG_FILE)
     except Exception as e:  # pragma: no cover - defensive
         QMessageBox.warning(parent, "Open Log",
@@ -2672,7 +2673,7 @@ def _show_about_dialog(parent: QWidget) -> None:
     """Help > About — a small themed dialog showing the version and a
     clickable link to the project's GitHub page."""
     try:
-        from FYPA import __version__ as fypa_version
+        from fypa.cli import __version__ as fypa_version
     except Exception:
         fypa_version = "unknown"
     t = _T()
@@ -2700,11 +2701,14 @@ def _show_about_dialog(parent: QWidget) -> None:
         f"<h2 style='color:{t['fg']}; margin:6px 0 0 0;'>FYPA</h2>"
         f"<p style='color:{t['accent']}; margin:2px 0;'>Altium PDN Analyser</p>"
         f"<p style='color:{t['fg_muted']}; margin:2px 0;'>Version {fypa_version}</p>"
-        f"<p style='color:{t['fg_dim']}; margin:12px 0 2px 0;'>{_GITHUB_URL}</p>"
+        f"<p style='margin:12px 0 2px 0;'>"
+        f"<a href='{_GITHUB_URL}' style='color:{t['accent']};'>{_GITHUB_URL}</a>"
+        "</p>"
         "</div>"
     )
     body.setTextFormat(Qt.RichText)
     body.setAlignment(Qt.AlignCenter)
+    body.setOpenExternalLinks(True)
     layout.addWidget(body)
 
     layout.addSpacing(6)
@@ -2887,7 +2891,7 @@ class LauncherWindow(QMainWindow):
         proceed, pcbdoc_path = _choose_pcbdoc(self, prjpcb_path)
         if not proceed:
             return
-        from altium_loader import SolveSettings
+        from fypa.altium_loader import SolveSettings
         settings = SolveSettings()
         settings.apply_to_modules()
 
@@ -2983,7 +2987,7 @@ class LauncherWindow(QMainWindow):
         if not path_str:
             return
         try:
-            from FYPA import _load_solution_pickle
+            from fypa.cli import _load_solution_pickle
             solution, metadata = _load_solution_pickle(Path(path_str))
         except Exception as e:
             QMessageBox.critical(
@@ -3059,7 +3063,7 @@ class PdnViewer(QMainWindow):
         # fields with whatever the user just submitted. Falls back to the
         # values recorded in the pickle (which match the FEM that produced
         # this solution) so opening a fresh pickle always shows the truth.
-        from altium_loader import SolveSettings as _SolveSettings
+        from fypa.altium_loader import SolveSettings as _SolveSettings
         if initial_settings is None:
             initial_settings = _SolveSettings.from_metadata(metadata)
         self._solve_settings = initial_settings
@@ -8707,7 +8711,7 @@ class PdnViewer(QMainWindow):
         """Build a QGroupBox containing one labelled QLineEdit per field
         in ``fields``. The current value is pulled from ``source`` via
         ``getattr``; default-value hints come from a fresh SolveSettings."""
-        from altium_loader import SolveSettings as _SolveSettings
+        from fypa.altium_loader import SolveSettings as _SolveSettings
         from dataclasses import fields as _dc_fields
         defaults = _SolveSettings()
         # The display-only fields aren't in SolveSettings — fall back to
@@ -9363,7 +9367,7 @@ class PdnViewer(QMainWindow):
     def _on_settings_reset(self) -> None:
         """Restore every Settings-tab field to its built-in default. The
         user still has to press Re-run Solver to commit."""
-        from altium_loader import SolveSettings as _SolveSettings
+        from fypa.altium_loader import SolveSettings as _SolveSettings
         defaults = _SolveSettings()
         for key, *_ in self._SETTINGS_FIELDS:
             edit = getattr(self, f"settings_edit_{key}", None)
@@ -9458,7 +9462,7 @@ class PdnViewer(QMainWindow):
         ``(SolveSettings, via_current_warn_a, display_percentile,
         sink_overrides, stackup_overrides)``. Raises ``ValueError``
         (caught by the Re-run handler) on bad input."""
-        from altium_loader import SolveSettings as _SolveSettings
+        from fypa.altium_loader import SolveSettings as _SolveSettings
         kwargs: dict[str, float] = {}
         for key, label, *_rest in self._SETTINGS_FIELDS:
             edit = getattr(self, f"settings_edit_{key}", None)
@@ -9586,7 +9590,7 @@ class PdnViewer(QMainWindow):
         if not prjpcb:
             return ""
         try:
-            from FYPA import _project_cache_dir
+            from fypa.cli import _project_cache_dir
             cache_dir = _project_cache_dir(
                 Path(prjpcb), Path(pcbdoc) if pcbdoc else None,
             )
@@ -9662,7 +9666,7 @@ class PdnViewer(QMainWindow):
         if not path_str:
             return
         try:
-            from FYPA import save_solution_file
+            from fypa.cli import save_solution_file
             save_solution_file(Path(path_str), self.solution, self.metadata)
         except Exception as e:
             QMessageBox.critical(
@@ -9689,7 +9693,7 @@ class PdnViewer(QMainWindow):
         if not path_str:
             return
         try:
-            from FYPA import _load_solution_pickle
+            from fypa.cli import _load_solution_pickle
             solution, metadata = _load_solution_pickle(Path(path_str))
         except Exception as e:
             QMessageBox.critical(

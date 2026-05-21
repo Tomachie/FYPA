@@ -43,7 +43,7 @@ import shapely.affinity
 import shapely.geometry
 import shapely.ops
 
-from altium_extract import (
+from fypa.altium_extract import (
     ExtractedProject,
     NO_NET,
     NO_POLYGON,
@@ -1135,7 +1135,7 @@ def _save_quicklook(layers: list[GeometryLayer], out_path: str) -> None:
 
 if __name__ == "__main__":
     import sys
-    from altium_extract import extract_project
+    from fypa.altium_extract import extract_project
 
     logging.basicConfig(level=logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")

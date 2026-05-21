@@ -265,10 +265,10 @@ along with a fingerprint of every input that affects the solve:
 
 * The `.PrjPcb` plus every `.PcbDoc` / `.SchDoc` it references
   (parsed from the `DocumentPath=` lines)
-* The tool's own solver-affecting source files
-  (`altium_extract.py`, `altium_annotations.py`, `altium_geometry.py`,
-  `altium_loader.py`, `FYPA.py`, and the modified `pdnsolver/`
-  modules)
+* The tool's own solver-affecting source files (`fypa/altium_extract.py`,
+  `fypa/altium_annotations.py`, `fypa/altium_geometry.py`,
+  `fypa/altium_loader.py`, `fypa/cli.py`, `fypa/lean_solution.py`, and the
+  modified `pdnsolver/` modules)
 
 On subsequent runs the fingerprint is recomputed and compared. If
 nothing has changed the cached solution is reused — typical startup
@@ -287,12 +287,12 @@ the tool folder — they'll regenerate on the next run.
 
 ### Launching directly from Altium
 
-A small DelphiScript ([Run_FYPA.pas](Run_FYPA.pas)) is bundled
+A small DelphiScript ([Run_FYPA.pas](packaging/Run_FYPA.pas)) is bundled
 that fires the tool against whichever `.PrjPcb` is focused in Altium —
 no need to copy paths to a console. One-time setup:
 
-1. **Point the script at this directory.** Open `Run_FYPA.pas` in a
-   text editor and check the `SCRIPT_DIR` constant near the top:
+1. **Point the script at this directory.** Open `packaging/Run_FYPA.pas`
+   in a text editor and check the `SCRIPT_DIR` constant near the top:
    ```pascal
    SCRIPT_DIR = 'C:\path\to\FYPA';
    ```
@@ -308,7 +308,7 @@ no need to copy paths to a console. One-time setup:
 
 3. **Register the script in Altium.** *DXP > Scripting System > Script
    Projects*, add a new script project (or open an existing one) and
-   add `Run_FYPA.pas` to it.
+   add `packaging/Run_FYPA.pas` to it.
 
 4. **Run it.** With a `.PrjPcb` open and focused in the *Projects*
    panel, right-click the `Run` procedure in the Script Editor and
@@ -342,13 +342,13 @@ pip install pyinstaller
 
 ### Building
 
-From the project root, double-click **`build_dist.bat`** (or run it from a
-terminal). It will:
+From the project root, double-click **`packaging\build_dist.bat`** (or run
+it from a terminal). It will:
 
 1. Activate the venv
 2. Auto-install PyInstaller if it is not already present
 3. Wipe any previous `build/` and `dist/` folders
-4. Run `pyinstaller FYPA.spec`
+4. Run `pyinstaller packaging\FYPA.spec`
 5. Copy `README.md` into the staged output so it travels with the bundle
 6. Delete the intermediate `build/` folder
 7. Zip the staged `dist\FYPA\` folder into a single distributable archive
@@ -389,7 +389,7 @@ re-extracting a new build over the old folder.
 
 ### Customising the build
 
-All PyInstaller settings live in **`FYPA.spec`**. Notable options:
+All PyInstaller settings live in **`packaging\FYPA.spec`**. Notable options:
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -398,20 +398,24 @@ All PyInstaller settings live in **`FYPA.spec`**. Notable options:
 | `hiddenimports` | PyOpenGL, PySide6 GL, scipy, matplotlib | Extend if the app crashes on launch with `ModuleNotFoundError` — add the missing module name here. |
 | `excludes` | `tkinter`, `cadquery`/`OCP`/`vtk`/`casadi`, unused PySide6 modules | Trims ~400 MB by dropping the `altium_monkey` STEP-bounds 3D stack (only used by write-side helpers FYPA never calls) and QML/PDF Qt modules. Extend if you find more bloat. |
 
-After editing the spec, re-run `build_dist.bat` to rebuild.
+After editing the spec, re-run `packaging\build_dist.bat` to rebuild.
 
 ## Architecture
 
 ```
-FYPA.py              CLI entry; orchestrates the pipeline
-altium_extract.py          altium_monkey adapter → typed dataclasses (mm-based)
-altium_annotations.py      Parses PDN_* parameters, resolves terminal pins
-altium_geometry.py         Builds per-(layer, net) Shapely MultiPolygons
-altium_loader.py           Orchestrator; assembles the padne Problem
-altium_viewer.py           Qt viewer (side panel, tabs, scale controller)
-gl_mesh_viewer.py          Custom QOpenGLWidget — mesh-on-GPU heatmap canvas
-pdnsolver/                 Vendored fork of padne (FEM solver + mesher)
-altium_monkey/             Submodule — Altium project parser
+FYPA.py                  Thin launcher shim (repo root)
+fypa/                    Application package:
+  cli.py                 CLI entry; orchestrates the pipeline
+  altium_extract.py      altium_monkey adapter → typed dataclasses (mm-based)
+  altium_annotations.py  Parses PDN_* parameters, resolves terminal pins
+  altium_geometry.py     Builds per-(layer, net) Shapely MultiPolygons
+  altium_loader.py       Orchestrator; assembles the padne Problem
+  altium_viewer.py       Qt viewer (side panel, tabs, scale controller)
+  gl_mesh_viewer.py      Custom QOpenGLWidget — mesh-on-GPU heatmap canvas
+  lean_solution.py       Compact numeric solution (cache / pickle payload)
+pdnsolver/               Vendored fork of padne (FEM solver + mesher)
+altium_monkey/           Submodule — Altium project parser
+packaging/               PyInstaller spec, build script, Altium launcher
 ```
 
 ## How the GL viewer works

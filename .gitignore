@@ -45,6 +45,9 @@ ExampleDesigns/Sandbox/*
 .idea/
 *.swp
 
+# Claude Code local settings (personal, not shared)
+.claude/settings.local.json
+
 # Override the parent repo's broad ignores: README screenshots are intentional
 !screenshots/
 !screenshots/*.png

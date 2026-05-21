@@ -8,7 +8,7 @@ assignment. See ``altium_annotations.py`` for the schema.
 """
 from __future__ import annotations
 
-from altium_annotations import (
+from fypa.altium_annotations import (
     AnnotationResult,
     SinkSpec,
     SourceSpec,
@@ -17,7 +17,7 @@ from altium_annotations import (
     _terminal_mode,
     _validate_directive_groups,
 )
-from altium_extract import Pt2D
+from fypa.altium_extract import Pt2D
 
 
 # --- _terminal_mode -----------------------------------------------------------

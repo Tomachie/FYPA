@@ -85,13 +85,13 @@ from dataclasses import dataclass, field, replace
 
 import shapely.geometry
 
-from altium_extract import (
+from fypa.altium_extract import (
     ExtractedProject,
     NO_NET,
     Pt2D,
     RawPad,
 )
-from altium_geometry import _pad_polygon
+from fypa.altium_geometry import _pad_polygon
 
 
 log = logging.getLogger(__name__)
@@ -1311,7 +1311,7 @@ def _describe_directive(d: DirectiveSpec) -> str:
 
 if __name__ == "__main__":
     import sys
-    from altium_extract import extract_project
+    from fypa.altium_extract import extract_project
 
     logging.basicConfig(level=logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")

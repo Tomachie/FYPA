@@ -6,9 +6,13 @@ echo   FYPA  --  Build Distribution
 echo =========================================
 echo.
 
-REM Must be run from the project root (where this file lives)
+REM This script lives in packaging\. Switch to the repo root (its parent) so
+REM every relative path below (.venv, build, dist, README.md) resolves there
+REM no matter where the script was launched from.
+cd /d "%~dp0.."
+
 if not exist ".venv\Scripts\activate.bat" (
-    echo ERROR: .venv not found. Run from the project root directory.
+    echo ERROR: .venv not found at the repo root. Create the venv there first.
     pause & exit /b 1
 )
 
@@ -37,10 +41,10 @@ if exist build  rmdir /s /q build
 if exist dist   rmdir /s /q dist
 echo.
 
-REM Run PyInstaller using the project spec file
+REM Run PyInstaller using the project spec file (lives next to this script)
 echo Running PyInstaller ...
 echo.
-pyinstaller FYPA.spec
+pyinstaller "%~dp0FYPA.spec"
 
 if errorlevel 1 (
     echo.

@@ -25,7 +25,7 @@ from pathlib import Path
 import shapely.geometry
 import shapely.strtree
 
-from altium_annotations import (
+from fypa.altium_annotations import (
     AnnotationResult,
     DirectiveSpec,
     RegulatorSpec,
@@ -36,13 +36,13 @@ from altium_annotations import (
     TerminalSpec,
     parse_annotations,
 )
-from altium_extract import (
+from fypa.altium_extract import (
     ExtractedProject,
     NO_NET,
     extract_project,
 )
 import dataclasses
-from altium_geometry import (
+from fypa.altium_geometry import (
     GeometryLayer,
     _pad_outer_shape,
     build_layer_geometries,
@@ -188,7 +188,7 @@ class SolveSettings:
     def apply_to_modules(self) -> None:
         """Patch module-level physics constants so the next solve uses
         these values. Idempotent — call again to change."""
-        import altium_geometry as _g
+        import fypa.altium_geometry as _g
         _g.COPPER_CONDUCTIVITY_S_PER_MM = self.copper_conductivity_s_per_mm
         # Keep loader-side constants in sync. Functions that reference them
         # via the bare module-global name (e.g. _barrel_segment_resistance_ohm)
@@ -1241,7 +1241,10 @@ def build_solve_metadata(
             # Read the *current* module-level values so a Settings-tab
             # override is faithfully recorded in the saved pickle.
             "copper_conductivity_S_per_mm": (
-                __import__("altium_geometry").COPPER_CONDUCTIVITY_S_PER_MM
+                __import__(
+                    "fypa.altium_geometry",
+                    fromlist=["COPPER_CONDUCTIVITY_S_PER_MM"],
+                ).COPPER_CONDUCTIVITY_S_PER_MM
             ),
             "copper_resistivity_ohm_mm": COPPER_RESISTIVITY_OHM_MM,
             # 1 Ω·mm = 1e-3 Ω·m; 1 Ω·mm = 1e5 µΩ·cm.

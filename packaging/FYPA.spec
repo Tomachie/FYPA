@@ -2,10 +2,20 @@
 #
 # PyInstaller spec for FYPA  --  onedir build
 #
-# Run via build_dist.bat (from project root, venv activated), or manually:
-#   pyinstaller FYPA.spec
+# Run via packaging/build_dist.bat (venv activated), or manually from the
+# project root:
+#   pyinstaller packaging/FYPA.spec
+#
+# This spec lives in packaging/, but the project files it references sit one
+# level up at the repo root. SPECPATH (injected by PyInstaller) is this file's
+# own directory, so _REPO_ROOT below resolves correctly no matter what the
+# current working directory is.
+
+import os
 
 from PyInstaller.utils.hooks import collect_submodules
+
+_REPO_ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 # altium_monkey loads ~16 submodules via importlib.import_module at package
 # import time (_mark_declared_public_surfaces) plus more in its lazy __getattr__.
@@ -13,14 +23,14 @@ from PyInstaller.utils.hooks import collect_submodules
 _altium_monkey_submodules = collect_submodules('altium_monkey')
 
 a = Analysis(
-    ['FYPA.py'],
+    [os.path.join(_REPO_ROOT, 'FYPA.py')],
     # altium_monkey is an editable install; add its source root as a fallback
     # so PyInstaller finds it even if the .pth hook is missed.
-    pathex=['altium_monkey/src/py'],
+    pathex=[os.path.join(_REPO_ROOT, 'altium_monkey', 'src', 'py')],
     binaries=[],
     datas=[
         # Icon files used by the app window / taskbar
-        ('assets', 'assets'),
+        (os.path.join(_REPO_ROOT, 'assets'), 'assets'),
     ],
     hiddenimports=[
         # PyOpenGL resolves its platform backend and array handlers at runtime
@@ -87,7 +97,7 @@ exe = EXE(
     # console=True keeps a terminal window so CLI subcommands (solve, extract,
     # geometry …) can print output and errors remain visible on crash.
     console=True,
-    icon='assets/icon_titlebar.ico',
+    icon=os.path.join(_REPO_ROOT, 'assets', 'icon_titlebar.ico'),
 )
 
 coll = COLLECT(
