@@ -62,6 +62,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtOpenGL import (
     QOpenGLBuffer,
+    QOpenGLFramebufferObject,
+    QOpenGLFramebufferObjectFormat,
     QOpenGLShader,
     QOpenGLShaderProgram,
     QOpenGLTexture,
@@ -127,11 +129,42 @@ void main() {
 }
 """
 
+# Fullscreen-pass shader for the supersampling (SSAA) downsample. A single
+# clip-space-covering triangle is generated from gl_VertexID alone — no VBO
+# needed — and the fragment shader samples the resolved oversize colour
+# buffer through hardware LINEAR filtering. At the fixed 2:1 ratio that
+# averages each 2x2 source block, i.e. an exact box downsample.
+_SS_BLIT_VERTEX_SHADER_SRC = """
+#version 330 core
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    v_uv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+_SS_BLIT_FRAGMENT_SHADER_SRC = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 frag_color;
+void main() {
+    frag_color = texture(u_tex, v_uv);
+}
+"""
+
 
 # Viewport background (clear) colour when editor mode is active — a light
 # bluish tone so it's unmistakable which mode the user is in. Coder-tunable:
 # any "#rrggbb" hex string. Viewer mode keeps the dark substrate below.
 _EDITOR_BG_HEX = "#272735"
+
+# Outline width (device px) of the yellow editor-mode selection box drawn
+# around the selected component. Matches the selected source / sink
+# marker's edge thickness (altium_viewer._EDITOR_MARKER_SELECT_SCALE) so
+# the two selection cues read as one consistent style.
+_EDITOR_SELECTION_BOX_PX = 1.8
 
 
 @dataclass
@@ -175,6 +208,14 @@ def _install_default_surface_format() -> None:
     # mode we just leave depth-test off so it's effectively unused.
     fmt.setDepthBufferSize(24)
     fmt.setStencilBufferSize(0)
+    # 4x MSAA. Copper is world-scaled filled triangles; zoomed far out a
+    # thin trace shrinks below a pixel and a single-sample rasteriser only
+    # keeps it where a triangle happens to cover the pixel centre — the
+    # trace breaks up / partly vanishes. Multisampling tests 4 sub-samples
+    # per pixel, so sub-pixel copper renders as a (coverage-weighted)
+    # antialiased fragment instead of dropping out. QOpenGLWidget honours
+    # this by allocating a multisample FBO and resolving on composition.
+    fmt.setSamples(4)
     fmt.setSwapInterval(1)  # vsync on — smoother and easier on the GPU
     QSurfaceFormat.setDefaultFormat(fmt)
 
@@ -195,6 +236,20 @@ class GLMeshViewer(QOpenGLWidget):
     # release that still counts as a click rather than a drag. 4 px is
     # comfortable on both mice and trackpads.
     _CLICK_DRAG_THRESHOLD_PX: float = 4.0
+
+    # --- Supersampling (SSAA) ---------------------------------------------
+    # When supersampling is on, the whole scene is rendered to an offscreen
+    # FBO at _SS_FACTOR x the widget's device resolution (with _SS_SAMPLES x
+    # MSAA on top) and box-downsampled into the widget. A copper trace too
+    # thin to survive the rasteriser at native resolution is rasterised
+    # _SS_FACTOR x fatter in the oversized buffer, so it registers there,
+    # and the downsample turns it into a faint averaged tint rather than
+    # dropping it. _SS_FACTOR is pinned at 2: a 2:1 LINEAR downsample is an
+    # exact 2x2 box filter, whereas other factors would need a custom
+    # kernel. Effective sample count per native pixel is _SS_FACTOR**2 *
+    # _SS_SAMPLES (16 here) vs 4 for the plain MSAA path.
+    _SS_FACTOR: int = 2
+    _SS_SAMPLES: int = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -326,6 +381,20 @@ class GLMeshViewer(QOpenGLWidget):
         # a constant attribute colour, on top of the filled heatmap.
         self._show_mesh_edges: bool = False
 
+        # Supersampling (SSAA). Off until the host calls
+        # :meth:`set_supersampling`. The two offscreen FBOs and the
+        # downsample shader program are created lazily in the GL thread
+        # (initializeGL / paintGL, where the context is current) and the
+        # FBOs are rebuilt whenever the widget size or device-pixel ratio
+        # changes.
+        self._supersample: bool = False
+        self._ss_blit_program: QOpenGLShaderProgram | None = None
+        self._ss_blit_u_tex_loc: int = -1
+        self._ss_blit_vao: QOpenGLVertexArrayObject | None = None
+        self._ss_ms_fbo: QOpenGLFramebufferObject | None = None
+        self._ss_resolve_fbo: QOpenGLFramebufferObject | None = None
+        self._ss_fbo_size: tuple[int, int] = (0, 0)
+
         # --- Data extents ---
         self._data_bounds: tuple[float, float, float, float] | None = None
 
@@ -413,6 +482,11 @@ class GLMeshViewer(QOpenGLWidget):
         # unmistakable which mode the user is in. ``paintGL`` picks the
         # clear colour each frame from ``_editor_mode``.
         self._editor_mode: bool = False
+        # World-space (x0, y0, x1, y1) bbox of the selected editor-mode
+        # component, drawn as a yellow selection box; None when nothing
+        # (or a non-component) is selected.
+        self._editor_selection_bbox: tuple[
+            float, float, float, float] | None = None
         self._bg_normal = (self._bg_r, self._bg_g, self._bg_b)
         # Editor-mode clear colour, from the coder-tunable _EDITOR_BG_HEX.
         self._bg_editor = QColor(_EDITOR_BG_HEX).getRgbF()[:3]
@@ -611,6 +685,21 @@ class GLMeshViewer(QOpenGLWidget):
         if flag == self._show_mesh_edges:
             return
         self._show_mesh_edges = flag
+        self.update()
+
+    def set_supersampling(self, enabled: bool) -> None:
+        """Enable / disable supersampled (SSAA) rendering.
+
+        When on, the scene is drawn to an offscreen buffer at
+        :data:`_SS_FACTOR` x the device resolution and box-downsampled into
+        the widget, so sub-pixel copper survives zoom-out as a faint
+        averaged tint instead of being dropped by the rasteriser. Costs GPU
+        memory + fill rate while enabled — hence a user-facing toggle. The
+        offscreen buffers are freed (on the next paint) when turned off."""
+        flag = bool(enabled)
+        if flag == self._supersample:
+            return
+        self._supersample = flag
         self.update()
 
     def set_outlines(self, positions: np.ndarray,
@@ -1098,6 +1187,18 @@ class GLMeshViewer(QOpenGLWidget):
         self._editor_mode = on
         self.update()
 
+    def set_editor_selection_bbox(self, bbox) -> None:
+        """Set (or clear, with ``None``) the component bounding box drawn
+        as the editor-mode yellow selection box. ``bbox`` is
+        ``(x0, y0, x1, y1)`` in world mm. A no-op when unchanged so the
+        per-render push doesn't trigger a redundant repaint."""
+        new = (tuple(float(v) for v in bbox)
+               if bbox is not None else None)
+        if new == self._editor_selection_bbox:
+            return
+        self._editor_selection_bbox = new
+        self.update()
+
     def set_measurement_line(self, x0: float, y0: float,
                               x1: float, y1: float) -> None:
         """Show a thin white line from world-mm ``(x0, y0)`` to ``(x1, y1)``.
@@ -1353,6 +1454,25 @@ class GLMeshViewer(QOpenGLWidget):
         self._ovl_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         self._ovl_col_vbo.create()
 
+        # Supersampling (SSAA) downsample shader — a textured fullscreen
+        # triangle that resolves the oversized offscreen buffer into the
+        # widget. An empty VAO satisfies the core-profile rule that a VAO
+        # be bound for any draw; the triangle's three vertices come from
+        # gl_VertexID, so no VBO is attached.
+        ss_prog = QOpenGLShaderProgram()
+        ss_prog.addShaderFromSourceCode(QOpenGLShader.Vertex,
+                                        _SS_BLIT_VERTEX_SHADER_SRC)
+        ss_prog.addShaderFromSourceCode(QOpenGLShader.Fragment,
+                                        _SS_BLIT_FRAGMENT_SHADER_SRC)
+        if not ss_prog.link():
+            log = ss_prog.log()
+            raise RuntimeError(
+                f"GLMeshViewer: SSAA blit shader link failed: {log}")
+        self._ss_blit_program = ss_prog
+        self._ss_blit_u_tex_loc = ss_prog.uniformLocation("u_tex")
+        self._ss_blit_vao = QOpenGLVertexArrayObject()
+        self._ss_blit_vao.create()
+
         self._gl_initialized = True
 
     def resizeGL(self, w: int, h: int) -> None:
@@ -1365,6 +1485,130 @@ class GLMeshViewer(QOpenGLWidget):
         self.viewChanged.emit()
 
     def paintGL(self) -> None:
+        # Render straight to the widget's framebuffer, unless supersampling
+        # is enabled AND its offscreen buffers are available this frame —
+        # then render oversized and downsample. The QPainter overlay pass
+        # always runs last, at native resolution, so text / markers / chips
+        # stay crisp regardless of the supersample factor.
+        if (self._supersample
+                and self._ss_blit_program is not None
+                and self._ensure_ss_fbos()):
+            self._render_scene_supersampled()
+        else:
+            if self._ss_resolve_fbo is not None:
+                self._release_ss_fbos()
+            self._render_scene()
+        # Overlays (markers + text chips) drawn via QPainter — works on
+        # the QOpenGLWidget because QPainter uses the GL paint engine.
+        # MUST be called outside the active program's bind to avoid
+        # state corruption from the painter.
+        self._draw_overlays()
+
+    def _render_scene_supersampled(self) -> None:
+        """Render the scene oversized into the MSAA supersample FBO, then
+        resolve and box-downsample it into the widget's framebuffer.
+
+        Assumes :meth:`_ensure_ss_fbos` has just returned ``True``."""
+        sw, sh = self._ss_fbo_size
+        default_fbo = self.defaultFramebufferObject()
+        # 1. Draw the scene into the oversized multisample FBO.
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._ss_ms_fbo.handle())
+        GL.glViewport(0, 0, sw, sh)
+        self._render_scene()
+        # 2. Resolve MSAA into a same-size single-sample texture FBO. A
+        #    multisample buffer can't be blitted with scaling, so the
+        #    resolve and the downscale have to be two separate steps.
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self._ss_ms_fbo.handle())
+        GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER,
+                             self._ss_resolve_fbo.handle())
+        GL.glBlitFramebuffer(0, 0, sw, sh, 0, 0, sw, sh,
+                             GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)
+        # 3. Downsample the resolved buffer into the widget framebuffer
+        #    with a textured fullscreen triangle. The resolve texture is
+        #    LINEAR-filtered, so sampling it at the (smaller) widget
+        #    resolution averages each 2x2 oversize block. A blit can't be
+        #    used here — scaling into the widget's own multisample FBO is
+        #    a GL error — but drawing a quad into it is ordinary rendering.
+        dpr = self.devicePixelRatio()
+        w = max(1, int(self.width() * dpr))
+        h = max(1, int(self.height() * dpr))
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, default_fbo)
+        GL.glViewport(0, 0, w, h)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_BLEND)
+        self._ss_blit_program.bind()
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._ss_resolve_fbo.texture())
+        self._ss_blit_program.setUniformValue(self._ss_blit_u_tex_loc, 0)
+        self._ss_blit_vao.bind()
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        self._ss_blit_vao.release()
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        self._ss_blit_program.release()
+
+    def _ensure_ss_fbos(self) -> bool:
+        """Create or resize the offscreen supersample FBOs to match the
+        current widget size. Returns ``True`` when a valid pair is ready
+        to render into; ``False`` if supersampling can't run this frame
+        (e.g. the oversized buffer would exceed the driver's renderbuffer
+        limit, or allocation failed) so the caller falls back to a plain
+        native-resolution paint.
+
+        Called only from :meth:`paintGL`, so the GL context is current."""
+        dpr = self.devicePixelRatio()
+        w = max(1, int(self.width() * dpr))
+        h = max(1, int(self.height() * dpr))
+        sw, sh = w * self._SS_FACTOR, h * self._SS_FACTOR
+        try:
+            max_dim = int(GL.glGetIntegerv(GL.GL_MAX_RENDERBUFFER_SIZE))
+        except Exception:
+            max_dim = 0
+        if max_dim and (sw > max_dim or sh > max_dim):
+            return False
+        if (self._ss_ms_fbo is not None
+                and self._ss_resolve_fbo is not None
+                and self._ss_fbo_size == (sw, sh)):
+            return True
+        self._release_ss_fbos()
+        ms_fmt = QOpenGLFramebufferObjectFormat()
+        ms_fmt.setSamples(self._SS_SAMPLES)
+        ms_fmt.setAttachment(QOpenGLFramebufferObject.Attachment.Depth)
+        ms_fbo = QOpenGLFramebufferObject(sw, sh, ms_fmt)
+        resolve_fbo = QOpenGLFramebufferObject(
+            sw, sh, QOpenGLFramebufferObjectFormat())
+        if not (ms_fbo.isValid() and resolve_fbo.isValid()):
+            return False
+        # The downsample samples the resolve texture with LINEAR filtering
+        # to box-average each 2x2 block; clamp so edge texels don't wrap.
+        GL.glBindTexture(GL.GL_TEXTURE_2D, resolve_fbo.texture())
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER,
+                           GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER,
+                           GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S,
+                           GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T,
+                           GL.GL_CLAMP_TO_EDGE)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        self._ss_ms_fbo = ms_fbo
+        self._ss_resolve_fbo = resolve_fbo
+        self._ss_fbo_size = (sw, sh)
+        return True
+
+    def _release_ss_fbos(self) -> None:
+        """Drop the offscreen supersample FBOs, freeing their GPU memory.
+        Runs from the paint path only — releasing the last Python
+        reference fires the QOpenGLFramebufferObject destructor, which
+        needs a current GL context to delete its renderbuffers."""
+        self._ss_ms_fbo = None
+        self._ss_resolve_fbo = None
+        self._ss_fbo_size = (0, 0)
+
+    def _render_scene(self) -> None:
+        """Draw the full GL scene — copper mesh, stubs, overlays, outlines,
+        arrows — into whichever framebuffer is currently bound. Split out
+        of :meth:`paintGL` so it can target either the widget directly or
+        the oversized supersample buffer."""
         # Clear colour follows the editor/viewer mode — set per-frame here
         # (rather than once in initializeGL) so set_editor_mode takes effect
         # without needing the GL context made current off the paint path.
@@ -1434,11 +1678,6 @@ class GLMeshViewer(QOpenGLWidget):
         if (self._n_bdrl_vertices > 0
                 and self._line_program is not None):
             self._draw_board_outline()
-        # Overlays (markers + text chips) drawn via QPainter — works on
-        # the QOpenGLWidget because QPainter uses the GL paint engine.
-        # MUST be called outside the active program's bind to avoid
-        # state corruption from the painter.
-        self._draw_overlays()
 
     # ------------------------------------------------------------------
     # GL upload / draw helpers
@@ -1863,6 +2102,7 @@ class GLMeshViewer(QOpenGLWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         self._draw_editor_grid(painter)
+        self._draw_editor_selection(painter)
         self._draw_overlay_labels(painter)
         self._draw_markers(painter)
         self._draw_measurement_line(painter)
@@ -1919,6 +2159,29 @@ class GLMeshViewer(QOpenGLWidget):
             painter.drawLine(QPointF(0.0, py), QPointF(w, py))
             j += 1
             y += step_mm
+        painter.restore()
+
+    def _draw_editor_selection(self, painter: QPainter) -> None:
+        """Yellow box around the editor-mode component selection — the
+        component's world-space bounding box projected to the screen, so
+        it tracks pan / zoom (and the camera in 3D). Same yellow + pixel
+        thickness as the selected source / sink marker's box."""
+        if not self._editor_mode or self._editor_selection_bbox is None:
+            return
+        x0, y0, x1, y1 = self._editor_selection_bbox
+        poly = QPolygonF()
+        for wx, wy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            px, py = self.world_to_screen(wx, wy, 0.0)
+            if px < -1e8 or py < -1e8:   # a corner is behind the camera
+                return
+            poly.append(QPointF(px, py))
+        painter.save()
+        pen = QPen(QColor("#ffff00"))
+        pen.setWidthF(_EDITOR_SELECTION_BOX_PX)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPolygon(poly)
         painter.restore()
 
     def _draw_measurement_line(self, painter: QPainter) -> None:
@@ -2071,6 +2334,21 @@ class GLMeshViewer(QOpenGLWidget):
                 QPointF(px + r * 0.866, py - r * 0.5),
                 QPointF(px - r * 0.866, py - r * 0.5),
             ]))
+        elif symbol in ("tri_up_box", "tri_down_box"):
+            # Tight selection box around a tri_up / tri_down glyph of the
+            # same `size`. The triangle is NOT centred within its `size`
+            # square (apex at ±r, base at ∓0.5r), so a plain centred
+            # square leaves a gap one side and clips the apex on the
+            # other — this draws the triangle's true bounding rectangle
+            # instead, plus a hairline pad so the box stroke clears the
+            # triangle's own outline.
+            pad = 2.0
+            half_w = r * 0.866 + pad
+            if symbol == "tri_up_box":
+                y0, y1 = py - r - pad, py + r * 0.5 + pad
+            else:
+                y0, y1 = py - r * 0.5 - pad, py + r + pad
+            painter.drawRect(QRectF(px - half_w, y0, 2.0 * half_w, y1 - y0))
         elif symbol == "bolt":
             # Lightning bolt — 7-point concave polygon. Geometry lifted
             # from the Material Design ``flash_on`` icon and normalised

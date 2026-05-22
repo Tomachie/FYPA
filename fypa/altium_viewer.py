@@ -391,6 +391,9 @@ _THEME_PRESETS: dict[str, dict[str, str]] = {
 _THEME_QS_ORG = "CopperTree"
 _THEME_QS_APP = "FYPA"
 _THEME_QS_KEY = "ui/theme"
+# High-quality-zoom (supersampling / SSAA) preference for the heatmap
+# canvas. Persisted so the choice survives a relaunch; defaults to on.
+_SSAA_QS_KEY = "ui/supersampling"
 
 _current_theme_mode: str = "dark"
 
@@ -433,6 +436,42 @@ def save_theme_mode(mode: str) -> None:
     except Exception as e:
         logging.getLogger(__name__).debug(
             "Could not persist theme preference (%s); ignoring.", e,
+        )
+
+
+def load_supersampling_enabled() -> bool:
+    """Read the persisted high-quality-zoom (SSAA) preference.
+
+    Defaults to ``True`` — the supersampled canvas is the better
+    experience and its cost is only paid while a viewer window is open.
+    QSettings round-trips a bool as a native string on some backends, so
+    accept ``"true"`` / ``1`` etc. as well as a real bool."""
+    try:
+        from PySide6.QtCore import QSettings
+        qs = QSettings(_THEME_QS_ORG, _THEME_QS_APP)
+        val = qs.value(_SSAA_QS_KEY, True)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(int(val))
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            "Could not read saved supersampling preference (%s); using "
+            "default.", e,
+        )
+    return True
+
+
+def save_supersampling_enabled(enabled: bool) -> None:
+    """Persist the high-quality-zoom (SSAA) preference for next launch."""
+    try:
+        from PySide6.QtCore import QSettings
+        qs = QSettings(_THEME_QS_ORG, _THEME_QS_APP)
+        qs.setValue(_SSAA_QS_KEY, bool(enabled))
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            "Could not persist supersampling preference (%s); ignoring.", e,
         )
 
 
@@ -1059,6 +1098,16 @@ _OVERLAY_DEFAULT_COLORS: dict[str, tuple[float, float, float]] = {
     "board_outline": (0.50, 0.00, 0.00),   # dark red / maroon (#800000)
 }
 
+# Default Bottom-side colour for a Board Features layer. Applied to the
+# layer's bottom side — both the Bottom row of a split layer and the
+# bottom-side geometry of a merged row — so the two board faces stay
+# visually distinct. A layer absent here defaults to None: its Bottom
+# side simply follows the primary colour above. The colour-swatch button
+# overrides this per project.
+_OVERLAY_DEFAULT_BOTTOM_COLORS: dict[str, tuple[float, float, float]] = {
+    "silkscreen": (0.50, 0.50, 0.00),   # olive (#808000)
+}
+
 # World-space half-width (mm) of an overlay wire-mesh outline ribbon. The
 # Overlays control renders every outline as a thin filled ribbon (rather
 # than GL_LINES) so wire-mesh and solid fill share one GL triangle batch.
@@ -1068,28 +1117,52 @@ _OVERLAY_WIRE_HALF_MM = 0.025
 # Segments a via circle is tessellated into.
 _OVERLAY_CIRCLE_SEGMENTS = 20
 
+# Editor-mode connectivity dimming for the all-copper overlay. When a
+# selection highlight is active, copper whose net is NOT connected to the
+# selection recedes. The overlay-fill batch has no per-vertex alpha (only
+# the heatmap mesh does — see _editor_alpha_array), so we fake the same
+# "0.1 alpha over background" look by pre-blending the colour toward the
+# editor-mode clear colour. Keep _EDITOR_OVERLAY_DIM_BG in sync with
+# gl_mesh_viewer._EDITOR_BG_HEX.
+_EDITOR_OVERLAY_DIM_BG = (0x27 / 255.0, 0x27 / 255.0, 0x35 / 255.0)
+_EDITOR_OVERLAY_DIM_ALPHA = 0.10
 
-def _overlay_outline_tris(polyline, half_w: float, *,
-                          closed: bool) -> np.ndarray:
-    """Triangulate a thin, uniform-width outline ribbon along a polyline.
+# Click hit-radius (screen pixels) for picking a placed free source /
+# sink marker in editor mode. Converted to world mm with the current
+# view zoom so it tracks the on-screen marker size at any scale.
+_EDITOR_MARKER_HIT_PX = 14.0
 
-    Returns an ``(3k, 2)`` float32 array of triangle vertices. The ribbon
-    is centred on the polyline and uses per-vertex *mitered* offsets — the
-    offset at each vertex bisects its two adjacent edge normals — so the
-    band stays a clean constant width even when the polyline has many
-    short segments. A naive per-segment rectangle ribbon splays those into
-    a radial sunburst once the width exceeds the segment length (e.g. a
-    tessellated circular pad). ``closed`` joins the last vertex back to the
-    first (pad / via / component outlines); open polylines (silkscreen
-    tracks) get square ends."""
+# Glyph size + outline-width multiplier for the editor marker matching
+# the current selection — it draws this much larger / thicker than the
+# unselected source / sink markers.
+_EDITOR_MARKER_SELECT_SCALE = 1.3
+
+
+def _overlay_ribbon_offsets(polyline, half_w: float, *,
+                            closed: bool):
+    """Mitered outer / inner edge points of a constant-width ribbon
+    centred on ``polyline``.
+
+    Returns ``(pts, outer, inner)`` — the cleaned centre-line vertices and
+    the two offset edges, each a float64 ``(n, 2)`` array — or ``None`` when
+    the polyline is too short to form a ribbon. The offset at each vertex
+    bisects its two adjacent edge normals, so the band keeps a clean
+    constant width even when the polyline has many short segments. A naive
+    per-segment rectangle ribbon splays those into a radial sunburst once
+    the width exceeds the segment length (e.g. a tessellated circular pad).
+    ``closed`` joins the last vertex back to the first.
+
+    Shared by :func:`_overlay_outline_tris` (which fills the band) and
+    :func:`_overlay_ribbon_outline_tris` (which traces its perimeter for
+    the wire-mesh fill style)."""
     pts = np.asarray(polyline, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[0] < 2:
-        return np.empty((0, 2), dtype=np.float32)
+        return None
     if closed and np.allclose(pts[0], pts[-1]):
         pts = pts[:-1]
     n = pts.shape[0]
     if n < 2:
-        return np.empty((0, 2), dtype=np.float32)
+        return None
     half_w = max(float(half_w), 1e-4)
 
     # Outgoing-edge unit direction + right-hand normal at each vertex.
@@ -1120,9 +1193,23 @@ def _overlay_outline_tris(polyline, half_w: float, *,
     dot = np.where(np.abs(dot) < 0.25,
                    np.where(dot < 0.0, -0.25, 0.25), dot)
     off = bis * (half_w / dot)[:, None]
-    outer = pts + off
-    inner = pts - off
+    return pts, pts + off, pts - off
 
+
+def _overlay_outline_tris(polyline, half_w: float, *,
+                          closed: bool) -> np.ndarray:
+    """Triangulate a thin, uniform-width outline ribbon along a polyline.
+
+    Returns an ``(3k, 2)`` float32 array of triangle vertices filling the
+    band between the polyline's two mitered offset edges (see
+    :func:`_overlay_ribbon_offsets`). ``closed`` joins the last vertex back
+    to the first (pad / via / component outlines); open polylines
+    (silkscreen tracks) get square ends."""
+    res = _overlay_ribbon_offsets(polyline, half_w, closed=closed)
+    if res is None:
+        return np.empty((0, 2), dtype=np.float32)
+    pts, outer, inner = res
+    n = pts.shape[0]
     seg = n if closed else n - 1
     cur = np.arange(seg)
     nxt = (cur + 1) % n
@@ -1134,6 +1221,67 @@ def _overlay_outline_tris(polyline, half_w: float, *,
     out[4::6] = inner[cur]
     out[5::6] = inner[nxt]
     return out
+
+
+def _overlay_cap_arc(center, p_from, outward,
+                     segments: int = 8) -> np.ndarray:
+    """Interior points of a ribbon end's semicircular round cap.
+
+    Sweeps a half-circle of radius ``|p_from - center|`` starting at
+    ``p_from`` and bulging toward ``outward`` (the ribbon's travel
+    direction at that end), ending at the antipode of ``p_from``. Returns
+    ``segments - 1`` interior points as a float64 ``(k, 2)`` array — the
+    two diametric endpoints are supplied by the caller from the outer /
+    inner offset edges, so they are omitted to avoid duplicate vertices."""
+    center = np.asarray(center, dtype=np.float64)
+    v = np.asarray(p_from, dtype=np.float64) - center
+    r = float(np.linalg.norm(v))
+    if r < 1e-9 or segments < 2:
+        return np.empty((0, 2), dtype=np.float64)
+    a0 = math.atan2(v[1], v[0])
+    # Rotating v by +90° gives (-v.y, v.x); pick the sweep sign whose
+    # mid-arc direction points the same way as `outward`.
+    rot90 = np.array([-v[1], v[0]], dtype=np.float64)
+    sign = (1.0 if float(rot90 @ np.asarray(outward, dtype=np.float64)) >= 0.0
+            else -1.0)
+    k = np.arange(1, segments)
+    ang = a0 + sign * math.pi * k / segments
+    return np.column_stack([center[0] + r * np.cos(ang),
+                            center[1] + r * np.sin(ang)])
+
+
+def _overlay_ribbon_outline_tris(polyline, half_w: float, wire_w: float, *,
+                                 closed: bool) -> np.ndarray:
+    """Wire-mesh of a constant-width ribbon — its hollow perimeter.
+
+    Traces the boundary of the band :func:`_overlay_outline_tris` would
+    fill and renders that boundary as its own thin ribbon of half-width
+    ``wire_w``. ``half_w`` is the source ribbon's half-width. Used by the
+    Overlay and Designators rows' wire-mesh fill style, whose geometry is
+    open stroke polylines rather than closed shapes.
+
+    For an open polyline the perimeter is one closed loop: out along the
+    outer edge, a round end cap, back along the inner edge, a round start
+    cap. For a closed polyline it is two concentric loops (the band's
+    outer and inner rims)."""
+    res = _overlay_ribbon_offsets(polyline, half_w, closed=closed)
+    if res is None:
+        return np.empty((0, 2), dtype=np.float32)
+    pts, outer, inner = res
+    if closed:
+        return np.concatenate([
+            _overlay_outline_tris(outer, wire_w, closed=True),
+            _overlay_outline_tris(inner, wire_w, closed=True),
+        ], axis=0)
+    # Open ribbon: round end + start caps bridge the outer and inner edges
+    # into a single closed perimeter (matching the round caps the solid
+    # fill style draws as separate circles). At an open end the offset is
+    # exactly ±half_w along the edge normal, so outer[-1] / inner[-1] are
+    # antipodal on the cap circle — the arc joins them cleanly.
+    end_cap = _overlay_cap_arc(pts[-1], outer[-1], pts[-1] - pts[-2])
+    start_cap = _overlay_cap_arc(pts[0], inner[0], pts[0] - pts[1])
+    ring = np.concatenate([outer, end_cap, inner[::-1], start_cap], axis=0)
+    return _overlay_outline_tris(ring, wire_w, closed=True)
 
 
 def _overlay_fan_tris(ring) -> np.ndarray:
@@ -4183,7 +4331,7 @@ class PdnViewer(QMainWindow):
             tip_show="Show all copper on every layer",
             tip_hide="Hide all copper on every layer",
         )
-        self._all_layers_fill = FillToggleButton(solid=False)
+        self._all_layers_fill = FillToggleButton(solid=True)
         # Layer-outline toggle — lives only on the "All Layers" row, just
         # left of the wire-mesh / solid button. Replaces the old "Show
         # layer outlines (O)" side-panel checkbox.
@@ -4215,7 +4363,7 @@ class PdnViewer(QMainWindow):
                 tip_hide="Hide all copper on this layer",
             )
             eye2.toggled_visible.connect(self._on_layer_eye2_toggled)
-            fill = FillToggleButton(solid=False)
+            fill = FillToggleButton(solid=True)
             fill.toggled_fill.connect(self._on_layer_fill_toggled)
             row = self._build_layer_row_widget(
                 eye, swatch_color=self._layer_color_for(phys),
@@ -4359,6 +4507,24 @@ class PdnViewer(QMainWindow):
         side.addWidget(self.scale_controller, 0)
 
         side.addSpacing(8)
+
+        # The 2D/3D view, via-heatmap, no-current-copper-colour and
+        # FEM-mesh-overlay toggles moved to the View menu (see
+        # _build_view_menu). Their QCheckBox objects are kept as the
+        # canonical state holders — so every isChecked() / setChecked() /
+        # toggle() call site and the existing toggled-signal wiring stay
+        # unchanged — but they are never added to a layout, so they remain
+        # hidden. The View menu actions drive them and mirror their state
+        # in the menu item labels via _refresh_view_menu_labels.
+        self.show_mesh_box = QCheckBox("Show copper mesh")
+        self.show_mesh_box.setChecked(False)
+        self.colour_stubs_box = QCheckBox("Grey no current copper")
+        self.colour_stubs_box.setChecked(False)
+        self.view_3d_box = QCheckBox("3D view (3)")
+        self.view_3d_box.setChecked(False)
+        self.heatmap_vias_box = QCheckBox("Heatmap vias/PTH (V)")
+        self.heatmap_vias_box.setChecked(False)
+
         self.rail_only_box = QCheckBox("Show only rail net (R)")
         self.rail_only_box.setToolTip(
             "When on, only the copper of each selected rail's own primary "
@@ -4377,29 +4543,6 @@ class PdnViewer(QMainWindow):
         )
         side.addWidget(self.show_markers_box)
 
-        self.show_mesh_box = QCheckBox("Show copper mesh")
-        self.show_mesh_box.setChecked(False)
-        self.show_mesh_box.setToolTip(
-            "When on, the FEM triangulation is overlaid on the heatmap "
-            "as a fine dark wireframe — useful for judging local mesh "
-            "density and spotting elongated triangles. No solve impact; "
-            "purely a visualisation toggle."
-        )
-        side.addWidget(self.show_mesh_box)
-
-        self.colour_stubs_box = QCheckBox("Grey no current copper")
-        self.colour_stubs_box.setChecked(False)
-        self.colour_stubs_box.setToolTip(
-            "Copper pieces that the FEM excluded (no current path through "
-            "them — typically via-cap stubs and decoupling islands) are "
-            "coloured by their approximate voltage by default, sampled from "
-            "the same-net solved layer. Check this to instead draw them as "
-            "a flat dim grey, making them obviously distinct from the solved "
-            "copper. The voltage is constant across each piece since no "
-            "current flows."
-        )
-        side.addWidget(self.colour_stubs_box)
-
         self.cursor_tooltip_box = QCheckBox("Show cursor tooltip (T)")
         self.cursor_tooltip_box.setChecked(False)
         self.cursor_tooltip_box.setToolTip(
@@ -4409,28 +4552,6 @@ class PdnViewer(QMainWindow):
             "layer. Same information as the bar at the bottom of the plot."
         )
         side.addWidget(self.cursor_tooltip_box)
-
-        self.view_3d_box = QCheckBox("3D view (3)")
-        self.view_3d_box.setChecked(False)
-        self.view_3d_box.setToolTip(
-            "Switch the canvas to a 3D perspective view of the stacked "
-            "copper layers. Right-drag pans, Shift+right-drag rotates, "
-            "and the wheel dollies the camera. Vias are drawn as orange "
-            "cylinders connecting the layers they span."
-        )
-        side.addWidget(self.view_3d_box)
-
-        self.heatmap_vias_box = QCheckBox("Heatmap vias/PTH (V)")
-        self.heatmap_vias_box.setChecked(False)
-        self.heatmap_vias_box.setToolTip(
-            "Colour via and plated-through-hole cylinders by the active "
-            "heatmap mode (voltage / drop / current / power) instead of "
-            "solid orange (vias) / light grey (PTHs). Voltage / Voltage "
-            "Drop interpolate along the barrel; Current Density and Power "
-            "Density are constant per inter-layer segment. 3D mode only. "
-            "Press V to toggle."
-        )
-        side.addWidget(self.heatmap_vias_box)
 
         self.show_arrows_box = QCheckBox("Show current arrows (A)")
         self.show_arrows_box.setChecked(False)
@@ -4674,6 +4795,13 @@ class PdnViewer(QMainWindow):
         self.view_3d_box.toggled.connect(self._on_view_3d_toggled)
         self.heatmap_vias_box.toggled.connect(self._render)
         self.show_arrows_box.toggled.connect(self._on_arrows_toggled)
+        # Keep the View-menu item labels in step whenever one of their
+        # backing checkboxes flips — whether from the menu action, a
+        # keyboard hotkey, or a restored project setting.
+        for _box in (self.view_3d_box, self.heatmap_vias_box,
+                     self.colour_stubs_box, self.show_mesh_box):
+            _box.toggled.connect(self._refresh_view_menu_labels)
+        self._refresh_view_menu_labels()
         # Pan, wheel zoom, and resize handlers are wired to the GL viewer
         # via signals connected when the viewer was created.
 
@@ -4879,11 +5007,12 @@ class PdnViewer(QMainWindow):
 
         Draw colour lives separately. ``self._overlay_colors`` holds the
         primary colour per layer — used by a merged row and the Top side of
-        a split one. ``self._overlay_bottom_colors`` holds an optional
-        distinct colour for the Bottom side of a split layer (``None`` until
-        the user picks one, meaning "follow the primary"). Both are seeded
-        from :data:`_OVERLAY_DEFAULT_COLORS` / ``None`` and then overridden
-        by anything the open .fypa project saved.
+        a split one. ``self._overlay_bottom_colors`` holds the distinct
+        colour for the layer's Bottom side (``None`` == follow the primary);
+        it applies whether the layer is split or merged. Both are seeded
+        from :data:`_OVERLAY_DEFAULT_COLORS` /
+        :data:`_OVERLAY_DEFAULT_BOTTOM_COLORS` and then overridden by
+        anything the open .fypa project saved.
         """
         self._overlay_state: dict[str, dict] = {}
         for key, _label, has_sides in _OVERLAY_LAYERS:
@@ -4898,11 +5027,14 @@ class PdnViewer(QMainWindow):
 
         self._overlay_colors: dict[str, tuple[float, float, float]] = dict(
             _OVERLAY_DEFAULT_COLORS)
-        # None == the Bottom side follows the primary colour; a tuple == the
-        # user pinned a distinct Bottom colour (only meaningful once split).
+        # None == the Bottom side follows the primary colour; a tuple == a
+        # distinct Bottom colour (a built-in default from
+        # _OVERLAY_DEFAULT_BOTTOM_COLORS, or one the user later pins). It is
+        # applied to the Bottom side whether the layer is split or merged.
         self._overlay_bottom_colors: dict[
             str, tuple[float, float, float] | None] = {
-            key: None for key in _OVERLAY_DEFAULT_COLORS
+            key: _OVERLAY_DEFAULT_BOTTOM_COLORS.get(key)
+            for key in _OVERLAY_DEFAULT_COLORS
         }
         self._load_overlay_colors_from_project()
 
@@ -5125,10 +5257,11 @@ class PdnViewer(QMainWindow):
     def _overlay_color_for(self, key: str,
                            side: str) -> tuple[float, float, float]:
         """RGB an overlay's geometry on ``side`` ("top" / "bottom") is drawn
-        in. The Bottom side of a *split* layer uses its own pinned colour
-        when set; the Top side, and either side of a merged layer, use the
-        primary colour."""
-        if side == "bottom" and self._overlay_state.get(key, {}).get("split"):
+        in. The Bottom side uses its own distinct colour whenever one is set
+        — whether the layer is split or merged — so a merged row still draws
+        its bottom-side geometry in the Bottom colour. The Top side, and the
+        Bottom side when it has no distinct colour, use the primary."""
+        if side == "bottom":
             bot = self._overlay_bottom_colors.get(key)
             if bot is not None:
                 return bot
@@ -5301,7 +5434,7 @@ class PdnViewer(QMainWindow):
             if rec.get("kind") == "text":
                 continue  # legacy pickles only — text isn't an Overlay item
             side = rec.get("side", "top")
-            vis, _solid = sides.get(side, (None, False))
+            vis, solid = sides.get(side, (None, False))
             if vis is None:
                 continue
             rgb = self._overlay_color_for("silkscreen", side)
@@ -5313,13 +5446,20 @@ class PdnViewer(QMainWindow):
             half = max(0.5 * float(rec.get("width_mm", 0.0) or 0.0), 0.01)
             z = feature_z.get(side, 0.0)
             under = in_2d and side == "bottom"
-            _emit(_overlay_outline_tris(poly, half, closed=False), z, rgb,
-                  under=under)
-            # Round end caps — interior joins are already mitered.
-            for end in (poly[0], poly[-1]):
-                _emit(_overlay_fan_tris(_overlay_circle_ring(
-                    float(end[0]), float(end[1]), half, 12)), z, rgb,
-                    under=under)
+            if solid:
+                _emit(_overlay_outline_tris(poly, half, closed=False), z,
+                      rgb, under=under)
+                # Round end caps — interior joins are already mitered.
+                for end in (poly[0], poly[-1]):
+                    _emit(_overlay_fan_tris(_overlay_circle_ring(
+                        float(end[0]), float(end[1]), half, 12)), z, rgb,
+                        under=under)
+            else:
+                # Wire-mesh: the track's hollow perimeter. The round caps
+                # are part of the traced outline — no separate cap fills.
+                _emit(_overlay_ribbon_outline_tris(
+                    poly, half, _OVERLAY_WIRE_HALF_MM, closed=False),
+                    z, rgb, under=under)
 
         # Vias — one circle per via (the Vias row has no top/bottom split).
         vsub = self._overlay_state["vias"]["both"]
@@ -5386,14 +5526,14 @@ class PdnViewer(QMainWindow):
         sides = self._overlay_side_states("designators")
         for rec in md.get("designators", []):
             side = rec.get("side", "top")
-            vis, _solid = sides.get(side, (None, False))
+            vis, solid = sides.get(side, (None, False))
             if vis is None:
                 continue
             if vis == "rails" and not _net_match(rec.get("nets", [])):
                 continue
             rgb = self._overlay_color_for("designators", side)
             if rec.get("polylines"):
-                _emit(self._designator_stroke_tris(rec),
+                _emit(self._designator_stroke_tris(rec, solid=solid),
                       feature_z[side], rgb,
                       under=in_2d and side == "bottom")
             else:
@@ -5440,13 +5580,18 @@ class PdnViewer(QMainWindow):
                 lrgb = (qc.redF(), qc.greenF(), qc.blueF())
                 z = self._layer_z_for(name)
                 for rec in recs:
-                    if rec.get("net") in rail_members:
+                    net = rec.get("net")
+                    if net in rail_members:
                         continue
+                    # Editor-mode connectivity focus: copper not connected
+                    # to the current selection recedes toward the
+                    # background (mirrors the heatmap mesh dimming).
+                    rgb = self._editor_dim_rgb(lrgb, net)
                     for poly in rec.get("polygons", []):
                         if solid:
-                            _emit(self._triangulate_stub(poly), z, lrgb)
+                            _emit(self._triangulate_stub(poly), z, rgb)
                         else:
-                            _emit(self._copper_poly_wire(poly), z, lrgb)
+                            _emit(self._copper_poly_wire(poly), z, rgb)
 
         # Concatenate under-mesh chunks first so the GL viewer can draw
         # that leading slice before the heatmap mesh (2D bottom-side
@@ -5485,11 +5630,17 @@ class PdnViewer(QMainWindow):
         poly["_wire_cache"] = arr
         return arr
 
-    def _designator_stroke_tris(self, rec: dict) -> np.ndarray:
+    def _designator_stroke_tris(self, rec: dict, *,
+                                solid: bool = True) -> np.ndarray:
         """Triangles for one designator's stroke-font geometry — each glyph
         stroke as a thin round-capped ribbon at the text's stroke width.
-        Cached on the record dict (the layout is static for the session)."""
-        cached = rec.get("_des_tris")
+
+        ``solid`` draws each stroke as a filled ribbon; otherwise each
+        stroke is traced as its hollow perimeter (the wire-mesh fill
+        style). Both variants are cached separately on the record dict
+        (the layout is static for the session)."""
+        cache_key = "_des_tris" if solid else "_des_tris_wire"
+        cached = rec.get(cache_key)
         if cached is not None:
             return cached
         half = max(0.5 * float(rec.get("stroke_width_mm", 0.0) or 0.0), 0.01)
@@ -5497,13 +5648,17 @@ class PdnViewer(QMainWindow):
         for pl in rec.get("polylines") or []:
             if len(pl) < 2:
                 continue
-            chunks.append(_overlay_outline_tris(pl, half, closed=False))
-            for end in (pl[0], pl[-1]):
-                chunks.append(_overlay_fan_tris(_overlay_circle_ring(
-                    float(end[0]), float(end[1]), half, 8)))
+            if solid:
+                chunks.append(_overlay_outline_tris(pl, half, closed=False))
+                for end in (pl[0], pl[-1]):
+                    chunks.append(_overlay_fan_tris(_overlay_circle_ring(
+                        float(end[0]), float(end[1]), half, 8)))
+            else:
+                chunks.append(_overlay_ribbon_outline_tris(
+                    pl, half, _OVERLAY_WIRE_HALF_MM, closed=False))
         arr = (np.concatenate(chunks, axis=0) if chunks
                else np.empty((0, 2), dtype=np.float32))
-        rec["_des_tris"] = arr
+        rec[cache_key] = arr
         return arr
 
     # --- Rendering -----------------------------------------------------------
@@ -6075,6 +6230,9 @@ class PdnViewer(QMainWindow):
         # rail or 2D/3D change keeps them in sync — and so they still draw
         # when the early-outs below fire (no layer / rail selected).
         self._refresh_overlay_geometry(rails)
+        # Same up-front treatment for the editor-mode component selection
+        # box — it must survive the no-layer / no-rail early-outs below.
+        self._refresh_editor_selection()
 
         # Copper-mesh cmap follows the active mode: every other mode
         # paints the copper from its per-vertex scalar field, so we
@@ -8923,12 +9081,14 @@ class PdnViewer(QMainWindow):
         rbtn.setToolTip(
             "Re-run the solver with the current editor changes applied"
         )
+        # Border + text use a fixed "go" green (not a theme token) so the
+        # Resolve action reads as a positive call-to-action in both themes.
         rbtn.setStyleSheet(
-            "QPushButton { border: 1px solid %(warn)s; border-radius: 6px;"
+            "QPushButton { border: 1px solid %(green)s; border-radius: 6px;"
             "  padding: 6px 12px; font-weight: bold;"
-            "  background-color: %(bg)s; color: %(warn)s; }"
+            "  background-color: %(bg)s; color: %(green)s; }"
             "QPushButton:hover { background-color: %(hover)s; }"
-            % {"warn": t["warn"], "bg": t["bg"], "hover": t["bg_hover"]}
+            % {"green": "#2ca92c", "bg": t["bg"], "hover": t["bg_hover"]}
         )
         rbtn.clicked.connect(self._on_resolve_clicked)
         rbtn.hide()
@@ -9115,6 +9275,24 @@ class PdnViewer(QMainWindow):
             return None   # ordering mismatch — skip dimming, never crash
         return arr
 
+    def _editor_dim_rgb(self, rgb: tuple[float, float, float],
+                        net: str | None) -> tuple[float, float, float]:
+        """Dim an all-copper overlay colour for editor-mode connectivity
+        focus. With a selection highlight active, copper whose ``net`` is
+        not in the highlight is blended toward the editor background — the
+        same recede the heatmap mesh gets from :meth:`_editor_alpha_array`.
+        Highlighted copper, and any time no highlight is active, is
+        returned unchanged."""
+        if not self._editor_mode or not self._editor_highlight_nets:
+            return rgb
+        if net in self._editor_highlight_nets:
+            return rgb
+        f = _EDITOR_OVERLAY_DIM_ALPHA
+        bg = _EDITOR_OVERLAY_DIM_BG
+        return (rgb[0] * f + bg[0] * (1.0 - f),
+                rgb[1] * f + bg[1] * (1.0 - f),
+                rgb[2] * f + bg[2] * (1.0 - f))
+
     def _connected_nets(self, net: str | None) -> set[str]:
         """Nets electrically connected to ``net`` — the net itself plus
         anything bridged to it by a SERIES directive (via the rail-group
@@ -9145,26 +9323,117 @@ class PdnViewer(QMainWindow):
                     best, best_area = rec, area
         return best
 
-    def _net_at(self, world_x: float, world_y: float) -> str | None:
-        """Copper net under the point — solved copper first, then the
-        excluded-stub copper. ``None`` on bare substrate."""
+    def _editor_copper_pick(self, world_x: float,
+                            world_y: float) -> dict | None:
+        """Copper under the point for editor-mode selection / marker
+        placement. Tries, in order: the solved rail mesh, the excluded
+        stubs, then the full per-(layer, net) copper set. Returns
+        ``{"net", "physical", "layer_id"}`` or ``None`` on bare substrate.
+
+        The final fallback to :meth:`_copper_at_point` is what lets a
+        source / sink land on *any* copper — ``_probe_at_point`` and
+        ``_probe_at_stub`` only see the rail currently drawn in the
+        heatmap, so without it placement is limited to that rail."""
         hit = self._probe_at_point(world_x, world_y)
         if hit is not None and hit[1].get("net"):
-            return hit[1]["net"]
+            info = hit[1]
+            return {"net": info["net"],
+                    "physical": info.get("physical"),
+                    "layer_id": info.get("layer_id")}
         stub_hit = self._probe_at_stub(world_x, world_y)
         if stub_hit is not None and stub_hit[1].get("net"):
-            return stub_hit[1]["net"]
-        return None
+            phys = stub_hit[1].get("physical")
+            return {"net": stub_hit[1]["net"],
+                    "physical": phys,
+                    "layer_id": self._phys_name_to_layer_id.get(phys)}
+        return self._copper_at_point(world_x, world_y)
+
+    def _net_at(self, world_x: float, world_y: float) -> str | None:
+        """Copper net under the point — any copper, not just the rail in
+        the heatmap. ``None`` on bare substrate."""
+        pick = self._editor_copper_pick(world_x, world_y)
+        return pick.get("net") if pick else None
+
+    def _copper_poly_prepared(self, poly: dict):
+        """Return (and cache) a shapely PreparedGeometry for one
+        ``all_copper`` polygon (exterior ring plus any holes). Mirrors
+        :meth:`_stub_prepared_shape`; the cache lives on the polygon
+        dict so repeated point tests stay cheap."""
+        cached = poly.get("_prepared_shape_cache")
+        if cached is not None:
+            return cached
+        ext = poly.get("exterior")
+        if ext is None or (hasattr(ext, "size") and ext.size == 0):
+            return None
+        try:
+            shp = _sg.Polygon(ext, poly.get("holes") or [])
+        except Exception:
+            return None
+        if shp.is_empty:
+            return None
+        prepped = _sp.prep(shp)
+        poly["_prepared_shape_cache"] = prepped
+        return prepped
+
+    def _copper_at_point(self, world_x: float,
+                         world_y: float) -> dict | None:
+        """Copper under the point from the full per-(layer, net) copper
+        set — every net on every layer, not just the rail currently drawn
+        in the heatmap. Returns ``{"net", "physical", "layer_id"}`` for
+        the topmost layer whose copper covers the point, or ``None`` on
+        bare substrate."""
+        md = self.metadata
+        if not md:
+            return None
+        records = md.get("all_copper") or []
+        if not records:
+            return None
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        pt = _sg.Point(world_x, world_y)
+        best: dict | None = None
+        best_rank = 1 << 30
+        for rec in records:
+            net = rec.get("net")
+            if not net:
+                continue
+            layer_id = rec.get("layer_id")
+            phys = id_to_phys.get(layer_id)
+            rank = self._phys_stackup_rank.get(phys, 1 << 30)
+            # A layer already hit at or above this one wins (topmost = the
+            # lowest stackup rank), so this record can't improve the pick.
+            if best is not None and rank >= best_rank:
+                continue
+            for poly in rec.get("polygons", []):
+                prepped = self._copper_poly_prepared(poly)
+                if prepped is None:
+                    continue
+                try:
+                    if not prepped.contains(pt):
+                        continue
+                except Exception:
+                    continue
+                best = {"net": net, "physical": phys, "layer_id": layer_id}
+                best_rank = rank
+                break
+        return best
 
     def _on_editor_click(self, world_x: float, world_y: float) -> None:
         """Editor-mode left-click: drop a pending free marker if one is
-        armed, else select the component / copper under the cursor."""
+        armed, else select the component / placed marker / copper under
+        the cursor."""
         if self._editor_pending_marker is not None:
             self._place_free_marker(world_x, world_y)
             return
+        # Component first: a marker sitting on a component reads as that
+        # component's source / sink, so clicking it loads the component
+        # properties rather than the free-marker form.
         comp = self._component_at(world_x, world_y)
         if comp is not None:
             self._select_component(comp)
+            return
+        marker = self._free_marker_at(world_x, world_y)
+        if marker is not None:
+            self._select_free_marker(marker)
             return
         net = self._net_at(world_x, world_y)
         if net:
@@ -9174,6 +9443,41 @@ class PdnViewer(QMainWindow):
         self._editor_selection = None
         self._clear_editor_highlight()
         self._update_editor_panel()
+
+    def _free_marker_at(self, world_x: float,
+                        world_y: float):
+        """The placed free-marker :class:`EditorDirective` whose anchor is
+        under the click, or ``None``. The hit radius scales with the view
+        zoom so it tracks the on-screen marker size; the nearest marker
+        wins when several overlap."""
+        if self._project is None:
+            return None
+        try:
+            _cx, _cy, mm_per_px = self._gl_viewer.view_center_scale()
+        except Exception:
+            mm_per_px = 0.1
+        radius = max(float(mm_per_px) * _EDITOR_MARKER_HIT_PX, 1e-6)
+        best = None
+        best_d2 = radius * radius
+        for d in self._project.editor_directives:
+            if d.kind != "free" or d.anchor_xy is None:
+                continue
+            dx = world_x - float(d.anchor_xy[0])
+            dy = world_y - float(d.anchor_xy[1])
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best, best_d2 = d, d2
+        return best
+
+    def _select_free_marker(self, directive) -> None:
+        """Select a placed free source / sink marker — the right-hand
+        panel opens its PDN form so the role / value / nets can be
+        edited (see :meth:`_populate_editor_form`)."""
+        self._editor_selection = {"kind": "free", "id": directive.id}
+        highlight = (self._connected_nets(directive.p_net)
+                     if directive.p_net else set())
+        self._apply_editor_highlight(highlight)
+        self._populate_editor_form()
 
     def _select_component(self, comp: dict) -> None:
         """Select a PCB component for PDN editing and highlight the copper
@@ -9264,6 +9568,43 @@ class PdnViewer(QMainWindow):
                     return (0.5 * (bbox[0] + bbox[2]),
                             0.5 * (bbox[1] + bbox[3]))
         return None
+
+    def _component_pad_points(
+        self, designator: str | None, nets,
+    ) -> list[tuple[float, float]]:
+        """Centres of the named component's pads that sit on any net in
+        ``nets`` — one point per matching pin.
+
+        Lets an editor directive draw a marker on every pin it couples to
+        (mirroring the solved-directive pin markers) instead of one glyph
+        at the component centre. Pad records are keyed ``"<comp>-<pad>"``
+        in the metadata, so the component prefix isolates this component's
+        pads. Returns ``[]`` when no pad matches, so the caller can fall
+        back to :meth:`_component_center`."""
+        if not designator or not self.metadata:
+            return []
+        want = {n for n in (nets or ()) if n}
+        if not want:
+            return []
+        prefix = f"{designator}-"
+        pts: list[tuple[float, float]] = []
+        for rec in self.metadata.get("pads", []):
+            des = rec.get("designator") or ""
+            if not des.startswith(prefix):
+                continue
+            if rec.get("net") not in want:
+                continue
+            ring = rec.get("outline")
+            if not ring:
+                continue
+            arr = np.asarray(ring, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[0] < 1:
+                continue
+            pts.append(
+                (0.5 * (float(arr[:, 0].min()) + float(arr[:, 0].max())),
+                 0.5 * (float(arr[:, 1].min()) + float(arr[:, 1].max())))
+            )
+        return pts
 
     def _directive_for_selection(self):
         """Return the :class:`EditorDirective` matching the current
@@ -9665,14 +10006,14 @@ class PdnViewer(QMainWindow):
         role = self._editor_pending_marker
         if role is None:
             return
-        net = self._net_at(world_x, world_y)
-        if not net:
+        pick = self._editor_copper_pick(world_x, world_y)
+        if pick is None or not pick.get("net"):
             self.statusBar().showMessage(
                 "No copper there — click on a copper region.", 4000)
             return
-        hit = self._probe_at_point(world_x, world_y)
-        layer = hit[1].get("physical") if hit is not None else None
-        layer_id = hit[1].get("layer_id") if hit is not None else None
+        net = pick["net"]
+        layer = pick.get("physical")
+        layer_id = pick.get("layer_id")
         d = EditorDirective(
             kind="free", role=role, anchor_xy=(world_x, world_y),
             layer=layer, layer_id=layer_id, single_net=True, p_net=net,
@@ -9690,39 +10031,101 @@ class PdnViewer(QMainWindow):
 
     def _editor_marker_groups(self) -> list:
         """MarkerGroups for the placed editor directives — drawn only in
-        editor mode so they don't clutter the normal viewer."""
+        editor mode so they don't clutter the normal viewer. The directive
+        matching the current selection is emphasised: a 30%-larger glyph
+        with a 30%-thicker outline, wrapped in a yellow selection box, so
+        the selected source / sink stands out from the rest."""
         if not self._editor_mode or self._project is None:
             return []
-        by_role: dict[str, list[tuple[float, float]]] = {}
+        selected = self._directive_for_selection()
+        sel_id = selected.id if selected is not None else None
+        # Keyed (role, is_selected) so the selected marker lands in its
+        # own group and can carry a larger size / thicker outline.
+        by_key: dict[tuple[str, bool], list[tuple[float, float]]] = {}
+        sel_pts: list[tuple[float, float]] = []
         for d in self._project.editor_directives:
             if d.kind == "free" and d.anchor_xy is not None:
-                pt = (float(d.anchor_xy[0]), float(d.anchor_xy[1]))
+                pts = [(float(d.anchor_xy[0]), float(d.anchor_xy[1]))]
             elif d.kind == "component":
-                pt = self._component_center(d.designator)
-                if pt is None:
-                    continue
+                # One marker per component pin on the directive's net(s),
+                # mirroring the solved-directive pin markers. Falls back to
+                # a single glyph at the component centre when no pad matches.
+                nets = [d.p_net]
+                if not d.single_net and d.n_net:
+                    nets.append(d.n_net)
+                pts = self._component_pad_points(d.designator, nets)
+                if not pts:
+                    ctr = self._component_center(d.designator)
+                    if ctr is None:
+                        continue
+                    pts = [ctr]
             else:
                 continue
-            by_role.setdefault(d.role, []).append(pt)
+            is_sel = d.id == sel_id
+            by_key.setdefault((d.role, is_sel), []).extend(pts)
+            if is_sel:
+                sel_pts.extend(pts)
+        # Outline width shared by the selected marker and its box.
+        sel_edge_w = 1.4 * _EDITOR_MARKER_SELECT_SCALE
         groups = []
-        for role, pts in by_role.items():
+        for (role, is_sel), pts in by_key.items():
             if not pts:
                 continue
             # Match the solved-directive markers — red up-triangle SOURCE,
             # blue down-triangle SINK (see _ROLE_MARKER_STYLE).
             style = self._ROLE_MARKER_STYLE.get(
                 role, {"symbol": "star", "color": "#ffffff", "size": 18})
+            emph = _EDITOR_MARKER_SELECT_SCALE if is_sel else 1.0
             groups.append(MarkerGroup(
                 xs=np.array([p[0] for p in pts], dtype=np.float64),
                 ys=np.array([p[1] for p in pts], dtype=np.float64),
                 zs=np.zeros(len(pts), dtype=np.float64),
                 color=style["color"],
                 symbol=style["symbol"],
-                size=style["size"] + 4,
+                size=int(round((style["size"] + 4) * emph)),
                 edge_color="#101010",
-                edge_width=1.4,
+                edge_width=sel_edge_w if is_sel else 1.4,
+            ))
+        # Yellow selection box around the emphasised marker — an unfilled
+        # rectangle hugging the enlarged glyph (the *_box symbols draw the
+        # triangle's true bounding rect, so no margin / no clipping),
+        # outlined at the same thickness as the selected marker's edge.
+        if sel_pts and selected is not None:
+            sel_style = self._ROLE_MARKER_STYLE.get(
+                selected.role, {"symbol": "s", "size": 18})
+            box_symbol = {"tri_up": "tri_up_box",
+                          "tri_down": "tri_down_box"}.get(
+                              sel_style.get("symbol"), "s")
+            # Same size as the selected glyph — the box symbol derives the
+            # tight rect from it. One box per pin of the selected directive.
+            box_px = int(round((sel_style["size"] + 4)
+                               * _EDITOR_MARKER_SELECT_SCALE))
+            groups.append(MarkerGroup(
+                xs=np.array([p[0] for p in sel_pts], dtype=np.float64),
+                ys=np.array([p[1] for p in sel_pts], dtype=np.float64),
+                zs=np.zeros(len(sel_pts), dtype=np.float64),
+                color="transparent",   # unfilled — outline only
+                symbol=box_symbol,
+                size=box_px,
+                edge_color="#ffff00",
+                edge_width=sel_edge_w,
             ))
         return groups
+
+    def _refresh_editor_selection(self) -> None:
+        """Push the selected component's world-space bounding box to the
+        GL viewer for its yellow selection box — the component-level twin
+        of the source / sink marker's selection box. Cleared when nothing,
+        or a non-component, is selected. Called every render so it stays
+        in sync without scattered set / clear calls."""
+        bbox = None
+        sel = self._editor_selection
+        if self._editor_mode and sel and sel.get("kind") == "component":
+            b = sel.get("bbox")
+            if b and len(b) == 4:
+                bbox = (float(b[0]), float(b[1]),
+                        float(b[2]), float(b[3]))
+        self._gl_viewer.set_editor_selection_bbox(bbox)
 
     # --- Editor mode: pending rails + resolve -------------------------------
 
@@ -9833,6 +10236,9 @@ class PdnViewer(QMainWindow):
                 "Re-solving with your editor changes…\n"
                 "Reusing the cached design info (no re-extraction)."
             ),
+            # ~2.78x Qt's auto-sized width — the standard solve dialog's
+            # 1.44x, widened further for the longer editor-changes message.
+            dialog_width_scale=2.78208,
         )
 
     def _on_gl_clicked(self, _world_x: float, _world_y: float) -> None:
@@ -11276,6 +11682,29 @@ class PdnViewer(QMainWindow):
         label_widget.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
         form.addRow(label_widget, self._theme_combo)
 
+        # High-quality zoom (supersampling / SSAA). When on, the heatmap
+        # canvas renders oversized and downsamples, so thin copper and
+        # outlines stay visible when zoomed far out instead of breaking
+        # up or vanishing. Costs GPU memory + fill while a viewer is open,
+        # hence a toggle; defaults on. Applied to the live canvas right
+        # here (the GL viewer already exists by the time this tab builds)
+        # so the setting takes effect without waiting for the next launch.
+        self._ssaa_check = QCheckBox("High-quality zoom (supersampling)")
+        self._ssaa_check.setChecked(load_supersampling_enabled())
+        self._ssaa_check.setToolTip(
+            "Render the heatmap canvas oversized and downsample it so thin "
+            "copper and outlines stay visible when zoomed far out, instead "
+            "of breaking up or vanishing. Uses more GPU memory while a "
+            "viewer window is open. The choice is remembered for the next "
+            "launch."
+        )
+        self._ssaa_check.toggled.connect(self._on_ssaa_toggled)
+        if self._gl_viewer is not None:
+            self._gl_viewer.set_supersampling(self._ssaa_check.isChecked())
+        ssaa_label = QLabel("High-quality zoom")
+        ssaa_label.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+        form.addRow(ssaa_label, self._ssaa_check)
+
         # Status / hint line. Starts with the static usage hint and is
         # overwritten by :meth:`_on_theme_combo_changed` to confirm a
         # toggle took effect and prompt the user to restart.
@@ -11289,6 +11718,13 @@ class PdnViewer(QMainWindow):
         self._theme_status_label.setWordWrap(True)
         form.addRow(QLabel(""), self._theme_status_label)
         return box
+
+    def _on_ssaa_toggled(self, checked: bool) -> None:
+        """Persist and apply the High-quality-zoom (supersampling) toggle.
+        Takes effect on the live canvas immediately — no relaunch."""
+        save_supersampling_enabled(bool(checked))
+        if self._gl_viewer is not None:
+            self._gl_viewer.set_supersampling(bool(checked))
 
     def _on_theme_combo_changed(self, _idx: int) -> None:
         """Handle the user picking a different theme from the combobox.
@@ -11998,7 +12434,80 @@ class PdnViewer(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        # View menu sits between File and Help.
+        self._build_view_menu()
         _build_help_menu(self)
+
+    def _build_view_menu(self) -> None:
+        """View menu — the display toggles that used to be side-panel
+        checkboxes (2D/3D view, via heatmap, no-current copper colour, FEM
+        mesh overlay).
+
+        Each action drives its hidden backing checkbox via ``toggle()`` so
+        the rest of the viewer's logic is untouched, and carries no
+        ``QShortcut`` of its own — the existing window hotkeys (see
+        :meth:`_install_hotkeys`) still own the keys, and the menu labels
+        merely echo them. Labels flip with state; see
+        :meth:`_refresh_view_menu_labels`."""
+        view_menu = self.menuBar().addMenu("&View")
+
+        self._act_view_3d = QAction(self)
+        self._act_view_3d.setStatusTip(
+            "Switch between the 2D top-down heatmap and the 3D perspective "
+            "view of the stacked copper layers."
+        )
+        self._act_view_3d.triggered.connect(
+            lambda: self.view_3d_box.toggle())
+        view_menu.addAction(self._act_view_3d)
+
+        self._act_heatmap_vias = QAction(self)
+        self._act_heatmap_vias.setStatusTip(
+            "Colour via and plated-through-hole cylinders by the active "
+            "heatmap mode instead of solid orange / grey (3D mode only)."
+        )
+        self._act_heatmap_vias.triggered.connect(
+            lambda: self.heatmap_vias_box.toggle())
+        view_menu.addAction(self._act_heatmap_vias)
+
+        self._act_colour_stubs = QAction(self)
+        self._act_colour_stubs.setStatusTip(
+            "Draw copper that carries no current as flat dim grey instead "
+            "of its approximate (voltage-sampled) heatmap colour."
+        )
+        self._act_colour_stubs.triggered.connect(
+            lambda: self.colour_stubs_box.toggle())
+        view_menu.addAction(self._act_colour_stubs)
+
+        self._act_show_mesh = QAction(self)
+        self._act_show_mesh.setStatusTip(
+            "Overlay the FEM triangulation on the heatmap as a fine dark "
+            "wireframe — useful for judging local mesh density."
+        )
+        self._act_show_mesh.triggered.connect(
+            lambda: self.show_mesh_box.toggle())
+        view_menu.addAction(self._act_show_mesh)
+
+    def _refresh_view_menu_labels(self) -> None:
+        """Update the View menu item labels to track the current display
+        state. Wired to each backing checkbox's ``toggled`` signal, so it
+        fires whether the toggle came from the menu, a hotkey, or a
+        restored project setting."""
+        if not hasattr(self, "_act_view_3d"):
+            return
+        self._act_view_3d.setText(
+            "2D View (2)" if self.view_3d_box.isChecked()
+            else "3D View (3)")
+        self._act_heatmap_vias.setText(
+            "Heatmap vias / PTH [enabled] (V)"
+            if self.heatmap_vias_box.isChecked()
+            else "Heatmap vias / PTH [disabled] (V)")
+        self._act_colour_stubs.setText(
+            "No current copper colour [heatmap]"
+            if self.colour_stubs_box.isChecked()
+            else "No current copper colour [grey]")
+        self._act_show_mesh.setText(
+            "Hide Mesh" if self.show_mesh_box.isChecked()
+            else "Show Mesh")
 
     def _menu_start_dir(self) -> str:
         """Best-effort starting directory for the file dialogs: the folder
@@ -12511,6 +13020,7 @@ class PdnViewer(QMainWindow):
         editor_directives: list | None = None,
         dialog_title: str = "Running solver",
         dialog_text: str | None = None,
+        dialog_width_scale: float = 1.44,
     ) -> None:
         """Show an indeterminate progress dialog and run :class:`_SolveWorker`
         off-thread; on success, open a fresh viewer via
@@ -12536,9 +13046,10 @@ class PdnViewer(QMainWindow):
         QApplication.processEvents()
         # 44% wider than Qt's auto-sized width so the longer per-stage
         # status messages ("Packaging solution: building metadata…",
-        # "Opening viewer…", etc.) aren't truncated.
+        # "Opening viewer…", etc.) aren't truncated. Callers can widen
+        # further via ``dialog_width_scale``.
         _sz = dlg.size()
-        dlg.setFixedSize(int(_sz.width() * 1.44), _sz.height())
+        dlg.setFixedSize(int(_sz.width() * dialog_width_scale), _sz.height())
 
         # Stash refs on ``self`` so the QThread + dialog survive past this
         # handler returning — Qt + Python both need them alive until the
