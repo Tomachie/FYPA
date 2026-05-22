@@ -903,8 +903,9 @@ def _build_all_copper_records(
     per_net_layers: list[GeometryLayer] | None,
     net_name_fn,
 ) -> list[dict]:
-    """Pack per-(layer, net) copper polygon rings for the "Show all copper"
-    overlay. Each record: ``{layer_id, net, polygons: [{exterior, holes}, ...]}``
+    """Pack per-(layer, net) copper polygon rings for the Overlays
+    control's per-layer "all copper" view.
+    Each record: ``{layer_id, net, polygons: [{exterior, holes}, ...]}``
     with rings stored as ``(N, 2) float32`` numpy arrays (same compact form
     as :func:`_build_stub_record`)."""
     if not per_net_layers:
@@ -941,6 +942,190 @@ def _build_all_copper_records(
             "polygons": ring_polys,
         })
     return out
+
+
+# Altium classic layer ids for the silkscreen (overlay) layers.
+_TOP_OVERLAY_LAYER_ID = 33
+_BOT_OVERLAY_LAYER_ID = 34
+_OVERLAY_LAYER_IDS = (_TOP_OVERLAY_LAYER_ID, _BOT_OVERLAY_LAYER_ID)
+
+
+def _arc_polyline(arc) -> list[list[float]]:
+    """Tessellate a :class:`RawArc` into an origin-corrected ``[x, y]``
+    polyline. Altium stores arc angles in degrees and sweeps CCW; a
+    non-positive sweep is wrapped by a full turn."""
+    start = math.radians(arc.start_angle_deg)
+    end = math.radians(arc.end_angle_deg)
+    sweep = end - start
+    if sweep <= 1e-9:
+        sweep += 2.0 * math.pi
+    n = max(2, int(abs(sweep) / math.radians(12.0)) + 1)
+    cx, cy, r = arc.center.x, arc.center.y, arc.radius_mm
+    return [[cx + r * math.cos(start + sweep * k / n),
+             cy + r * math.sin(start + sweep * k / n)]
+            for k in range(n + 1)]
+
+
+def _stroke_font_tables(kind: int):
+    """Return ``(glyphs, advances)`` for one of Altium's three built-in PCB
+    stroke fonts — 0 = Default, 1 = Sans Serif, 2 = Serif."""
+    import altium_monkey.altium_stroke_font_data as sfd
+    if kind == 1:
+        return sfd.STROKE_FONT_SANS_SERIF, sfd.STROKE_ADVANCES_SANS_SERIF
+    if kind == 2:
+        return sfd.STROKE_FONT_SERIF, sfd.STROKE_ADVANCES_SERIF
+    return sfd.STROKE_FONT_DEFAULT, sfd.STROKE_ADVANCES_DEFAULT
+
+
+def _stroke_text_polylines(text: str, stroke_kind: int, height_mm: float,
+                           anchor_x: float, anchor_y: float,
+                           rotation_deg: float, mirrored: bool) -> list[list]:
+    """Lay a string out in one of Altium's built-in single-stroke fonts.
+
+    Returns the glyph stroke polylines as ``[[x, y], ...]`` lists in the
+    origin-corrected millimetre frame — the exact vector geometry Altium
+    itself strokes designators with. The glyph tables store coordinates
+    normalised to a unit character height with a y=0 baseline; advances
+    (already including Altium's per-font multiplier) are in the same unit.
+    """
+    if height_mm <= 0.0 or not text:
+        return []
+    try:
+        glyphs, advances = _stroke_font_tables(stroke_kind)
+    except Exception:
+        return []
+
+    # Lay out left-to-right along the baseline, in height-normalised units.
+    local: list[list[tuple[float, float]]] = []
+    pen = 0.0
+    for ch in text:
+        code = ord(ch)
+        for stroke in glyphs.get(code, ()):
+            if len(stroke) >= 2:
+                local.append([(pen + px, py) for px, py in stroke])
+        pen += float(advances.get(code, 0.7))
+    if not local:
+        return []
+
+    # Scale to mm; mirror bottom-side text; rotate; translate to the anchor.
+    ang = math.radians(rotation_deg)
+    cos_a, sin_a = math.cos(ang), math.sin(ang)
+    sx = -1.0 if mirrored else 1.0
+    out: list[list] = []
+    for stroke in local:
+        pts: list = []
+        for px, py in stroke:
+            lx = sx * px * height_mm
+            ly = py * height_mm
+            pts.append([anchor_x + lx * cos_a - ly * sin_a,
+                        anchor_y + lx * sin_a + ly * cos_a])
+        out.append(pts)
+    return out
+
+
+def _build_overlay_records(proj: ExtractedProject, net_name_fn) -> dict:
+    """Build the silkscreen / component-body / designator overlay records
+    consumed by the viewer's Overlays control.
+
+    All coordinates are the same origin-corrected millimetre frame as the
+    mesh. ``silkscreen`` is a list of ``{side, polyline}``; ``components``
+    a list of ``{designator, side, bbox, nets}`` (axis-aligned bounding
+    box of the component's pads); ``designators`` a list of
+    ``{text, x_mm, y_mm, height_mm, rotation_deg, side, nets}``."""
+    def _side(layer_id: int) -> str:
+        return "bottom" if layer_id == _BOT_OVERLAY_LAYER_ID else "top"
+
+    # Overlay graphics — the tracks and (tessellated) arcs on the Top /
+    # Bottom Overlay layers: component silkscreen outlines, polarity marks,
+    # board markings. Text is deliberately excluded — reference designators
+    # are their own overlay, and component comment / value strings are a
+    # component property Altium hides on the overlay by default.
+    silkscreen: list[dict] = []
+    for t in proj.tracks:
+        if t.layer_id in _OVERLAY_LAYER_IDS:
+            silkscreen.append({
+                "kind": "line",
+                "side": _side(t.layer_id),
+                "width_mm": float(t.width_mm),
+                "polyline": [[t.a.x, t.a.y], [t.b.x, t.b.y]],
+            })
+    for a in proj.arcs:
+        if a.layer_id in _OVERLAY_LAYER_IDS:
+            silkscreen.append({
+                "kind": "line",
+                "side": _side(a.layer_id),
+                "width_mm": float(a.width_mm),
+                "polyline": _arc_polyline(a),
+            })
+
+    # Per-component net set + pad-extent points (for the body bounding box).
+    # The half-diagonal extent guarantees the box contains each pad even
+    # after the component's placement rotation.
+    comp_nets: dict[int, set[str]] = {}
+    comp_pts: dict[int, list[tuple[float, float]]] = {}
+    for p in proj.pads:
+        ci = p.component_index
+        if ci < 0:
+            continue
+        comp_nets.setdefault(ci, set()).add(net_name_fn(p.net_index))
+        half = 0.5 * math.hypot(p.width_mm, p.height_mm)
+        comp_pts.setdefault(ci, []).extend((
+            (p.center.x - half, p.center.y - half),
+            (p.center.x + half, p.center.y + half),
+        ))
+
+    components: list[dict] = []
+    for ci, comp in enumerate(proj.pcb_components):
+        pts = comp_pts.get(ci)
+        if not pts:
+            continue
+        xs = [x for x, _ in pts]
+        ys = [y for _, y in pts]
+        side = ("bottom" if str(comp.layer_name).upper().startswith("B")
+                else "top")
+        components.append({
+            "designator": comp.designator,
+            "side": side,
+            "bbox": [min(xs), min(ys), max(xs), max(ys)],
+            "nets": sorted(comp_nets.get(ci, set())),
+        })
+
+    designators: list[dict] = []
+    for t in proj.texts:
+        if not t.is_designator or not t.text:
+            continue
+        ci = t.component_index
+        if t.layer_id in _OVERLAY_LAYER_IDS:
+            side = _side(t.layer_id)
+        else:
+            side = "bottom" if t.is_mirrored else "top"
+        # Stroke-font designators are laid out into the exact single-stroke
+        # vector geometry Altium draws — so the viewer renders them in the
+        # real Altium stroke font, not a substitute. TrueType designators
+        # ship with empty polylines and the viewer falls back to a label.
+        polylines: list = []
+        if t.is_stroke:
+            polylines = _stroke_text_polylines(
+                t.text, t.stroke_kind, t.height_mm,
+                t.center.x, t.center.y, t.rotation_deg, t.is_mirrored,
+            )
+        designators.append({
+            "text": t.text,
+            "x_mm": t.center.x,
+            "y_mm": t.center.y,
+            "height_mm": t.height_mm,
+            "rotation_deg": t.rotation_deg,
+            "side": side,
+            "nets": sorted(comp_nets.get(ci, set())) if ci >= 0 else [],
+            "stroke_width_mm": t.stroke_width_mm,
+            "polylines": polylines,
+        })
+
+    return {
+        "silkscreen": silkscreen,
+        "components": components,
+        "designators": designators,
+    }
 
 
 def _gil_yield(i: int, every: int = 256) -> None:
@@ -1142,7 +1327,8 @@ def build_solve_metadata(
                 "segments": site_segments,
             })
 
-    # Pad outlines for the viewer's "Show pads" overlay — every SMT or
+    # Pad outlines for the viewer's Overlays control (the Pads row) —
+    # every SMT or
     # through-hole pad reduced to its exterior copper polygon (no drill
     # subtraction) plus the list of enabled copper layer_ids it sits on.
     # SMT pads live on one layer; through-hole / multi-layer pads span the
@@ -1204,12 +1390,16 @@ def build_solve_metadata(
 
     # Per-(layer, net) copper outline rings for every net on the board —
     # active rails, other rails, and signal nets alike. Lets the viewer's
-    # "Show all copper" overlay outline copper that doesn't belong to the
-    # currently selected rail. Rings stored as float32 (x, y) arrays — same
+    # Overlays control draw copper that doesn't belong to the currently
+    # selected rail. Rings stored as float32 (x, y) arrays — same
     # compact representation used by ``stubs``.
     all_copper: list[dict] = _build_all_copper_records(
         per_net_layers, _net_name,
     )
+
+    # Silkscreen lines, component bounding boxes and reference-designator
+    # text for the viewer's Overlays control (Heatmap tab).
+    overlay_records = _build_overlay_records(proj, _net_name)
 
     return {
         "project_name": proj.prjpcb_path.stem,
@@ -1288,6 +1478,11 @@ def build_solve_metadata(
         "pads": pads_outline,
         "stubs": stubs,
         "all_copper": all_copper,
+        # Overlays-control geometry (Heatmap tab): silkscreen lines,
+        # component bounding boxes, reference-designator text.
+        "silkscreen": overlay_records["silkscreen"],
+        "components": overlay_records["components"],
+        "designators": overlay_records["designators"],
         # Closed polyline (list of [x_mm, y_mm]) of the PCB's mechanical
         # board outline. Empty list when the project has no outline.
         # Drawn as the "Show board outline" overlay in the viewer.
@@ -1606,8 +1801,8 @@ def build_problem(
     * ``per_net_layers`` — the full per-(physical_layer, net) Shapely
       geometry for *every* net on the board, active or not. Passed to
       :func:`build_solve_metadata` so the viewer can outline copper
-      belonging to other rails / signal nets via the "Show all copper"
-      overlay. The FEM itself only uses the active subset.
+      belonging to other rails / signal nets via the Overlays control.
+      The FEM itself only uses the active subset.
     """
     # Build padne Layers per (physical_layer, net) — so each net is its own
     # conductor in the FEM and cross-net unioning artefacts cannot bleed

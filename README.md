@@ -103,8 +103,8 @@ define the power-delivery topology:
 
 | Role         | Required parameters                                                                                     | What it means                                                         |
 |--------------|---------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
-| `SOURCE`     | `PDN_V`, `PDN_P_NET`, `PDN_N_NET` — *or* `PDN_V`, `PDN_NET`                                              | Voltage source between the two nets (e.g. a connector pin)            |
-| `SINK`       | `PDN_I`, `PDN_P_NET`, `PDN_N_NET` — *or* `PDN_I`, `PDN_NET`                                              | Current sink between the two nets (e.g. an IC load)                   |
+| `SOURCE`     | `PDN_V`, `PDN_P_NET`, `PDN_N_NET` — *or* `PDN_V`, `PDN_NET`                                              | Voltage source (e.g. a connector pin or regulator)            |
+| `SINK`       | `PDN_I`, `PDN_P_NET`, `PDN_N_NET` — *or* `PDN_I`, `PDN_NET`                                              | Current sink  (e.g. an IC load)                   |
 | `SERIES`     | `PDN_R`, `PDN_P_NET`\*, `PDN_N_NET`\*                                                                   | Series resistance / fuse / ferrite / inductor DCR (rail bridge)       |
 | `REGULATOR`  | `PDN_V`, `PDN_GAIN`, `PDN_OUT_P_NET`, `PDN_OUT_N_NET`, `PDN_IN_P_NET`, `PDN_IN_N_NET`                   | On-board regulator (LDO / buck) — models BOTH input and output rails  |
 
@@ -177,7 +177,7 @@ U7 (multi-rail IC load):
   PDN2_I     = 50mA      PDN2_P_NET = +5V    PDN2_N_NET = GND
 ```
 
-The Setup tab and the Pins-tab table label indexed channels as
+The Setup tab and the Nodes-tab table label indexed channels as
 `U7#1`, `U7#2` so they're easy to tell apart from the legacy `U7` channel.
 
 `SERIES` and `REGULATOR` ignore the index suffix and behave as

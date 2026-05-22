@@ -219,6 +219,38 @@ class RawFill:
 
 
 @dataclass(frozen=True, slots=True)
+class RawText:
+    """A PCB text string (from Altium's ``Texts6`` stream).
+
+    Covers free-standing text as well as the per-component reference
+    designator and comment strings. ``component_index`` links the latter
+    back to :attr:`ExtractedProject.pcb_components` (-1 if free-standing).
+    ``layer_id`` 33 / 34 are the Top / Bottom Overlay (silkscreen) layers.
+    """
+    text: str
+    center: Pt2D              # text anchor point, origin-corrected mm
+    height_mm: float          # character height
+    rotation_deg: float
+    layer_id: int
+    component_index: int      # -1 if not part of a component
+    is_designator: bool       # the component's reference designator
+    is_comment: bool          # the component's comment / value string
+    is_mirrored: bool         # placed on a bottom-side layer (reads mirrored)
+    # Font: Altium PCB text is drawn either with one of three built-in
+    # single-stroke vector fonts or a TrueType face. ``is_stroke`` is True
+    # for the stroke fonts; ``stroke_kind`` then selects which (0 = Default,
+    # 1 = Sans Serif, 2 = Serif). ``stroke_width_mm`` is the stroke pen
+    # width. ``font_name`` / ``is_bold`` / ``is_italic`` describe the
+    # TrueType case.
+    is_stroke: bool = True
+    stroke_kind: int = 0
+    stroke_width_mm: float = 0.0
+    font_name: str = ""
+    is_bold: bool = False
+    is_italic: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RawPcbComponent:
     designator: str           # physical (PCB) designator, e.g. 'C144_PWR_SW13'
     center: Pt2D
@@ -292,6 +324,10 @@ class ExtractedProject:
     # Layer Type = Board), in mm, origin-corrected. Arc segments have
     # been discretised. Empty tuple when the project carries no outline.
     board_outline: tuple[Pt2D, ...] = ()
+    # PCB text strings (designators, comments, free-standing text). Optional
+    # with an empty default so older callers that build ExtractedProject
+    # without texts keep working.
+    texts: tuple[RawText, ...] = ()
 
     def enabled_copper_layer_ids(self) -> list[int]:
         """Layer ids forming the actually-enabled copper stack, in Top→Bottom order.
@@ -380,6 +416,47 @@ def _extract_arcs(pcb, ox_mm: float, oy_mm: float) -> tuple[RawArc, ...]:
             layer_id=int(a.layer),
             net_index=_net_index(a.net_index),
             is_keepout=bool(a.is_keepout),
+        ))
+    return tuple(out)
+
+
+def _extract_texts(pcb, ox_mm: float, oy_mm: float) -> tuple[RawText, ...]:
+    """Extract every PCB text string from the ``Texts6`` stream.
+
+    Unicode text is stored out-of-line in the wide-strings table; fall
+    back to the inline ``text_content`` for the common ASCII case (and
+    when no wide-strings table is exposed by this altium_monkey build)."""
+    out: list[RawText] = []
+    wst = getattr(pcb, "widestrings_table", None)
+    for t in pcb.texts:
+        content = ""
+        if wst is not None and hasattr(t, "resolve_text_content"):
+            try:
+                content = t.resolve_text_content(wst) or ""
+            except Exception:
+                content = ""
+        if not content:
+            content = str(getattr(t, "text_content", "") or "")
+        # Font: ``font_type`` 0 == one of Altium's built-in stroke fonts;
+        # ``stroke_font_type`` then picks Default / Sans Serif / Serif.
+        font_type = int(getattr(t, "font_type", 0) or 0)
+        out.append(RawText(
+            text=content,
+            center=_pt_from_mils(t.x_mils, t.y_mils, ox_mm, oy_mm),
+            height_mm=mils_to_mm(float(getattr(t, "height_mils", 0.0) or 0.0)),
+            rotation_deg=float(getattr(t, "rotation", 0.0) or 0.0),
+            layer_id=int(getattr(t, "layer", 0) or 0),
+            component_index=_component_index(getattr(t, "component_index", None)),
+            is_designator=bool(getattr(t, "is_designator", False)),
+            is_comment=bool(getattr(t, "is_comment", False)),
+            is_mirrored=bool(getattr(t, "is_mirrored", False)),
+            is_stroke=(font_type == 0),
+            stroke_kind=int(getattr(t, "stroke_font_type", 0) or 0),
+            stroke_width_mm=mils_to_mm(
+                float(getattr(t, "stroke_width_mils", 0.0) or 0.0)),
+            font_name=str(getattr(t, "font_name", "") or ""),
+            is_bold=bool(getattr(t, "is_bold", False)),
+            is_italic=bool(getattr(t, "is_italic", False)),
         ))
     return tuple(out)
 
@@ -811,6 +888,7 @@ def extract_project(prjpcb_path: str | Path,
         arcs=_extract_arcs(pcb, ox_mm, oy_mm),
         vias=_extract_vias(pcb, ox_mm, oy_mm),
         pads=_extract_pads(pcb, ox_mm, oy_mm),
+        texts=_extract_texts(pcb, ox_mm, oy_mm),
         regions=_extract_regions(pcb, ox_mm, oy_mm),
         shape_based_regions=_extract_shape_based_regions(pcb, ox_mm, oy_mm),
         fills=_extract_fills(pcb, ox_mm, oy_mm),

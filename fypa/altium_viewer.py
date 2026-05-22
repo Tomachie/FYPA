@@ -114,6 +114,78 @@ def _load_app_icon() -> QIcon | None:
     return icon
 
 
+_EDITMODE_ICON_CACHE: dict[str, QIcon] = {}
+
+# Tint for the editor-mode toggle icon when the button is CHECKED — the
+# checked state shows a light accent background that washes a light glyph
+# out, so the checked (On) state uses a near-black glyph instead.
+_EDITMODE_ICON_CHECKED_COLOR = "#101010"
+
+
+def _load_editmode_icon(color: str = "#d8dee9") -> QIcon | None:
+    """Return the editor-mode toggle icon (``assets/icon_editmode.svg``).
+
+    The icon carries two states: ``color`` tints the unchecked (Off) glyph
+    so it reads against the dark / bluish viewport; the checked (On) glyph
+    is tinted near-black so it stays legible against the light accent
+    background the button shows while editor mode is active. Qt swaps the
+    two automatically with the QToolButton's checked state. Cached per
+    ``color``."""
+    if color in _EDITMODE_ICON_CACHE:
+        return _EDITMODE_ICON_CACHE[color]
+    svg_path = _ICON_DIR / "icon_editmode.svg"
+    if not svg_path.is_file():
+        return None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+    except ImportError:
+        return None
+    renderer = QSvgRenderer(str(svg_path))
+    if not renderer.isValid():
+        return None
+    def _tinted(size: int, tint: str) -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        renderer.render(painter)
+        # Tint: paint the colour through the rendered glyph's alpha mask.
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(pm.rect(), QColor(tint))
+        painter.end()
+        return pm
+
+    # Two states: ``color`` for the unchecked (Off) button on the dark
+    # viewport; a near-black glyph for the checked (On) state, whose light
+    # accent background would otherwise wash a light glyph out. Qt swaps
+    # them automatically with the QToolButton's checked state.
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64):
+        icon.addPixmap(_tinted(size, color), QIcon.Normal, QIcon.Off)
+        icon.addPixmap(_tinted(size, _EDITMODE_ICON_CHECKED_COLOR),
+                       QIcon.Normal, QIcon.On)
+    _EDITMODE_ICON_CACHE[color] = icon
+    return icon
+
+
+def _triangle_icon(color: str, up: bool = True) -> QIcon:
+    """A small filled-triangle :class:`QIcon` — an up triangle for SOURCE,
+    a down triangle for SINK — tinted to ``color`` to match the viewport's
+    directive markers (see ``PdnViewer._ROLE_MARKER_STYLE``)."""
+    pm = QPixmap(20, 20)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setBrush(QColor(color))
+    p.setPen(QColor("#101010"))
+    if up:
+        pts = [QPointF(10, 3), QPointF(17.5, 16.5), QPointF(2.5, 16.5)]
+    else:
+        pts = [QPointF(2.5, 3.5), QPointF(17.5, 3.5), QPointF(10, 17)]
+    p.drawPolygon(QPolygonF(pts))
+    p.end()
+    return QIcon(pm)
+
+
 # FYPA branding assets — stacked above the H2 on the welcome window.
 # Both are pre-rendered PNGs because Qt's QSvgRenderer can't handle the
 # clipPaths in the master SVGs (the red/blue arrow triangles are
@@ -188,7 +260,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -206,6 +280,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -547,10 +622,14 @@ class EyeButton(QToolButton):
     toggled_visible = Signal(bool)
 
     def __init__(self, parent=None, *, visible: bool = True,
-                 icon_size: int = 16) -> None:
+                 icon_size: int = 16,
+                 tip_show: str = "Show layer",
+                 tip_hide: str = "Hide layer") -> None:
         super().__init__(parent)
         self._visible = bool(visible)
         self._icon_size = icon_size
+        self._tip_show = tip_show
+        self._tip_hide = tip_hide
         self.setAutoRaise(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setIconSize(QSize(icon_size, icon_size))
@@ -573,10 +652,519 @@ class EyeButton(QToolButton):
 
     def _apply_icon(self) -> None:
         self.setIcon(QIcon(_eye_pixmap(self._visible, self._icon_size)))
-        self.setToolTip("Hide layer" if self._visible else "Show layer")
+        self.setToolTip(self._tip_hide if self._visible else self._tip_show)
 
     def _on_clicked(self) -> None:
         self.setVisibleState(not self._visible)
+
+
+# --- Wire-mesh / solid fill toggle icons -----------------------------------
+
+_FILL_PIXMAP_CACHE: dict[tuple[str, bool, int], QPixmap] = {}
+
+
+def _make_fill_pixmap(solid: bool, *, size: int = 16) -> QPixmap:
+    """Draw a fill-style icon for an overlay row.
+
+    ``solid`` = True  → a solid-filled square (overlay drawn as solid fill).
+    ``solid`` = False → an outlined square (overlay drawn as a wire mesh).
+    """
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    color = QColor(current_theme()["eye_open"])
+    inset = size * 0.20
+    rect = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    pen = QPen(color)
+    pen.setWidthF(max(1.2, size * 0.11))
+    pen.setJoinStyle(Qt.MiterJoin)
+    p.setPen(pen)
+    p.setBrush(color if solid else Qt.NoBrush)
+    p.drawRect(rect)
+
+    p.end()
+    return px
+
+
+def _fill_pixmap(solid: bool, size: int = 16) -> QPixmap:
+    key = (current_theme_mode(), solid, size)
+    cached = _FILL_PIXMAP_CACHE.get(key)
+    if cached is None:
+        cached = _make_fill_pixmap(solid, size=size)
+        _FILL_PIXMAP_CACHE[key] = cached
+    return cached
+
+
+class FillToggleButton(QToolButton):
+    """Outline-vs-solid fill toggle for an overlay row.
+
+    Mirrors :class:`EyeButton` — a small auto-raise tool button whose icon
+    flips between an outlined square (wire mesh) and a solid square."""
+
+    toggled_fill = Signal(bool)  # True == solid fill
+
+    def __init__(self, parent=None, *, solid: bool = True,
+                 icon_size: int = 16) -> None:
+        super().__init__(parent)
+        self._solid = bool(solid)
+        self._icon_size = icon_size
+        self.setAutoRaise(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(icon_size + 6, icon_size + 6)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._apply_icon()
+        self.clicked.connect(self._on_clicked)
+
+    def isSolid(self) -> bool:
+        return self._solid
+
+    def setSolid(self, on: bool, *, emit: bool = True) -> None:
+        on = bool(on)
+        if on == self._solid:
+            return
+        self._solid = on
+        self._apply_icon()
+        if emit:
+            self.toggled_fill.emit(self._solid)
+
+    def _apply_icon(self) -> None:
+        self.setIcon(QIcon(_fill_pixmap(self._solid, self._icon_size)))
+        self.setToolTip(
+            "Solid fill — click for wire mesh" if self._solid
+            else "Wire mesh — click for solid fill"
+        )
+
+    def _on_clicked(self) -> None:
+        self.setSolid(not self._solid)
+
+
+# --- Layer-outline toggle icons --------------------------------------------
+
+_OUTLINE_PIXMAP_CACHE: dict[tuple[str, bool, int], QPixmap] = {}
+
+
+def _make_outline_pixmap(on: bool, *, size: int = 16) -> QPixmap:
+    """Draw a layer-outline toggle icon.
+
+    ``on``  = True  → a muted square wrapped by a bright traced contour
+                      (layer outlines shown).
+    ``on``  = False → just the muted square with a faint dotted contour
+                      (layer outlines hidden).
+    """
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    t = current_theme()
+    body = QColor(t["eye_closed"])
+    trace = QColor(t["eye_open"] if on else t["eye_closed"])
+
+    # Inner filled square — the copper polygon being traced.
+    inset = size * 0.32
+    inner = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    p.setPen(Qt.NoPen)
+    p.setBrush(body)
+    p.drawRect(inner)
+
+    # Outer square outline — the traced layer boundary.
+    o = size * 0.14
+    outer = QRectF(o, o, size - 2 * o, size - 2 * o)
+    pen = QPen(trace)
+    pen.setJoinStyle(Qt.MiterJoin)
+    if on:
+        pen.setWidthF(max(1.2, size * 0.11))
+    else:
+        pen.setWidthF(max(1.0, size * 0.075))
+        pen.setStyle(Qt.DotLine)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(outer)
+
+    p.end()
+    return px
+
+
+def _outline_pixmap(on: bool, size: int = 16) -> QPixmap:
+    key = (current_theme_mode(), on, size)
+    cached = _OUTLINE_PIXMAP_CACHE.get(key)
+    if cached is None:
+        cached = _make_outline_pixmap(on, size=size)
+        _OUTLINE_PIXMAP_CACHE[key] = cached
+    return cached
+
+
+class OutlineToggleButton(QToolButton):
+    """Layer-outline visibility toggle for the "All Layers" row.
+
+    Mirrors :class:`FillToggleButton` — a small auto-raise tool button,
+    the same size as the wire-mesh / solid toggle it sits beside. Its
+    icon flips between a bright traced contour (outlines shown) and a
+    faint dotted one (outlines hidden). Drives the same state the old
+    "Show layer outlines" checkbox used to."""
+
+    toggled_outline = Signal(bool)  # True == layer outlines shown
+
+    def __init__(self, parent=None, *, on: bool = False,
+                 icon_size: int = 16) -> None:
+        super().__init__(parent)
+        self._on = bool(on)
+        self._icon_size = icon_size
+        self.setAutoRaise(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(icon_size + 6, icon_size + 6)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._apply_icon()
+        self.clicked.connect(self._on_clicked)
+
+    def isOn(self) -> bool:
+        return self._on
+
+    def setOn(self, on: bool, *, emit: bool = True) -> None:
+        on = bool(on)
+        if on == self._on:
+            return
+        self._on = on
+        self._apply_icon()
+        if emit:
+            self.toggled_outline.emit(self._on)
+
+    def toggle(self) -> None:
+        self.setOn(not self._on)
+
+    def _apply_icon(self) -> None:
+        self.setIcon(QIcon(_outline_pixmap(self._on, self._icon_size)))
+        self.setToolTip(
+            "Layer outlines shown (O) — click to hide" if self._on
+            else "Layer outlines hidden (O) — click to show"
+        )
+
+    def _on_clicked(self) -> None:
+        self.setOn(not self._on)
+
+
+# --- Split / merge toggle icons --------------------------------------------
+
+_SPLIT_PIXMAP_CACHE: dict[tuple[str, bool, int], QPixmap] = {}
+
+
+def _make_split_pixmap(split: bool, *, size: int = 16) -> QPixmap:
+    """Draw a split / merge icon for overlay rows with a top + bottom side.
+
+    ``split`` = False → one square with a dashed mid-line ("click to split").
+    ``split`` = True  → two stacked squares with a gap ("click to merge").
+    """
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    color = QColor(current_theme()["eye_open"])
+    pen = QPen(color)
+    pen.setWidthF(max(1.0, size * 0.09))
+    pen.setJoinStyle(Qt.MiterJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    inset = size * 0.20
+    w = size - 2 * inset
+    if split:
+        # Two separate halves with a clear gap — the result of a split.
+        gap = size * 0.14
+        h = (w - gap) / 2.0
+        p.drawRect(QRectF(inset, inset, w, h))
+        p.drawRect(QRectF(inset, inset + h + gap, w, h))
+    else:
+        # One box with a dashed line marking where it would be cut.
+        p.drawRect(QRectF(inset, inset, w, w))
+        dash = QPen(color)
+        dash.setWidthF(max(1.0, size * 0.09))
+        dash.setStyle(Qt.DashLine)
+        p.setPen(dash)
+        cy = size / 2.0
+        p.drawLine(QPointF(inset, cy), QPointF(inset + w, cy))
+
+    p.end()
+    return px
+
+
+def _split_pixmap(split: bool, size: int = 16) -> QPixmap:
+    key = (current_theme_mode(), split, size)
+    cached = _SPLIT_PIXMAP_CACHE.get(key)
+    if cached is None:
+        cached = _make_split_pixmap(split, size=size)
+        _SPLIT_PIXMAP_CACHE[key] = cached
+    return cached
+
+
+class SplitButton(QToolButton):
+    """Toggle that splits an overlay row into separate Top / Bottom rows."""
+
+    toggled_split = Signal(bool)
+
+    def __init__(self, parent=None, *, split: bool = False,
+                 icon_size: int = 16) -> None:
+        super().__init__(parent)
+        self._split = bool(split)
+        self._icon_size = icon_size
+        self.setAutoRaise(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(icon_size + 6, icon_size + 6)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._apply_icon()
+        self.clicked.connect(self._on_clicked)
+
+    def isSplit(self) -> bool:
+        return self._split
+
+    def setSplit(self, on: bool, *, emit: bool = True) -> None:
+        on = bool(on)
+        if on == self._split:
+            return
+        self._split = on
+        self._apply_icon()
+        if emit:
+            self.toggled_split.emit(self._split)
+
+    def _apply_icon(self) -> None:
+        self.setIcon(QIcon(_split_pixmap(self._split, self._icon_size)))
+        self.setToolTip(
+            "Merge the Top / Bottom rows back into one" if self._split
+            else "Split into separate Top / Bottom rows"
+        )
+
+    def _on_clicked(self) -> None:
+        self.setSplit(not self._split)
+
+
+# --- Board-feature colour swatch -------------------------------------------
+
+
+def _make_swatch_pixmap(rgb: tuple[float, float, float], *,
+                        size: int = 16) -> QPixmap:
+    """Draw a colour-swatch icon for a Board Features row — a rounded square
+    filled with ``rgb`` (each channel 0..1) and a faint theme-coloured edge."""
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    inset = size * 0.16
+    rect = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    pen = QPen(QColor(current_theme()["border"]))
+    pen.setWidthF(max(1.0, size * 0.07))
+    p.setPen(pen)
+    p.setBrush(QColor.fromRgbF(*[min(1.0, max(0.0, c)) for c in rgb]))
+    p.drawRoundedRect(rect, size * 0.16, size * 0.16)
+    p.end()
+    return px
+
+
+class OverlayColorButton(QToolButton):
+    """Colour-swatch button for a Board Features row.
+
+    Mirrors :class:`EyeButton` — a small auto-raise tool button the same
+    size as the eye / fill toggles it sits beside. Clicking opens a colour
+    picker; choosing a colour repaints the swatch and emits
+    :attr:`colorChanged` so the viewer can recolour the overlay and mark
+    the project dirty."""
+
+    colorChanged = Signal(object)  # the new (r, g, b) tuple, channels 0..1
+
+    def __init__(self, parent=None, *,
+                 rgb: tuple[float, float, float] = (1.0, 1.0, 1.0),
+                 icon_size: int = 16) -> None:
+        super().__init__(parent)
+        self._rgb = tuple(float(c) for c in rgb)
+        self._icon_size = icon_size
+        self.setAutoRaise(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(icon_size + 6, icon_size + 6)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._apply_icon()
+        self.clicked.connect(self._on_clicked)
+
+    def colorRgb(self) -> tuple[float, float, float]:
+        return self._rgb
+
+    def setColorRgb(self, rgb: tuple[float, float, float], *,
+                    emit: bool = True) -> None:
+        rgb = tuple(float(c) for c in rgb)
+        if rgb == self._rgb:
+            return
+        self._rgb = rgb
+        self._apply_icon()
+        if emit:
+            self.colorChanged.emit(self._rgb)
+
+    def _apply_icon(self) -> None:
+        self.setIcon(QIcon(_make_swatch_pixmap(self._rgb, size=self._icon_size)))
+        self.setToolTip("Pick this overlay's colour")
+
+    def _on_clicked(self) -> None:
+        chosen = QColorDialog.getColor(
+            QColor.fromRgbF(*[min(1.0, max(0.0, c)) for c in self._rgb]),
+            self, "Overlay colour",
+        )
+        if chosen.isValid():
+            self.setColorRgb((chosen.redF(), chosen.greenF(), chosen.blueF()))
+
+
+# Overlay layers shown in the Heatmap tab's "Board Features" control. Each is
+# (key, label, has_sides). ``has_sides`` rows (everything but vias) carry a
+# split button that breaks the row into separate Top / Bottom rows.
+_OVERLAY_LAYERS: list[tuple[str, str, bool]] = [
+    # "silkscreen" key kept internally; label is "Overlay" to match
+    # Altium's layer name (splits into Top Overlay / Bottom Overlay).
+    ("silkscreen", "Overlay", True),
+    ("pads", "Pads", True),
+    ("vias", "Vias", False),
+    ("components", "Components", True),
+    ("designators", "Designators", True),
+    # The mechanical board outline. It has no per-net association, so its
+    # row carries only the "show everywhere" eye (no rails-only eye) and
+    # no fill toggle — see _build_overlay_row_widget.
+    ("board_outline", "Board outline", False),
+]
+
+# Fill style a freshly-built overlay row starts in (True == solid square,
+# False == wire-mesh outline square).
+_OVERLAY_DEFAULT_SOLID = True
+
+# ── Board Features default colours ──────────────────────────────────────────
+# Default RGB (each channel 0.0–1.0) every Board Features row is drawn in,
+# picked to stand out against the viridis heatmap and from each other.
+#
+# This table is the single place to change a *default* — edit a tuple here
+# and rebuild. At runtime each viewer copies it into ``self._overlay_colors``;
+# the per-row colour-swatch button edits that copy, and any change the user
+# makes is persisted to the .fypa project file (``viewer_settings
+# ["overlay_colors"]``) so a reopened project keeps its colours.
+_OVERLAY_DEFAULT_COLORS: dict[str, tuple[float, float, float]] = {
+    "silkscreen":    (0.93, 0.93, 0.86),   # off-white
+    "pads":          (1.00, 0.82, 0.29),   # amber
+    "vias":          (1.00, 0.55, 0.23),   # orange (matches via cylinders)
+    "components":    (0.35, 0.82, 1.00),   # cyan
+    "designators":   (0.96, 0.96, 0.96),   # near-white text
+    "board_outline": (1.00, 0.55, 0.00),   # warm orange
+}
+
+# World-space half-width (mm) of an overlay wire-mesh outline ribbon. The
+# Overlays control renders every outline as a thin filled ribbon (rather
+# than GL_LINES) so wire-mesh and solid fill share one GL triangle batch.
+# Coder-tunable — raise for a heavier wire-mesh, lower for a finer one.
+_OVERLAY_WIRE_HALF_MM = 0.025
+
+# Segments a via circle is tessellated into.
+_OVERLAY_CIRCLE_SEGMENTS = 20
+
+
+def _overlay_outline_tris(polyline, half_w: float, *,
+                          closed: bool) -> np.ndarray:
+    """Triangulate a thin, uniform-width outline ribbon along a polyline.
+
+    Returns an ``(3k, 2)`` float32 array of triangle vertices. The ribbon
+    is centred on the polyline and uses per-vertex *mitered* offsets — the
+    offset at each vertex bisects its two adjacent edge normals — so the
+    band stays a clean constant width even when the polyline has many
+    short segments. A naive per-segment rectangle ribbon splays those into
+    a radial sunburst once the width exceeds the segment length (e.g. a
+    tessellated circular pad). ``closed`` joins the last vertex back to the
+    first (pad / via / component outlines); open polylines (silkscreen
+    tracks) get square ends."""
+    pts = np.asarray(polyline, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    if closed and np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    n = pts.shape[0]
+    if n < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    half_w = max(float(half_w), 1e-4)
+
+    # Outgoing-edge unit direction + right-hand normal at each vertex.
+    if closed:
+        edges = np.roll(pts, -1, axis=0) - pts
+    else:
+        edges = np.empty_like(pts)
+        edges[:-1] = pts[1:] - pts[:-1]
+        edges[-1] = edges[-2]          # last vertex reuses the final edge
+    elen = np.linalg.norm(edges, axis=1)
+    elen[elen == 0.0] = 1.0
+    edir = edges / elen[:, None]
+    enorm = np.column_stack([edir[:, 1], -edir[:, 0]])
+
+    # Per-vertex offset = bisector of the incoming + outgoing edge normals.
+    prev_norm = np.roll(enorm, 1, axis=0)
+    if not closed:
+        prev_norm[0] = enorm[0]        # open start has no incoming edge
+    bis = enorm + prev_norm
+    blen = np.linalg.norm(bis, axis=1)
+    flat = blen < 1e-9
+    bis[flat] = enorm[flat]
+    blen[flat] = 1.0
+    bis /= blen[:, None]
+    # Miter length = half_w / cos(theta/2); clamp so a sharp corner can't
+    # spike the offset out toward infinity.
+    dot = np.einsum("ij,ij->i", bis, enorm)
+    dot = np.where(np.abs(dot) < 0.25,
+                   np.where(dot < 0.0, -0.25, 0.25), dot)
+    off = bis * (half_w / dot)[:, None]
+    outer = pts + off
+    inner = pts - off
+
+    seg = n if closed else n - 1
+    cur = np.arange(seg)
+    nxt = (cur + 1) % n
+    out = np.empty((seg * 6, 2), dtype=np.float32)
+    out[0::6] = outer[cur]
+    out[1::6] = inner[cur]
+    out[2::6] = outer[nxt]
+    out[3::6] = outer[nxt]
+    out[4::6] = inner[cur]
+    out[5::6] = inner[nxt]
+    return out
+
+
+def _overlay_fan_tris(ring) -> np.ndarray:
+    """Triangulate a convex polygon ring as a centroid fan.
+
+    Returns an ``(3k, 2)`` float32 array. A trailing closing vertex (last
+    point equal to the first) is dropped. Pad / via / component-box rings
+    are convex, so a centroid fan fills them exactly."""
+    pts = np.asarray(ring, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        return np.empty((0, 2), dtype=np.float32)
+    if np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    n = pts.shape[0]
+    if n < 3:
+        return np.empty((0, 2), dtype=np.float32)
+    cx, cy = pts.mean(axis=0)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
+        j = (i + 1) % n
+        out += [(cx, cy), (pts[i, 0], pts[i, 1]), (pts[j, 0], pts[j, 1])]
+    return np.asarray(out, dtype=np.float32)
+
+
+def _overlay_circle_ring(cx: float, cy: float, r: float,
+                         n: int = _OVERLAY_CIRCLE_SEGMENTS) -> np.ndarray:
+    """A closed ``(n+1, 2)`` ring approximating a circle."""
+    ang = np.linspace(0.0, 2.0 * math.pi, n + 1)
+    return np.column_stack([cx + r * np.cos(ang), cy + r * np.sin(ang)])
+
+
+def _overlay_box_ring(x0: float, y0: float,
+                      x1: float, y1: float) -> np.ndarray:
+    """A closed ``(5, 2)`` ring tracing an axis-aligned rectangle."""
+    return np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]],
+                      dtype=np.float64)
 
 
 class SidebarToggleButton(QToolButton):
@@ -1190,7 +1778,7 @@ class _FastTriSampler:
     each triangle — so results match ``LinearTriInterpolator`` to
     floating-point precision (verified <1e-16 V across every GND plane
     in the example projects). Same pure-C-spatial-index swap the Vias /
-    Pins report tables already use (see :meth:`PdnViewer._compute_via_report`).
+    Nodes report tables already use (see :meth:`PdnViewer._compute_via_report`).
     """
 
     # Candidate triangles examined per query. For any quality mesh the
@@ -2084,6 +2672,7 @@ class _SolveWorker(QThread):
                   pcbdoc_selector: str | Path | None = None,
                   use_design_cache: bool = True,
                   try_solve_cache_first: bool = False,
+                  editor_directives: list | None = None,
                   parent=None) -> None:
         super().__init__(parent)
         self._prjpcb_path = prjpcb_path
@@ -2112,6 +2701,12 @@ class _SolveWorker(QThread):
         # main thread before starting the worker) keeps the progress
         # dialog responsive instead of freezing the UI.
         self._try_solve_cache_first = bool(try_solve_cache_first)
+        # FYPA editor-mode directives (project-file sources / sinks). When
+        # present they're converted to synthetic SourceSpec / SinkSpec and
+        # appended to the loaded AnnotationResult before build_problem —
+        # and, like the override paths, they disable the solve cache (the
+        # result diverges from the on-disk project).
+        self._editor_directives = list(editor_directives or [])
 
     def run(self) -> None:  # type: ignore[override]
         # Bias the OS scheduler toward the GUI thread. The packaging phase
@@ -2155,7 +2750,8 @@ class _SolveWorker(QThread):
             if (self._try_solve_cache_first
                     and pcbdoc_resolved is not None
                     and not self._stackup_overrides
-                    and not self._sink_overrides):
+                    and not self._sink_overrides
+                    and not self._editor_directives):
                 self.stage_changed.emit(
                     f"Checking solve cache for {self._prjpcb_path.name}…"
                 )
@@ -2285,6 +2881,20 @@ class _SolveWorker(QThread):
                 )
                 self._apply_sink_overrides(loaded)
 
+            if self._editor_directives:
+                self.stage_changed.emit(
+                    f"Applying {len(self._editor_directives)} editor "
+                    "directive(s)…"
+                )
+                from fypa.editor_directives import apply_editor_directives
+                ed_warnings = apply_editor_directives(
+                    loaded, self._editor_directives,
+                )
+                for w in ed_warnings:
+                    logging.getLogger(__name__).warning(
+                        "Editor directive not applied: %s", w,
+                    )
+
             self.stage_changed.emit("Assembling FEM problem…")
             with _timer.stage("Build FEM problem"):
                 problem, via_segment_records, stub_pieces_by_pair, per_net_layers = (
@@ -2378,10 +2988,12 @@ class _SolveWorker(QThread):
                     "Solve cache NOT written: pcbdoc_resolved is None "
                     "(see earlier warning from _resolve_pcbdoc).",
                 )
-            elif self._stackup_overrides or self._sink_overrides:
+            elif (self._stackup_overrides or self._sink_overrides
+                    or self._editor_directives):
                 _cache_log.info(
-                    "Solve cache NOT written: stackup/sink overrides "
-                    "are active; cached solve would diverge from project.",
+                    "Solve cache NOT written: stackup/sink overrides or "
+                    "editor directives are active; cached solve would "
+                    "diverge from the on-disk project.",
                 )
             else:
                 try:
@@ -3035,6 +3647,56 @@ class LauncherWindow(QMainWindow):
         )
 
 
+class _ProjectSaveDialog(QDialog):
+    """The Ctrl+S popup. Two choices: save the project file only, or save
+    the project file plus the latest solver run. ``choice`` is ``"project"``,
+    ``"all"``, or ``None`` (cancelled) after :meth:`exec`.
+
+    Keyboard: ``S`` (or a second ``Ctrl+S``) picks project-only; ``A`` picks
+    save-all when it's available, falling back to project-only otherwise.
+    """
+
+    def __init__(self, parent, allow_all: bool) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Save project")
+        self.setModal(True)
+        self.choice: str | None = None
+        self._allow_all = bool(allow_all)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Save the FYPA project?"))
+
+        self._save_btn = QPushButton("Save project  (S)")
+        self._save_btn.clicked.connect(lambda: self._pick("project"))
+        lay.addWidget(self._save_btn)
+
+        self._all_btn = QPushButton("Save project + latest solver run  (A)")
+        self._all_btn.setEnabled(self._allow_all)
+        if not self._allow_all:
+            self._all_btn.setToolTip(
+                "No solver run since the last save."
+            )
+        self._all_btn.clicked.connect(lambda: self._pick("all"))
+        lay.addWidget(self._all_btn)
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(cancel)
+        self._save_btn.setDefault(True)
+
+    def _pick(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key_S:          # S or Ctrl+S → project-only save
+            self._pick("project")
+        elif key == Qt.Key_A:        # A → save-all (or project-only if N/A)
+            self._pick("all" if self._allow_all else "project")
+        else:
+            super().keyPressEvent(event)
+
+
 class PdnViewer(QMainWindow):
     """Main window — composes the side panel and the matplotlib plot area.
 
@@ -3048,7 +3710,9 @@ class PdnViewer(QMainWindow):
     def __init__(self, solution, metadata: dict | None = None,
                   initial_settings: object | None = None,
                   via_current_warn_a: float | None = None,
-                  display_percentile_high: float | None = None):
+                  display_percentile_high: float | None = None,
+                  project: object | None = None,
+                  project_path: object | None = None):
         super().__init__()
         # Stashed on self so _build_ui (called below) can log per-tab
         # timings against the same start point.
@@ -3057,6 +3721,38 @@ class PdnViewer(QMainWindow):
         self._init_log.info("PdnViewer init: START")
         self.solution = solution
         self.metadata = metadata
+
+        # --- Editor mode + project-file state ---
+        # The .fypa project (links the two cache pickles + editor
+        # directives), set when the viewer is opened from / saved to a
+        # project file, or carried across a resolve. See
+        # :mod:`fypa.project_file`.
+        self._project = project           # ProjectFile | None
+        self._project_path = project_path  # Path | None
+        # _project_dirty: editor edits not yet written to the .fypa.
+        # _solve_stale:   editor edits not yet reflected by a solve.
+        # A viewer opened by a resolve already reflects the editor
+        # directives, so it starts non-stale.
+        self._project_dirty: bool = False
+        self._solve_stale: bool = False
+        # Whether a solver run has happened that isn't yet persisted to a
+        # pickle — gates the "Save project + latest solver run" option in
+        # the Ctrl+S popup. Set True by the resolve handler; a viewer
+        # opened from disk starts False (its solution is already saved).
+        self._solved_since_save: bool = False
+        self._editor_mode: bool = False
+        # Current editor selection: a dict carrying 'kind' plus
+        # selection-specific keys, or None when nothing is selected.
+        self._editor_selection: dict | None = None
+        # Net names currently highlighted (connected copper); everything
+        # else renders dimmed. Empty = no highlight active.
+        self._editor_highlight_nets: set[str] = set()
+        # "drop a free marker of this role on the next viewport click" —
+        # None, or "SOURCE" / "SINK".
+        self._editor_pending_marker: str | None = None
+        # Pending (unsolved) editor rails surfaced in the Rails list.
+        self._pending_rails: dict[str, list[str]] = {}
+        self._pending_rail_items: list = []
         # Solve-time + display-time settings exposed in the Settings tab.
         # ``initial_settings`` is a :class:`altium_loader.SolveSettings` —
         # passed by the Re-run handler so the new viewer pre-populates the
@@ -3303,6 +3999,10 @@ class PdnViewer(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        # If this viewer was opened bound to a project (e.g. via a resolve
+        # or File > Open Project File), surface any still-pending rails.
+        if self._project is not None:
+            self._update_pending_rails()
         self._render()
 
     # --- Rail-group computation ---------------------------------------------
@@ -3464,12 +4164,30 @@ class PdnViewer(QMainWindow):
         )
         self.layer_list.setAlternatingRowColors(True)
 
+        # Each physical-layer row carries three controls: the primary eye
+        # (layer in the heatmap), a second eye that shows ALL the copper on
+        # that layer — every net, not just the analysed rails — and a
+        # wire-mesh / solid fill toggle for that all-copper view.
         self._layer_eye_buttons: list[tuple[str, EyeButton]] = []
+        self._layer_eye2_buttons: list[tuple[str, EyeButton]] = []
+        self._layer_fill_buttons: list[tuple[str, FillToggleButton]] = []
 
         self._all_layers_eye = EyeButton(visible=True)
+        self._all_layers_eye2 = EyeButton(
+            visible=False,
+            tip_show="Show all copper on every layer",
+            tip_hide="Hide all copper on every layer",
+        )
+        self._all_layers_fill = FillToggleButton(solid=False)
+        # Layer-outline toggle — lives only on the "All Layers" row, just
+        # left of the wire-mesh / solid button. Replaces the old "Show
+        # layer outlines (O)" side-panel checkbox.
+        self._outlines_btn = OutlineToggleButton(on=False)
         all_row = self._build_layer_row_widget(
             self._all_layers_eye, swatch_color=None,
             label_text="All Layers", bold=True,
+            second_eye=self._all_layers_eye2, fill_btn=self._all_layers_fill,
+            outline_btn=self._outlines_btn,
         )
         all_item = QListWidgetItem()
         all_item.setFlags(Qt.ItemIsEnabled)
@@ -3477,13 +4195,27 @@ class PdnViewer(QMainWindow):
         all_item.setSizeHint(all_row.sizeHint())
         self.layer_list.setItemWidget(all_item, all_row)
         self._all_layers_eye.toggled_visible.connect(self._on_all_layers_toggled)
+        self._all_layers_eye2.toggled_visible.connect(
+            self._on_all_layers_eye2_toggled)
+        self._all_layers_fill.toggled_fill.connect(
+            self._on_all_layers_fill_toggled)
+        self._outlines_btn.toggled_outline.connect(self._render)
 
         for phys in self._physicals:
             eye = EyeButton(visible=True)
             eye.toggled_visible.connect(self._on_layer_eye_toggled)
+            eye2 = EyeButton(
+                visible=False,
+                tip_show="Show all copper on this layer",
+                tip_hide="Hide all copper on this layer",
+            )
+            eye2.toggled_visible.connect(self._on_layer_eye2_toggled)
+            fill = FillToggleButton(solid=False)
+            fill.toggled_fill.connect(self._on_layer_fill_toggled)
             row = self._build_layer_row_widget(
                 eye, swatch_color=self._layer_color_for(phys),
                 label_text=phys, bold=False,
+                second_eye=eye2, fill_btn=fill,
             )
             item = QListWidgetItem()
             item.setFlags(Qt.ItemIsEnabled)
@@ -3491,8 +4223,11 @@ class PdnViewer(QMainWindow):
             item.setSizeHint(row.sizeHint())
             self.layer_list.setItemWidget(item, row)
             self._layer_eye_buttons.append((phys, eye))
+            self._layer_eye2_buttons.append((phys, eye2))
+            self._layer_fill_buttons.append((phys, fill))
 
         self._sync_all_layers_eye()
+        self._sync_all_layers_eye2()
 
         # Size the list to show every physical layer (plus the "All Layers"
         # header). When the full side panel ends up too tall for the window,
@@ -3575,6 +4310,37 @@ class PdnViewer(QMainWindow):
         side.addWidget(self.mode_combo)
 
         side.addSpacing(8)
+        side.addWidget(QLabel("<b>Board Features</b>"))
+        # Non-copper display layers — silkscreen, pads, vias, components and
+        # designators. Same QListWidget-of-rows control as the Physical
+        # layers / Rails lists above, but each row carries two eyes (visible
+        # on the selected rails only vs. visible everywhere — a mutually
+        # exclusive pair) before the label, a wire-mesh / solid fill toggle
+        # at the far right, and — for the layers that exist on both board
+        # sides — a split toggle that breaks the row into Top / Bottom rows.
+        self.overlay_list = QListWidget()
+        self.overlay_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.overlay_list.setFocusPolicy(Qt.NoFocus)
+        self.overlay_list.setStyleSheet(
+            f"QListWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"              border: 1px solid {_t['border']}; padding: 2px;"
+            f"              alternate-background-color: {_t['bg_alt']}; }}"
+            f"QListWidget::item:hover {{ background-color: {_t['bg_hover']}; }}"
+        )
+        self.overlay_list.setAlternatingRowColors(True)
+        self.overlay_list.setToolTip(
+            "Non-copper overlays. Each row has two eyes — show on the "
+            "selected rails only (left) or show everywhere (right) — a "
+            "colour swatch that opens a picker for the overlay's colour, "
+            "and a wire-mesh / solid fill toggle on the right. Overlay, "
+            "pads, components and designators can be split into separate "
+            "Top / Bottom rows with the split button."
+        )
+        self._init_overlay_state()
+        self._build_overlay_list()
+        side.addWidget(self.overlay_list)
+
+        side.addSpacing(8)
         # Colour-scale controller: colour scheme + linear/log pickers and
         # Min/Max text-box entry. Editing the range clamps the heatmap
         # colours interactively without re-rasterising the mesh. Sits
@@ -3606,25 +4372,6 @@ class PdnViewer(QMainWindow):
         )
         side.addWidget(self.show_markers_box)
 
-        self.show_outlines_box = QCheckBox("Show layer outlines (O)")
-        self.show_outlines_box.setChecked(False)
-        self.show_outlines_box.setToolTip(
-            "When on, every visible layer's copper boundary is traced "
-            "with a thin line in that layer's swatch colour. Useful for "
-            "spotting which copper belongs to which layer when stacking "
-            "multiple layers in the view."
-        )
-        side.addWidget(self.show_outlines_box)
-
-        self.show_board_outline_box = QCheckBox("Show board outline")
-        self.show_board_outline_box.setChecked(False)
-        self.show_board_outline_box.setToolTip(
-            "When on, the PCB's mechanical board outline is overlaid as "
-            "a bold contrasting ribbon on top of the heatmap. Sourced "
-            "from the mechanical layer tagged Layer Type = Board."
-        )
-        side.addWidget(self.show_board_outline_box)
-
         self.show_mesh_box = QCheckBox("Show copper mesh")
         self.show_mesh_box.setChecked(False)
         self.show_mesh_box.setToolTip(
@@ -3634,27 +4381,6 @@ class PdnViewer(QMainWindow):
             "purely a visualisation toggle."
         )
         side.addWidget(self.show_mesh_box)
-
-        self.show_pads_box = QCheckBox("Show pads (P)")
-        self.show_pads_box.setChecked(False)
-        self.show_pads_box.setToolTip(
-            "When on, every SMT and through-hole pad on a visible copper "
-            "layer is traced with a black outline at the pad's location. "
-            "SMT pads appear on their assigned layer only; through-hole "
-            "pads appear on every enabled copper layer. Press P to toggle."
-        )
-        side.addWidget(self.show_pads_box)
-
-        self.show_all_copper_box = QCheckBox("Show all copper (C)")
-        self.show_all_copper_box.setChecked(False)
-        self.show_all_copper_box.setToolTip(
-            "When on, every copper polygon on a visible layer that does "
-            "NOT belong to any currently selected rail is traced with a "
-            "thin outline in that layer's swatch colour. Useful for seeing "
-            "where other rails and signal nets sit relative to the rails "
-            "being analysed. Press C to toggle."
-        )
-        side.addWidget(self.show_all_copper_box)
 
         self.colour_stubs_box = QCheckBox("Grey no current copper")
         self.colour_stubs_box.setChecked(False)
@@ -3730,6 +4456,10 @@ class PdnViewer(QMainWindow):
             self._on_arrow_density_changed,
         )
         side.addWidget(self.arrow_spacing_slider)
+        # The density control only matters while arrows are shown — keep
+        # the label + slider hidden until "Show current arrows" is ticked.
+        self.arrow_spacing_label.setVisible(False)
+        self.arrow_spacing_slider.setVisible(False)
 
         # Layer-spacing slider — drives both the per-layer z separation
         # and the via cylinder length in 3D mode (they share the same
@@ -3847,9 +4577,23 @@ class PdnViewer(QMainWindow):
         )
         plot_layout.addWidget(self.probe_label_widget)
 
+        # Editor-mode overlay buttons — live children of the GL viewer,
+        # pinned top-left (the scale strip owns bottom-left). The editor
+        # toggle is always visible; the resolve button only shows while
+        # there are unsolved editor edits. _position_editor_overlays
+        # (wired to GL-viewer resize via eventFilter) keeps them pinned.
+        self._build_editor_overlay_buttons()
+
         plot_widget = QWidget()
         plot_widget.setLayout(plot_layout)
         outer.addWidget(plot_widget, 1)
+
+        # Right-hand editor panel — hidden in viewer mode, shown when the
+        # user enters editor mode. Carries the PDN-role form + free-marker
+        # palette. Built collapsed so it costs nothing until used.
+        self._editor_panel = self._build_editor_panel()
+        self._editor_panel.hide()
+        outer.addWidget(self._editor_panel)
 
         self._init_log.info(
             "PdnViewer init: pre-tabs done (%.2fs)",
@@ -3862,17 +4606,17 @@ class PdnViewer(QMainWindow):
         self.tabs.addTab(self._build_setup_tab(), "Setup")
         self._init_log.info("PdnViewer init: Setup tab (%.2fs)", time.monotonic() - _t)
 
-        # Pins tab — sortable, filterable table of every directive pin's
+        # Nodes tab — sortable, filterable table of every directive node's
         # voltage / drop / current density / power density. The empty
         # table structure is built up-front (cheap); the actual row
-        # population (one QTableWidgetItem per pin × N columns + a voltage
+        # population (one QTableWidgetItem per node × N columns + a voltage
         # interpolator per (layer, net)) is deferred to the first time the
         # user navigates to this tab — see :meth:`_on_tabs_current_changed`.
-        # Without this, opening a viewer on a board with thousands of pins
+        # Without this, opening a viewer on a board with thousands of nodes
         # blocks the GUI thread for several seconds.
         _t = time.monotonic()
-        self._pins_table_populated = False
-        self._pins_tab_index = self.tabs.addTab(self._build_pins_tab(), "Nodes")
+        self._nodes_table_populated = False
+        self._nodes_tab_index = self.tabs.addTab(self._build_nodes_tab(), "Nodes")
         self._init_log.info("PdnViewer init: Nodes tab (%.2fs)", time.monotonic() - _t)
 
         # Vias tab — sortable, filterable table of every via's worst-segment
@@ -3917,13 +4661,9 @@ class PdnViewer(QMainWindow):
         self.mode_combo.currentTextChanged.connect(self._render)
         self.rail_only_box.toggled.connect(self._render)
         self.show_markers_box.toggled.connect(self._render)
-        self.show_outlines_box.toggled.connect(self._render)
-        self.show_board_outline_box.toggled.connect(self._refresh_board_outline)
         self.show_mesh_box.toggled.connect(
             lambda checked: self._gl_viewer.set_show_mesh_edges(checked)
         )
-        self.show_pads_box.toggled.connect(self._render)
-        self.show_all_copper_box.toggled.connect(self._render)
         self.colour_stubs_box.toggled.connect(self._render)
         self.cursor_tooltip_box.toggled.connect(self._on_cursor_tooltip_toggled)
         self.view_3d_box.toggled.connect(self._on_view_3d_toggled)
@@ -3980,13 +4720,29 @@ class PdnViewer(QMainWindow):
 
     def _build_layer_row_widget(self, eye: EyeButton, *,
                                   swatch_color: str | None,
-                                  label_text: str, bold: bool) -> QWidget:
-        """Build a single row for the layer list: eye + swatch + name."""
+                                  label_text: str, bold: bool,
+                                  second_eye: EyeButton | None = None,
+                                  fill_btn: "FillToggleButton | None" = None,
+                                  outline_btn: "OutlineToggleButton | None"
+                                  = None,
+                                  ) -> QWidget:
+        """Build a single row for the layer list: eye(s) + swatch + name.
+
+        ``second_eye``, when given, sits immediately right of the primary
+        eye — the Physical layers control uses it for the per-layer "show
+        all copper on this layer" toggle. ``fill_btn``, when given, is
+        pinned to the far right — the wire-mesh / solid fill style for that
+        all-copper view. ``outline_btn``, when given, sits just left of
+        ``fill_btn`` — only the "All Layers" row passes it (the layer-
+        outline toggle). The Rails list passes none of these, so its rows
+        keep the original single-eye layout."""
         w = QWidget()
         layout = QHBoxLayout(w)
         layout.setContentsMargins(2, 1, 6, 1)
         layout.setSpacing(6)
         layout.addWidget(eye)
+        if second_eye is not None:
+            layout.addWidget(second_eye)
         if swatch_color is not None:
             swatch = QLabel()
             pix = QPixmap(14, 14)
@@ -4007,6 +4763,10 @@ class PdnViewer(QMainWindow):
         )
         layout.addWidget(name)
         layout.addStretch(1)
+        if outline_btn is not None:
+            layout.addWidget(outline_btn)
+        if fill_btn is not None:
+            layout.addWidget(fill_btn)
         return w
 
     def _on_layer_eye_toggled(self, _on: bool) -> None:
@@ -4044,6 +4804,39 @@ class PdnViewer(QMainWindow):
         return [name for name, eye in self._layer_eye_buttons
                 if eye.isVisibleState()]
 
+    # --- Physical-layer "all copper" (second eye + fill toggle) -------------
+
+    def _on_layer_eye2_toggled(self, _on: bool) -> None:
+        """A layer's 'all copper' eye was clicked. The all-copper view is
+        independent of the FEM heatmap, so only the overlay geometry needs
+        rebuilding — no full re-render."""
+        self._sync_all_layers_eye2()
+        self._refresh_overlay_geometry(self._visible_rails())
+
+    def _on_all_layers_eye2_toggled(self, on: bool) -> None:
+        """The "All Layers" all-copper eye — show/hide all copper on every
+        layer at once."""
+        for _name, eye2 in self._layer_eye2_buttons:
+            eye2.setVisibleState(on, emit=False)
+        self._refresh_overlay_geometry(self._visible_rails())
+
+    def _sync_all_layers_eye2(self) -> None:
+        """Reflect "any layer's all-copper shown" in the All Layers eye."""
+        any_on = any(eye2.isVisibleState()
+                     for _n, eye2 in self._layer_eye2_buttons)
+        self._all_layers_eye2.setVisibleState(any_on, emit=False)
+
+    def _on_layer_fill_toggled(self, _solid: bool) -> None:
+        """A layer's all-copper wire-mesh / solid fill toggle flipped."""
+        self._refresh_overlay_geometry(self._visible_rails())
+
+    def _on_all_layers_fill_toggled(self, solid: bool) -> None:
+        """The "All Layers" fill toggle — set every layer's all-copper fill
+        style at once."""
+        for _name, fill in self._layer_fill_buttons:
+            fill.setSolid(solid, emit=False)
+        self._refresh_overlay_geometry(self._visible_rails())
+
     def _on_rail_eye_toggled(self, _on: bool) -> None:
         """An individual rail's eye was clicked."""
         self._sync_all_rails_eye()
@@ -4066,6 +4859,550 @@ class PdnViewer(QMainWindow):
         sort order they were registered (matches the rail list UI)."""
         return [name for name, eye in self._rail_eye_buttons
                 if eye.isVisibleState()]
+
+    # --- Overlays control ----------------------------------------------------
+
+    def _init_overlay_state(self) -> None:
+        """Build the Overlays control's state dict — the source of truth
+        that :meth:`_build_overlay_list` renders rows from.
+
+        One entry per overlay layer. ``split`` says whether the layer is
+        shown as one merged row or separate Top / Bottom rows; each row
+        variant (``both`` / ``top`` / ``bottom``) tracks ``vis`` — one of
+        ``None`` (hidden), ``"rails"`` (visible on the selected rails only)
+        or ``"all"`` (visible everywhere) — and ``solid`` (the fill style).
+
+        Draw colour lives separately in ``self._overlay_colors`` (keyed by
+        layer, shared by a split layer's Top / Bottom rows) — seeded from
+        :data:`_OVERLAY_DEFAULT_COLORS` and then overridden by anything the
+        open .fypa project saved.
+        """
+        self._overlay_state: dict[str, dict] = {}
+        for key, _label, has_sides in _OVERLAY_LAYERS:
+            st: dict = {
+                "split": False,
+                "both": {"vis": None, "solid": _OVERLAY_DEFAULT_SOLID},
+            }
+            if has_sides:
+                st["top"] = {"vis": None, "solid": _OVERLAY_DEFAULT_SOLID}
+                st["bottom"] = {"vis": None, "solid": _OVERLAY_DEFAULT_SOLID}
+            self._overlay_state[key] = st
+
+        self._overlay_colors: dict[str, tuple[float, float, float]] = dict(
+            _OVERLAY_DEFAULT_COLORS)
+        self._load_overlay_colors_from_project()
+
+    def _load_overlay_colors_from_project(self) -> None:
+        """Override the built-in overlay colours with any saved in the open
+        .fypa project (``viewer_settings["overlay_colors"]``). Unknown keys
+        and malformed values are skipped so an older or hand-edited project
+        still loads cleanly."""
+        proj = getattr(self, "_project", None)
+        if proj is None:
+            return
+        saved = (getattr(proj, "viewer_settings", None) or {}).get(
+            "overlay_colors") or {}
+        for key, rgb in saved.items():
+            if key not in self._overlay_colors:
+                continue
+            try:
+                r, g, b = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            clamp = lambda c: min(1.0, max(0.0, c))
+            self._overlay_colors[key] = (clamp(r), clamp(g), clamp(b))
+
+    def _build_overlay_list(self) -> None:
+        """(Re)populate the Overlays QListWidget from ``self._overlay_state``.
+
+        A split layer contributes two rows (Top / Bottom); a merged layer
+        one. Called once at construction and again whenever a split toggle
+        flips, so the list re-sizes to whatever the current state needs."""
+        self.overlay_list.clear()
+        n_rows = 0
+        for key, label, has_sides in _OVERLAY_LAYERS:
+            if has_sides and self._overlay_state[key]["split"]:
+                self._add_overlay_row(key, "top", f"Top {label}",
+                                      splittable=True)
+                self._add_overlay_row(key, "bottom", f"Bottom {label}",
+                                      splittable=False)
+                n_rows += 2
+            else:
+                self._add_overlay_row(key, "both", label,
+                                      splittable=has_sides)
+                n_rows += 1
+        row_h = self.overlay_list.sizeHintForRow(0) or 24
+        self.overlay_list.setFixedHeight(n_rows * row_h + 6)
+
+    def _add_overlay_row(self, key: str, variant: str, label_text: str, *,
+                         splittable: bool) -> None:
+        """Append one overlay row widget to the list."""
+        row = self._build_overlay_row_widget(key, variant, label_text,
+                                             splittable=splittable)
+        item = QListWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled)
+        self.overlay_list.addItem(item)
+        item.setSizeHint(row.sizeHint())
+        self.overlay_list.setItemWidget(item, row)
+
+    def _build_overlay_row_widget(self, key: str, variant: str,
+                                  label_text: str, *,
+                                  splittable: bool) -> QWidget:
+        """Build one row of the Overlays control.
+
+        Layout: ``[rails eye][all eye][colour] <label> … [split] [fill]``.
+        The two eyes are a mutually-exclusive pair (selected-rails-only vs.
+        everywhere), so the row is hidden / rails / all. The colour swatch
+        opens a picker for the overlay's draw colour. ``splittable`` rows
+        carry the split toggle just left of the fill toggle; on an
+        already-split layer the Top row keeps it (acting as a merge button)
+        while the Bottom row gets an aligning spacer in its place."""
+        sub = self._overlay_state[key][variant]
+        is_board = key == "board_outline"
+        # Overlays with no per-net association get only the "show
+        # everywhere" eye — a "show on the selected rails only" eye is
+        # meaningless when nothing ties the overlay to a rail. That covers
+        # the mechanical board outline and the silkscreen "Overlay" layer
+        # (graphics-only). Every other overlay keeps the rails-only eye.
+        has_rails_eye = key not in ("board_outline", "silkscreen")
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        layout.setContentsMargins(2, 1, 6, 1)
+        layout.setSpacing(4)
+
+        # The "show everywhere" eye is on every row. Its companion
+        # "show on the selected rails only" eye sits to its left — except
+        # on rows with no per-net association (see ``has_rails_eye``), which
+        # get an equal-width spacer instead, keeping the "show everywhere"
+        # eye in the same column as every other row. The two eyes (when both
+        # present) are mutually exclusive: the row is hidden / rails /
+        # everywhere.
+        all_eye = EyeButton(
+            visible=(sub["vis"] == "all"),
+            tip_show="Show everywhere",
+            tip_hide="Hide (shown everywhere)",
+        )
+        if not has_rails_eye:
+            rails_eye = None
+            rails_slot: QWidget = QLabel()
+            rails_slot.setFixedSize(all_eye.width(), all_eye.height())
+        else:
+            rails_eye = EyeButton(
+                visible=(sub["vis"] == "rails"),
+                tip_show="Show on the selected rails only",
+                tip_hide="Hide (shown on the selected rails only)",
+            )
+            rails_eye.toggled_visible.connect(
+                lambda on: self._on_overlay_eye(key, variant, "rails", on,
+                                                rails_eye, all_eye)
+            )
+            rails_slot = rails_eye
+        all_eye.toggled_visible.connect(
+            lambda on: self._on_overlay_eye(key, variant, "all", on,
+                                            rails_eye, all_eye)
+        )
+        layout.addWidget(rails_slot)
+        layout.addWidget(all_eye)
+
+        # Colour swatch — opens a picker for this overlay's draw colour.
+        # Colour is per layer, so the Top / Bottom rows of a split layer
+        # share one swatch; picking on either updates both (the list is
+        # rebuilt — see _on_overlay_color).
+        colour_btn = OverlayColorButton(rgb=self._overlay_colors[key])
+        colour_btn.colorChanged.connect(
+            lambda rgb, k=key: self._on_overlay_color(k, rgb)
+        )
+        layout.addWidget(colour_btn)
+
+        name = QLabel(label_text)
+        name.setStyleSheet(f"QLabel {{ color: {_T()['fg']}; }}")
+        layout.addWidget(name)
+        layout.addStretch(1)
+
+        # Split / merge toggle — only on rows that own a Top + Bottom pair.
+        # Sits just left of the fill toggle at the right of the row. Other
+        # rows (vias, and the Bottom side of a split layer) get a spacer the
+        # same width so the fill toggle still lines up across every row.
+        if splittable:
+            split_btn = SplitButton(split=self._overlay_state[key]["split"])
+            split_btn.toggled_split.connect(
+                lambda on: self._on_overlay_split(key, on)
+            )
+            layout.addWidget(split_btn)
+        else:
+            # Size off all_eye, not rails_eye — the board-outline row has
+            # no rails_eye (it is None there).
+            spacer = QLabel()
+            spacer.setFixedSize(all_eye.width(), all_eye.height())
+            layout.addWidget(spacer)
+
+        # Wire-mesh / solid fill toggle, pinned to the far right of the row.
+        # The board outline is always a fixed-width ribbon — solid vs
+        # wire-mesh is meaningless — so that row gets an aligning spacer in
+        # the fill toggle's place instead.
+        if is_board:
+            fill_slot: QWidget = QLabel()
+            fill_slot.setFixedSize(all_eye.width(), all_eye.height())
+            layout.addWidget(fill_slot)
+        else:
+            fill_btn = FillToggleButton(solid=sub["solid"])
+            fill_btn.toggled_fill.connect(
+                lambda on: self._on_overlay_fill(key, variant, on)
+            )
+            layout.addWidget(fill_btn)
+        return w
+
+    def _on_overlay_eye(self, key: str, variant: str, scope: str, on: bool,
+                        rails_eye: EyeButton | None,
+                        all_eye: EyeButton) -> None:
+        """One of an overlay row's eyes toggled. When the row has both
+        eyes they are a mutually-exclusive pair, so turning one on turns
+        the other off — the row ends up hidden / shown-on-rails /
+        shown-everywhere. The board-outline row has only the "everywhere"
+        eye (``rails_eye`` is None), so there is no companion to clear."""
+        sub = self._overlay_state[key][variant]
+        if on:
+            sub["vis"] = scope
+            other = all_eye if scope == "rails" else rails_eye
+            if other is not None:
+                other.setVisibleState(False, emit=False)
+        elif sub["vis"] == scope:
+            sub["vis"] = None
+        self._on_overlay_changed()
+
+    def _on_overlay_fill(self, key: str, variant: str, solid: bool) -> None:
+        """An overlay row's wire-mesh / solid fill toggle flipped."""
+        self._overlay_state[key][variant]["solid"] = bool(solid)
+        self._on_overlay_changed()
+
+    def _on_overlay_color(self, key: str,
+                          rgb: tuple[float, float, float]) -> None:
+        """A Board Features row's colour swatch picked a new colour.
+
+        Colour is stored per overlay layer, so a split layer's Top / Bottom
+        rows share it — the list is rebuilt (deferred a tick, as the picked
+        swatch is mid-emit) so both swatches repaint. The overlay geometry
+        is recoloured immediately, and the project is marked dirty so the
+        new colour is written to the .fypa on the next save."""
+        self._overlay_colors[key] = tuple(float(c) for c in rgb)
+        self._project_dirty = True
+        QTimer.singleShot(0, self._build_overlay_list)
+        self._on_overlay_changed()
+
+    def _on_overlay_split(self, key: str, split: bool) -> None:
+        """An overlay row's split toggle flipped. Splitting seeds the fresh
+        Top / Bottom rows from the merged row; merging keeps the Top row's
+        state on the recombined row. The list is rebuilt so rows appear /
+        disappear — deferred to the next event-loop tick because the rebuild
+        deletes the SplitButton that is mid-emit right now."""
+        st = self._overlay_state[key]
+        if split == st["split"]:
+            return
+        st["split"] = split
+        if split:
+            for side in ("top", "bottom"):
+                st[side]["vis"] = st["both"]["vis"]
+                st[side]["solid"] = st["both"]["solid"]
+        else:
+            st["both"]["vis"] = st["top"]["vis"]
+            st["both"]["solid"] = st["top"]["solid"]
+        QTimer.singleShot(0, self._build_overlay_list)
+        self._on_overlay_changed()
+
+    def _overlay_visibility(self) -> dict[str, dict]:
+        """Current Overlays selection, keyed by layer then row variant —
+        e.g. ``{"pads": {"top": {"vis": "rails", "solid": True}, …}}``.
+
+        ``vis`` is ``None`` / ``"rails"`` / ``"all"``. For a merged layer
+        only the ``"both"`` variant is populated; for a split layer the
+        ``"top"`` and ``"bottom"`` variants are."""
+        out: dict[str, dict] = {}
+        for key, _label, has_sides in _OVERLAY_LAYERS:
+            st = self._overlay_state[key]
+            variants = (("top", "bottom") if has_sides and st["split"]
+                        else ("both",))
+            out[key] = {v: dict(st[v]) for v in variants}
+        return out
+
+    def _on_overlay_changed(self) -> None:
+        """An overlay row's visibility, fill style or split state changed.
+
+        Overlays are independent of the FEM heatmap, so this rebuilds just
+        the overlay geometry rather than triggering a full :meth:`_render`.
+        The board outline lives in its own GL batch, so it is refreshed
+        alongside (its row is part of the same Overlays control)."""
+        self._refresh_overlay_geometry(self._visible_rails())
+        self._refresh_board_outline()
+
+    def _overlay_side_states(self, key: str) -> dict:
+        """Return ``{"top": (vis, solid), "bottom": (vis, solid)}`` for an
+        overlay layer. When the layer is not split, the merged row's state
+        applies to both sides."""
+        st = self._overlay_state[key]
+        if st.get("split"):
+            return {"top": (st["top"]["vis"], st["top"]["solid"]),
+                    "bottom": (st["bottom"]["vis"], st["bottom"]["solid"])}
+        b = st["both"]
+        return {"top": (b["vis"], b["solid"]),
+                "bottom": (b["vis"], b["solid"])}
+
+    def _refresh_overlay_geometry(self, rails) -> None:
+        """Rebuild and push the Overlays control's GL geometry.
+
+        Every visible overlay row contributes flat-shaded triangles — a
+        solid fill, or a thin ribbon for wire-mesh outlines — to the GL
+        viewer's overlay-fill batch; visible designator rows contribute
+        text labels. Independent of the FEM heatmap, so it is safe to call
+        regardless of the rail / layer selection.
+
+        ``rails`` is the list of currently-visible rail names; it drives
+        the per-row "show on the selected rails only" eye. Silkscreen has
+        no per-net association, so either eye simply shows it."""
+        gv = getattr(self, "_gl_viewer", None)
+        if gv is None:
+            return
+        md = self.metadata
+        if md is None:
+            gv.clear_overlay_fills()
+            gv.clear_overlay_labels()
+            return
+
+        rail_members = (set(self._effective_rail_members(rails))
+                        if rails else set())
+        # Per-side z so overlays sit on the right copper plane in 3D mode.
+        side_z = {"top": 0.0, "bottom": 0.0}
+        if self._physicals:
+            side_z["top"] = self._layer_z_for(self._physicals[0])
+            side_z["bottom"] = self._layer_z_for(self._physicals[-1])
+
+        tri_chunks: list[np.ndarray] = []
+        col_chunks: list[np.ndarray] = []
+        labels: list[dict] = []
+
+        def _emit(verts_xy: np.ndarray, z: float,
+                  rgb: tuple[float, float, float]) -> None:
+            if verts_xy.size == 0:
+                return
+            p = np.empty((verts_xy.shape[0], 3), dtype=np.float32)
+            p[:, :2] = verts_xy
+            p[:, 2] = z
+            tri_chunks.append(p)
+            col_chunks.append(np.broadcast_to(
+                np.asarray(rgb, dtype=np.float32), p.shape).copy())
+
+        def _shape_tris(ring, solid: bool) -> np.ndarray:
+            # Solid = filled polygon; wire-mesh = thin mitered outline of
+            # the closed ring (pad / via / component box).
+            return (_overlay_fan_tris(ring) if solid
+                    else _overlay_outline_tris(ring, _OVERLAY_WIRE_HALF_MM,
+                                               closed=True))
+
+        def _net_match(nets) -> bool:
+            return bool(rail_members) and bool(set(nets) & rail_members)
+
+        # Overlay graphics — silkscreen tracks / arcs. Each is drawn at its
+        # real track width with round end caps, so it matches Altium's
+        # round-capped tracks and consecutive segments join smoothly. No
+        # per-net data, so either eye ("selected rails" / "all") shows it.
+        sides = self._overlay_side_states("silkscreen")
+        rgb = self._overlay_colors["silkscreen"]
+        for rec in md.get("silkscreen", []):
+            if rec.get("kind") == "text":
+                continue  # legacy pickles only — text isn't an Overlay item
+            side = rec.get("side", "top")
+            vis, _solid = sides.get(side, (None, False))
+            if vis is None:
+                continue
+            poly = rec.get("polyline") or []
+            if len(poly) < 2:
+                continue
+            # Real track width (Altium silkscreen is thin); a small floor
+            # keeps a zero-width track from collapsing to nothing.
+            half = max(0.5 * float(rec.get("width_mm", 0.0) or 0.0), 0.01)
+            z = side_z.get(side, 0.0)
+            _emit(_overlay_outline_tris(poly, half, closed=False), z, rgb)
+            # Round end caps — interior joins are already mitered.
+            for end in (poly[0], poly[-1]):
+                _emit(_overlay_fan_tris(_overlay_circle_ring(
+                    float(end[0]), float(end[1]), half, 12)), z, rgb)
+
+        # Vias — one circle per via (the Vias row has no top/bottom split).
+        vsub = self._overlay_state["vias"]["both"]
+        if vsub["vis"] is not None:
+            rgb = self._overlay_colors["vias"]
+            solid = vsub["solid"]
+            rails_only = vsub["vis"] == "rails"
+            for rec in md.get("vias", []):
+                if rails_only and not _net_match([rec.get("net")]):
+                    continue
+                r = 0.5 * float(rec.get("diameter_mm", 0.0) or 0.0)
+                if r <= 0.0:
+                    continue
+                ring = _overlay_circle_ring(float(rec["x_mm"]),
+                                            float(rec["y_mm"]), r)
+                _emit(_shape_tris(ring, solid), side_z["top"], rgb)
+
+        # Components — axis-aligned bounding box per component.
+        sides = self._overlay_side_states("components")
+        rgb = self._overlay_colors["components"]
+        for rec in md.get("components", []):
+            side = rec.get("side", "top")
+            vis, solid = sides.get(side, (None, False))
+            if vis is None:
+                continue
+            if vis == "rails" and not _net_match(rec.get("nets", [])):
+                continue
+            bbox = rec.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            _emit(_shape_tris(_overlay_box_ring(*bbox), solid),
+                  side_z[side], rgb)
+
+        # Pads — outline ring per pad, drawn on whichever board side(s)
+        # the pad's copper layers include (through-hole pads → both).
+        # Emitted AFTER components: the 2D overlay batch has no depth test,
+        # so the last-emitted geometry wins — this puts pads visually on
+        # top of the component bodies they sit on.
+        enabled = md.get("enabled_copper_layer_ids") or []
+        top_lid = enabled[0] if enabled else None
+        bot_lid = enabled[-1] if enabled else None
+        sides = self._overlay_side_states("pads")
+        rgb = self._overlay_colors["pads"]
+        for rec in md.get("pads", []):
+            ring = rec.get("outline")
+            if not ring:
+                continue
+            lids = rec.get("layer_ids") or []
+            for side, lid in (("top", top_lid), ("bottom", bot_lid)):
+                if lid is None or lid not in lids:
+                    continue
+                vis, solid = sides[side]
+                if vis is None:
+                    continue
+                if vis == "rails" and not _net_match([rec.get("net")]):
+                    continue
+                _emit(_shape_tris(ring, solid), side_z[side], rgb)
+
+        # Designators — drawn in Altium's actual single-stroke font: the
+        # loader lays each one out into stroke polylines, which render as
+        # thin round-capped ribbons (same path as silkscreen). TrueType-
+        # font designators carry no polylines and fall back to a label.
+        sides = self._overlay_side_states("designators")
+        rgb = self._overlay_colors["designators"]
+        des_hex = QColor.fromRgbF(*rgb).name()
+        for rec in md.get("designators", []):
+            side = rec.get("side", "top")
+            vis, _solid = sides.get(side, (None, False))
+            if vis is None:
+                continue
+            if vis == "rails" and not _net_match(rec.get("nets", [])):
+                continue
+            if rec.get("polylines"):
+                _emit(self._designator_stroke_tris(rec),
+                      side_z[side], rgb)
+            else:
+                labels.append({
+                    "x": float(rec.get("x_mm", 0.0)),
+                    "y": float(rec.get("y_mm", 0.0)),
+                    "z": side_z[side],
+                    "text": rec.get("text", ""),
+                    "color": des_hex,
+                    "height_mm": float(rec.get("height_mm", 1.0) or 1.0),
+                    "rotation_deg": float(rec.get("rotation_deg", 0.0) or 0.0),
+                })
+
+        # Physical-layer "all copper" — the per-layer second eye. For every
+        # layer whose all-copper eye is on, draw all of that layer's copper
+        # that ISN'T part of a selected rail (the rails are already the
+        # heatmap; this is the rest), in the layer's swatch colour, as a
+        # wire-mesh outline or a solid fill per that row's fill toggle.
+        eye2_buttons = getattr(self, "_layer_eye2_buttons", [])
+        if eye2_buttons and md.get("all_copper"):
+            ac_by_layer: dict[int, list] = {}
+            for rec in md["all_copper"]:
+                ac_by_layer.setdefault(rec.get("layer_id"), []).append(rec)
+            fill_by_name = dict(getattr(self, "_layer_fill_buttons", []))
+            # Emit bottom-up: the 2D view has no depth test, so the
+            # last-drawn layer wins. ``_layer_eye2_buttons`` is in panel
+            # order (topmost first), which would paint the bottom layer
+            # over the top one — sort by stackup rank descending so the
+            # topmost layer is emitted last, mirroring the heatmap mesh's
+            # phys_draw_order.
+            for name, eye2 in sorted(
+                eye2_buttons,
+                key=lambda ne: self._phys_stackup_rank.get(ne[0], 1 << 30),
+                reverse=True,
+            ):
+                if not eye2.isVisibleState():
+                    continue
+                recs = ac_by_layer.get(self._phys_name_to_layer_id.get(name))
+                if not recs:
+                    continue
+                fb = fill_by_name.get(name)
+                solid = bool(fb.isSolid()) if fb is not None else False
+                qc = QColor(self._layer_color_for(name))
+                lrgb = (qc.redF(), qc.greenF(), qc.blueF())
+                z = self._layer_z_for(name)
+                for rec in recs:
+                    if rec.get("net") in rail_members:
+                        continue
+                    for poly in rec.get("polygons", []):
+                        if solid:
+                            _emit(self._triangulate_stub(poly), z, lrgb)
+                        else:
+                            _emit(self._copper_poly_wire(poly), z, lrgb)
+
+        if tri_chunks:
+            gv.set_overlay_fills(np.concatenate(tri_chunks, axis=0),
+                                 np.concatenate(col_chunks, axis=0))
+        else:
+            gv.clear_overlay_fills()
+        if labels:
+            gv.set_overlay_labels(labels)
+        else:
+            gv.clear_overlay_labels()
+
+    def _copper_poly_wire(self, poly: dict) -> np.ndarray:
+        """Mitered wire-mesh outline triangles for one all-copper polygon
+        (its exterior ring plus any holes). Cached on the polygon dict so
+        repeated renders just re-upload the prebuilt array."""
+        cached = poly.get("_wire_cache")
+        if cached is not None:
+            return cached
+        chunks: list[np.ndarray] = []
+        ext = poly.get("exterior")
+        if ext is not None and len(ext) >= 2:
+            chunks.append(_overlay_outline_tris(
+                ext, _OVERLAY_WIRE_HALF_MM, closed=True))
+        for hole in poly.get("holes", []) or []:
+            if hole is not None and len(hole) >= 2:
+                chunks.append(_overlay_outline_tris(
+                    hole, _OVERLAY_WIRE_HALF_MM, closed=True))
+        arr = (np.concatenate(chunks, axis=0) if chunks
+               else np.empty((0, 2), dtype=np.float32))
+        poly["_wire_cache"] = arr
+        return arr
+
+    def _designator_stroke_tris(self, rec: dict) -> np.ndarray:
+        """Triangles for one designator's stroke-font geometry — each glyph
+        stroke as a thin round-capped ribbon at the text's stroke width.
+        Cached on the record dict (the layout is static for the session)."""
+        cached = rec.get("_des_tris")
+        if cached is not None:
+            return cached
+        half = max(0.5 * float(rec.get("stroke_width_mm", 0.0) or 0.0), 0.01)
+        chunks: list[np.ndarray] = []
+        for pl in rec.get("polylines") or []:
+            if len(pl) < 2:
+                continue
+            chunks.append(_overlay_outline_tris(pl, half, closed=False))
+            for end in (pl[0], pl[-1]):
+                chunks.append(_overlay_fan_tris(_overlay_circle_ring(
+                    float(end[0]), float(end[1]), half, 8)))
+        arr = (np.concatenate(chunks, axis=0) if chunks
+               else np.empty((0, 2), dtype=np.float32))
+        rec["_des_tris"] = arr
+        return arr
 
     # --- Rendering -----------------------------------------------------------
 
@@ -4194,6 +5531,10 @@ class PdnViewer(QMainWindow):
                     "net": net,
                     "layer_id": self._phys_name_to_layer_id.get(phys),
                     "layer_index": layer_index,
+                    # Vertex count this (phys, net) contributed to the
+                    # combined mesh — used to build the editor-mode
+                    # per-vertex alpha array (see _editor_alpha_array).
+                    "n_vertices": n,
                     "triangulation": entry["triangulation"],
                     "interpolator": entry["interpolator"],
                     # Cache key stored for lazy interpolator writeback — when
@@ -4627,6 +5968,12 @@ class PdnViewer(QMainWindow):
         label, unit, derive_fn = self._mode_derive_fn(mode)
         is_via_current = (mode == _VIA_CURRENT_MODE)
 
+        # Overlays (silkscreen / pads / vias / components / designators)
+        # are independent of the FEM heatmap. Refresh them up-front so a
+        # rail or 2D/3D change keeps them in sync — and so they still draw
+        # when the early-outs below fire (no layer / rail selected).
+        self._refresh_overlay_geometry(rails)
+
         # Copper-mesh cmap follows the active mode: every other mode
         # paints the copper from its per-vertex scalar field, so we
         # need the viridis ramp. Via Current paints the heatmap onto
@@ -4899,6 +6246,12 @@ class PdnViewer(QMainWindow):
         self._gl_viewer.set_values(self._gl_scale(vs_arr).astype(np.float32))
         self._gl_viewer.set_levels(float(self._gl_scale(levels_min)),
                                     float(self._gl_scale(levels_max)))
+        # Editor-mode copper dimming: when a connectivity highlight is
+        # active, non-connected copper renders at 10% alpha. Pushed after
+        # set_mesh (which invalidates any previous alpha array).
+        self._gl_viewer.set_vertex_alpha(
+            self._editor_alpha_array(layer_probes, xs_arr.size)
+        )
         _mark("gl_mesh_upload")
 
         # Carry the user's chosen colour scheme through the re-render
@@ -5137,14 +6490,12 @@ class PdnViewer(QMainWindow):
         """Push the combined layer-outline + pad-outline overlay to the GL
         viewer as one GL_LINES batch.
 
-        Layer outlines (gated by ``show_outlines_box``) trace each visible
+        Layer outlines (gated by ``_outlines_btn``) trace each visible
         (layer, net) shape in the physical layer's swatch colour. Stub
         outlines (same gate, same colour) trace the no-current copper
         pieces that the FEM filter excluded — these aren't in
         ``layer_probes`` because there's no FEM solution for them, so we
-        walk ``metadata['stubs']`` separately. Pad outlines (gated by
-        ``show_pads_box``) trace every SMT / through-hole pad on each
-        visible copper layer in black.
+        walk ``metadata['stubs']`` separately.
 
         Each segment is promoted to 3D with z = the layer's stackup z, so
         the outline sits flush with the copper's top face. In 3D mode a
@@ -5176,7 +6527,7 @@ class PdnViewer(QMainWindow):
                     np.broadcast_to(rgb, (segs_xy.shape[0], 3)).copy()
                 )
 
-        if self.show_outlines_box.isChecked():
+        if self._outlines_btn.isOn():
             for lp in layer_probes:
                 segs = lp.get("outline_segments")
                 if segs is None or segs.size == 0:
@@ -5219,44 +6570,6 @@ class PdnViewer(QMainWindow):
                                        dtype=np.float32)
                         _emit(segs, self._layer_z_for(phys), rgb)
 
-        if self.show_pads_box.isChecked() and self.metadata is not None:
-            black = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            visible_layer_ids: dict[int, str] = {}
-            for phys in phys_list:
-                lid = self._phys_name_to_layer_id.get(phys)
-                if lid is not None:
-                    visible_layer_ids[lid] = phys
-            if visible_layer_ids:
-                pad_segs_by_layer = self._pad_outline_segments_by_layer()
-                for lid, phys in visible_layer_ids.items():
-                    segs = pad_segs_by_layer.get(lid)
-                    if segs is None or segs.size == 0:
-                        continue
-                    _emit(segs, self._layer_z_for(phys), black)
-
-        if self.show_all_copper_box.isChecked() and self.metadata is not None:
-            visible_layer_ids = {}
-            for phys in phys_list:
-                lid = self._phys_name_to_layer_id.get(phys)
-                if lid is not None:
-                    visible_layer_ids[lid] = phys
-            if visible_layer_ids:
-                rail_members = (set(self._effective_rail_members(rail_names))
-                                if rail_names is not None else set())
-                segs_by_pair = self._all_copper_segments_by_layer_net()
-                for (lid, net), segs in segs_by_pair.items():
-                    if segs.size == 0:
-                        continue
-                    if rail_members and net in rail_members:
-                        continue
-                    phys = visible_layer_ids.get(lid)
-                    if phys is None:
-                        continue
-                    qc = QColor(self._layer_color_for(phys))
-                    rgb = np.array([qc.redF(), qc.greenF(), qc.blueF()],
-                                   dtype=np.float32)
-                    _emit(segs, self._layer_z_for(phys), rgb)
-
         if pos_chunks:
             self._gl_viewer.set_outlines(
                 np.concatenate(pos_chunks, axis=0),
@@ -5280,7 +6593,8 @@ class PdnViewer(QMainWindow):
         GL_LINES pass would be clamped to 1 px on most Core profile
         drivers). Drawn on top of the heatmap in both 2D and 3D modes.
         """
-        if not self.show_board_outline_box.isChecked():
+        bo_state = self._overlay_state.get("board_outline", {}).get("both", {})
+        if bo_state.get("vis") is None:
             self._gl_viewer.clear_board_outline()
             return
         points = (self.metadata or {}).get("board_outline") or []
@@ -5341,97 +6655,13 @@ class PdnViewer(QMainWindow):
         if self.view_3d_box.isChecked():
             positions[:, 2] = 0.01
 
-        # Bold contrasting colour — warm orange reads on both viridis
-        # and the standard dark/light themes without being mistaken for
-        # any of the layer swatches.
-        colour = np.array([1.0, 0.55, 0.0], dtype=np.float32)
+        # User-set colour for the board-outline row (defaults to a bold
+        # warm orange — reads on both viridis and the standard dark/light
+        # themes without being mistaken for any of the layer swatches).
+        colour = np.asarray(self._overlay_colors["board_outline"],
+                            dtype=np.float32)
         colors = np.broadcast_to(colour, positions.shape).copy()
         self._gl_viewer.set_board_outline(positions, colors)
-
-    def _pad_outline_segments_by_layer(self) -> dict[int, np.ndarray]:
-        """Build (and cache) the per-copper-layer GL_LINES pad outline
-        segments from ``metadata['pads']``. Returns an ``layer_id ->
-        (N, 2) float32 array`` mapping (one GL_LINES pair per segment).
-        Cached after first build — pads never change for a given pickle.
-        """
-        cached = getattr(self, "_pad_segments_cache", None)
-        if cached is not None:
-            return cached
-        by_layer: dict[int, list[np.ndarray]] = {}
-        for pad in (self.metadata or {}).get("pads", []) or []:
-            ring = pad.get("outline") or []
-            if len(ring) < 3:
-                continue
-            ring_arr = np.asarray(ring, dtype=np.float32)
-            # Build GL_LINES pairs from the closed ring; if the ring isn't
-            # already closed (last != first), close it explicitly so the
-            # outline forms a complete loop.
-            if not np.allclose(ring_arr[0], ring_arr[-1]):
-                ring_arr = np.vstack([ring_arr, ring_arr[:1]])
-            pairs = np.empty((2 * (ring_arr.shape[0] - 1), 2),
-                             dtype=np.float32)
-            pairs[0::2] = ring_arr[:-1]
-            pairs[1::2] = ring_arr[1:]
-            for lid in pad.get("layer_ids") or []:
-                by_layer.setdefault(int(lid), []).append(pairs)
-        merged: dict[int, np.ndarray] = {}
-        for lid, chunks in by_layer.items():
-            merged[lid] = (np.concatenate(chunks, axis=0)
-                            if chunks else np.empty((0, 2), dtype=np.float32))
-        self._pad_segments_cache = merged
-        return merged
-
-    def _all_copper_segments_by_layer_net(
-        self,
-    ) -> dict[tuple[int, str], np.ndarray]:
-        """Build (and cache) per-(layer_id, net) GL_LINES outline segments
-        from ``metadata['all_copper']``.
-
-        Each entry's exterior + holes get unrolled into GL_LINES vertex
-        pairs (one segment per consecutive ring vertex pair, ring closed
-        explicitly when needed). Cached after first build — the underlying
-        polygon rings never change for a given pickle.
-        """
-        cached = getattr(self, "_all_copper_segments_cache", None)
-        if cached is not None:
-            return cached
-        result: dict[tuple[int, str], np.ndarray] = {}
-        records = (self.metadata or {}).get("all_copper", []) or []
-        for rec in records:
-            lid = int(rec.get("layer_id", -1))
-            net = rec.get("net", "")
-            if lid < 0:
-                continue
-            ring_chunks: list[np.ndarray] = []
-            for poly in rec.get("polygons", []) or []:
-                rings: list[np.ndarray] = []
-                ext = poly.get("exterior")
-                if ext is not None and len(ext) >= 2:
-                    rings.append(np.asarray(ext, dtype=np.float32))
-                for hole in poly.get("holes", []) or []:
-                    if hole is not None and len(hole) >= 2:
-                        rings.append(np.asarray(hole, dtype=np.float32))
-                for ring in rings:
-                    if not np.allclose(ring[0], ring[-1]):
-                        ring = np.vstack([ring, ring[:1]])
-                    pairs = np.empty(
-                        (2 * (ring.shape[0] - 1), 2), dtype=np.float32,
-                    )
-                    pairs[0::2] = ring[:-1]
-                    pairs[1::2] = ring[1:]
-                    ring_chunks.append(pairs)
-            if not ring_chunks:
-                continue
-            key = (lid, net)
-            existing = result.get(key)
-            merged = (np.concatenate(ring_chunks, axis=0) if len(ring_chunks) > 1
-                      else ring_chunks[0])
-            if existing is None:
-                result[key] = merged
-            else:
-                result[key] = np.concatenate([existing, merged], axis=0)
-        self._all_copper_segments_cache = result
-        return result
 
     # --- Stub-copper overlay -----------------------------------------------
 
@@ -6052,18 +7282,58 @@ class PdnViewer(QMainWindow):
             stub["_tris_cache"] = empty
             return empty
 
+        # Shewchuk's Triangle (the C core behind the ``triangle`` package)
+        # aborts the whole process — uncatchably, with no Python traceback
+        # — on a degenerate PSLG: self-touching rings, zero-length edges or
+        # duplicate vertices. ``all_copper`` rings are stored as float32,
+        # which on a dense real-board copper pour routinely rounds
+        # near-coincident vertices onto each other. Repair the polygon to
+        # strict OGC validity before meshing it. This is exactly why
+        # solid-fill "show all copper" crashed where wire-mesh — a
+        # pure-numpy path that never touches Triangle — did not.
+        if not poly.is_valid:
+            try:
+                repaired = poly.buffer(0)
+            except Exception:
+                repaired = None
+            if repaired is not None and not repaired.is_empty:
+                poly = repaired
+
+        # buffer(0) can split an invalid polygon into several pieces; mesh
+        # each component polygon on its own PSLG and concatenate (a single
+        # shared PSLG would let Triangle fill the gaps between them).
+        if poly.geom_type == "Polygon":
+            parts = [poly]
+        elif hasattr(poly, "geoms"):
+            parts = [g for g in poly.geoms if g.geom_type == "Polygon"]
+        else:
+            parts = []
+        chunks: list[np.ndarray] = []
+        for part in parts:
+            if part.is_empty:
+                continue
+            piece = self._triangulate_simple_polygon(part)
+            if piece.size:
+                chunks.append(piece)
+        arr = (np.concatenate(chunks, axis=0) if chunks
+               else np.empty((0, 2), dtype=np.float32))
+        stub["_tris_cache"] = arr
+        return arr
+
+    def _triangulate_simple_polygon(self, poly) -> np.ndarray:
+        """Constrained-Delaunay triangulate one OGC-valid shapely Polygon
+        into a flat ``(N*3, 2)`` float32 GL_TRIANGLES vertex soup.
+
+        Returns an empty array if Triangle declines the polygon. The
+        caller must hand in geometry that is already valid — see
+        :meth:`_triangulate_stub` for the validity repair.
+        """
         verts, segs, hole_markers = self._poly_to_triangle_input(poly)
         if not verts or not segs:
-            empty = np.empty((0, 2), dtype=np.float32)
-            stub["_tris_cache"] = empty
-            return empty
-
+            return np.empty((0, 2), dtype=np.float32)
         try:
             import triangle as _triangle
-            tri_input: dict = {
-                "vertices": verts,
-                "segments": segs,
-            }
+            tri_input: dict = {"vertices": verts, "segments": segs}
             if hole_markers:
                 tri_input["holes"] = hole_markers
             # ``p`` = constrained planar straight-line graph triangulation;
@@ -6076,17 +7346,13 @@ class PdnViewer(QMainWindow):
 
         out_verts = out.get("vertices") if out else None
         out_tris = out.get("triangles") if out else None
-        if (out_verts is None or out_tris is None
-                or len(out_tris) == 0):
-            arr = np.empty((0, 2), dtype=np.float32)
-        else:
-            v_arr = np.asarray(out_verts, dtype=np.float32)
-            t_arr = np.asarray(out_tris, dtype=np.int32)
-            # Expand index list into a flat (N*3, 2) GL_TRIANGLES vertex
-            # soup — matches the buffer layout the GL stub batch wants.
-            arr = v_arr[t_arr.ravel()].astype(np.float32, copy=False)
-        stub["_tris_cache"] = arr
-        return arr
+        if out_verts is None or out_tris is None or len(out_tris) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        v_arr = np.asarray(out_verts, dtype=np.float32)
+        t_arr = np.asarray(out_tris, dtype=np.int32)
+        # Expand the index list into a flat (N*3, 2) GL_TRIANGLES vertex
+        # soup — matches the buffer layout the GL stub/overlay batch wants.
+        return v_arr[t_arr.ravel()].astype(np.float32, copy=False)
 
     @staticmethod
     def _poly_to_triangle_input(poly) -> tuple[
@@ -6109,18 +7375,36 @@ class PdnViewer(QMainWindow):
         segs: list[tuple[int, int]] = []
         hole_markers: list[tuple[float, float]] = []
 
+        # Float32-rounded pour rings can carry coincident vertices that
+        # survive as zero-length PSLG edges; Triangle's C core aborts on
+        # those, so merge anything closer than this (0.1 µm — far below
+        # the finest real copper feature).
+        eps = 1e-4
+
         def _add_ring(ring) -> None:
             if ring is None or ring.is_empty:
                 return
             coords = list(ring.coords)
             if len(coords) >= 2 and coords[0] == coords[-1]:
                 coords = coords[:-1]
-            if len(coords) < 3:
+            # Drop consecutive coincident vertices (and the wrap-around
+            # duplicate) so every PSLG segment has non-zero length.
+            cleaned: list[tuple[float, float]] = []
+            for x, y in coords:
+                fx, fy = float(x), float(y)
+                if cleaned and abs(fx - cleaned[-1][0]) <= eps \
+                        and abs(fy - cleaned[-1][1]) <= eps:
+                    continue
+                cleaned.append((fx, fy))
+            while len(cleaned) >= 2 \
+                    and abs(cleaned[0][0] - cleaned[-1][0]) <= eps \
+                    and abs(cleaned[0][1] - cleaned[-1][1]) <= eps:
+                cleaned.pop()
+            if len(cleaned) < 3:
                 return
             i_first = len(verts)
-            for x, y in coords:
-                verts.append((float(x), float(y)))
-            n = len(coords)
+            verts.extend(cleaned)
+            n = len(cleaned)
             for i in range(n):
                 segs.append((i_first + i, i_first + (i + 1) % n))
 
@@ -6132,6 +7416,41 @@ class PdnViewer(QMainWindow):
                 hole_markers.append((float(hp.x), float(hp.y)))
             except Exception:
                 continue
+
+        # Weld globally-coincident vertices. The per-ring pass above only
+        # drops *consecutive* duplicates; float32-stored pour rings also
+        # round genuinely-distinct, non-adjacent vertices onto the exact
+        # same coordinate (within and across rings). Shewchuk's Triangle
+        # segfaults — silently, no traceback, taking the GUI with it — the
+        # instant its vertex list holds a duplicate or any non-finite
+        # coordinate, so collapse exact duplicates and bail on NaN/Inf
+        # before the PSLG ever reaches the C core.
+        if verts:
+            welded: list[tuple[float, float]] = []
+            index_of: dict[tuple[float, float], int] = {}
+            remap: list[int] = []
+            for vx, vy in verts:
+                if not (math.isfinite(vx) and math.isfinite(vy)):
+                    return [], [], []   # Triangle would segfault on NaN/Inf
+                key = (vx, vy)
+                idx = index_of.get(key)
+                if idx is None:
+                    idx = len(welded)
+                    index_of[key] = idx
+                    welded.append(key)
+                remap.append(idx)
+            clean_segs: list[tuple[int, int]] = []
+            seen_segs: set[tuple[int, int]] = set()
+            for a, b in segs:
+                ra, rb = remap[a], remap[b]
+                if ra == rb:
+                    continue                       # collapsed to zero length
+                ordered = (ra, rb) if ra < rb else (rb, ra)
+                if ordered in seen_segs:
+                    continue                       # duplicate constraint edge
+                seen_segs.add(ordered)
+                clean_segs.append((ra, rb))
+            verts, segs = welded, clean_segs
         return verts, segs, hole_markers
 
     def _stub_outline_segments(self, stub: dict) -> np.ndarray:
@@ -6650,7 +7969,7 @@ class PdnViewer(QMainWindow):
         plane (e.g. GND) and froze the GUI for several seconds the first
         time a heavy rail was shown — the per-(phys, net) cache is why
         only the *first* toggle stalled. A ``cKDTree`` build is pure C and
-        ~100x faster — the same swap the Vias / Pins report tables
+        ~100x faster — the same swap the Vias / Nodes report tables
         already made (see :meth:`_compute_via_report`).
 
         Orphan vertices — those not referenced by any triangle, which the
@@ -7000,6 +8319,10 @@ class PdnViewer(QMainWindow):
                 edge_width=2.5,
             ))
 
+        # Editor-mode directive markers (placed sources / sinks) — only
+        # populated while editor mode is active.
+        groups.extend(self._editor_marker_groups())
+
         self._gl_viewer.set_markers(groups)
 
         if legend_rows:
@@ -7061,9 +8384,12 @@ class PdnViewer(QMainWindow):
         # pan / zoom / 3D dolly don't change their world-space positions
         # — no rebuild needed on view change.
 
-    def _on_arrows_toggled(self, _checked: bool) -> None:
-        """Arrow checkbox flipped — push the overlay (or clear it).
-        Cheap; doesn't trigger a full _render."""
+    def _on_arrows_toggled(self, checked: bool) -> None:
+        """Arrow checkbox flipped — show/hide the density control and
+        push the overlay (or clear it). Cheap; doesn't trigger a full
+        _render."""
+        self.arrow_spacing_label.setVisible(checked)
+        self.arrow_spacing_slider.setVisible(checked)
         self._refresh_arrows()
 
     def _on_arrow_density_changed(self, value: int) -> None:
@@ -7310,8 +8636,6 @@ class PdnViewer(QMainWindow):
             ("Ctrl+Alt+3", self._hotkey_3d_mode_preserving),
             ("0", self._hotkey_reset_3d_view),
             ("O", self._hotkey_toggle_outlines),
-            ("P", self._hotkey_toggle_pads),
-            ("C", self._hotkey_toggle_all_copper),
             ("I", self._hotkey_toggle_markers),
             ("R", self._hotkey_toggle_rail_only),
             ("T", self._hotkey_toggle_cursor_tooltip),
@@ -7322,6 +8646,7 @@ class PdnViewer(QMainWindow):
             ("H", self._hotkey_cycle_colormap),
             ("Shift+H", self._hotkey_cycle_colormap_reverse),
             ("B", self._toggle_sidebar),
+            ("E", self._hotkey_toggle_editor),
         )
         # Hold references so the shortcuts don't get garbage-collected.
         self._hotkey_shortcuts = []
@@ -7378,13 +8703,7 @@ class PdnViewer(QMainWindow):
             self._gl_viewer.reset_3d_view()
 
     def _hotkey_toggle_outlines(self) -> None:
-        self.show_outlines_box.toggle()
-
-    def _hotkey_toggle_pads(self) -> None:
-        self.show_pads_box.toggle()
-
-    def _hotkey_toggle_all_copper(self) -> None:
-        self.show_all_copper_box.toggle()
+        self._outlines_btn.toggle()
 
     def _hotkey_toggle_markers(self) -> None:
         self.show_markers_box.toggle()
@@ -7432,9 +8751,913 @@ class PdnViewer(QMainWindow):
         idx = (combo.currentIndex() + step) % count
         combo.setCurrentIndex(idx)
 
+    # --- Editor mode ---------------------------------------------------------
+    #
+    # Editor mode lets the user place PDN sources / sinks directly on the
+    # board (on a real component, or as a free marker on copper) without
+    # editing the Altium schematic. Edits accumulate in the .fypa project
+    # file; the resolve button re-runs the FEM with them applied.
+
+    # Shared QSS for the square icon buttons pinned on the viewport.
+    _EDITOR_OVERLAY_BTN_QSS = (
+        "QToolButton { border: 1px solid %(border)s; border-radius: 6px;"
+        "  background-color: %(bg)s; }"
+        "QToolButton:hover { background-color: %(hover)s; }"
+        "QToolButton:checked { background-color: %(accent)s;"
+        "  border-color: %(accent)s; }"
+    )
+
+    def _build_editor_overlay_buttons(self) -> None:
+        """Create the editor-mode toggle, the source / sink free-marker
+        buttons, and the resolve button as overlay children of the GL
+        viewer, pinned top-left by :meth:`_position_editor_overlays`. The
+        source / sink buttons are shown only while editor mode is active."""
+        t = _T()
+        qss = self._EDITOR_OVERLAY_BTN_QSS % {
+            "border": t["border"], "bg": t["bg"],
+            "hover": t["bg_hover"], "accent": t["accent"],
+        }
+        btn = QToolButton(self._gl_viewer)
+        btn.setCheckable(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        icon = _load_editmode_icon()
+        if icon is not None:
+            btn.setIcon(icon)
+            btn.setIconSize(QSize(20, 20))
+        else:
+            btn.setText("Edit")
+        btn.setToolTip("Toggle editor mode (E) — place PDN sources / sinks")
+        btn.setFixedSize(34, 34)
+        btn.setStyleSheet(qss)
+        btn.toggled.connect(self._on_editor_mode_toggled)
+        self._editor_toggle_btn = btn
+
+        # Free-marker palette — red up-triangle SOURCE / blue down-triangle
+        # SINK, matching the solved-directive markers (_ROLE_MARKER_STYLE).
+        # Hidden until editor mode is entered.
+        for role, attr, up, tip in (
+            ("SOURCE", "_editor_add_source_btn", True,
+             "Drop a free SOURCE — click, then click copper"),
+            ("SINK", "_editor_add_sink_btn", False,
+             "Drop a free SINK — click, then click copper"),
+        ):
+            style = self._ROLE_MARKER_STYLE[role]
+            mbtn = QToolButton(self._gl_viewer)
+            mbtn.setCheckable(True)
+            mbtn.setCursor(Qt.PointingHandCursor)
+            mbtn.setIcon(_triangle_icon(style["color"], up=up))
+            mbtn.setIconSize(QSize(18, 18))
+            mbtn.setFixedSize(34, 34)
+            mbtn.setToolTip(tip)
+            mbtn.setStyleSheet(qss)
+            mbtn.clicked.connect(
+                lambda _checked=False, r=role: self._on_editor_add_marker(r)
+            )
+            mbtn.hide()
+            setattr(self, attr, mbtn)
+
+        rbtn = QPushButton("↻  Resolve", self._gl_viewer)
+        rbtn.setCursor(Qt.PointingHandCursor)
+        rbtn.setToolTip(
+            "Re-run the solver with the current editor changes applied"
+        )
+        rbtn.setStyleSheet(
+            "QPushButton { border: 1px solid %(warn)s; border-radius: 6px;"
+            "  padding: 6px 12px; font-weight: bold;"
+            "  background-color: %(bg)s; color: %(warn)s; }"
+            "QPushButton:hover { background-color: %(hover)s; }"
+            % {"warn": t["warn"], "bg": t["bg"], "hover": t["bg_hover"]}
+        )
+        rbtn.clicked.connect(self._on_resolve_clicked)
+        rbtn.hide()
+        self._resolve_btn = rbtn
+        self._position_editor_overlays()
+
+    def _position_editor_overlays(self) -> None:
+        """Pin the editor toggle, source / sink, and resolve buttons in a
+        row along the GL viewer's top-left corner. Safe before the widgets
+        exist (no-op); wired to every GL-viewer resize via
+        :meth:`eventFilter`."""
+        gl = getattr(self, "_gl_viewer", None)
+        btn = getattr(self, "_editor_toggle_btn", None)
+        if gl is None or btn is None:
+            return
+        margin, gap = 12, 6
+        x = margin
+        btn.move(x, margin)
+        btn.raise_()
+        x += btn.width() + gap
+        for attr in ("_editor_add_source_btn", "_editor_add_sink_btn"):
+            b = getattr(self, attr, None)
+            if b is not None and not b.isHidden():
+                b.move(x, margin)
+                b.raise_()
+                x += b.width() + gap
+        rbtn = getattr(self, "_resolve_btn", None)
+        if rbtn is not None and not rbtn.isHidden():
+            rbtn.adjustSize()
+            rbtn.move(x + 2, margin)
+            rbtn.raise_()
+
+    def _build_editor_panel(self) -> QWidget:
+        """Right-hand panel shown in editor mode: a PDN-role form, filled
+        on selection by :meth:`_populate_editor_form`. Free source / sink
+        markers are placed from the viewport-overlay buttons, not here."""
+        t = _T()
+        panel = QWidget()
+        panel.setFixedWidth(300)
+        panel.setStyleSheet(f"background-color: {t['bg']};")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        lay.addWidget(QLabel("<b>PDN Editor</b>"))
+
+        self._editor_hint = QLabel(self._EDITOR_DEFAULT_HINT)
+        self._editor_hint.setWordWrap(True)
+        self._editor_hint.setStyleSheet(f"color: {t['fg_muted']};")
+        lay.addWidget(self._editor_hint)
+
+        # Form host — (re)populated by _populate_editor_form on selection.
+        self._editor_form_host = QWidget()
+        self._editor_form_layout = QVBoxLayout(self._editor_form_host)
+        self._editor_form_layout.setContentsMargins(0, 0, 0, 0)
+        self._editor_form_layout.setSpacing(6)
+        self._editor_form_host.hide()
+        lay.addWidget(self._editor_form_host)
+
+        lay.addStretch(1)
+        return panel
+
+    def _on_editor_mode_toggled(self, checked: bool) -> None:
+        """Enter / leave editor mode — swaps the viewport look, shows /
+        hides the right-hand panel, and clears transient selection state
+        on the way out (placed directives persist in the project)."""
+        self._editor_mode = bool(checked)
+        self._gl_viewer.set_editor_mode(self._editor_mode)
+        self._editor_panel.setVisible(self._editor_mode)
+        # Keep the toggle button in sync when entered via the E hotkey.
+        if self._editor_toggle_btn.isChecked() != self._editor_mode:
+            self._editor_toggle_btn.blockSignals(True)
+            self._editor_toggle_btn.setChecked(self._editor_mode)
+            self._editor_toggle_btn.blockSignals(False)
+        if not self._editor_mode:
+            self._editor_selection = None
+            self._editor_pending_marker = None
+            self._clear_editor_highlight()
+        else:
+            self._update_pending_rails()
+        # Source / sink free-marker buttons live in the viewport overlay
+        # and are visible only while editor mode is active.
+        for attr in ("_editor_add_source_btn", "_editor_add_sink_btn"):
+            b = getattr(self, attr, None)
+            if b is not None:
+                b.setVisible(self._editor_mode)
+        self._update_editor_panel()
+        self._position_editor_overlays()
+        # Refresh so editor-directive markers appear / disappear with the
+        # mode (the grid + background are handled by the GL viewer itself).
+        self._render()
+
+    def _hotkey_toggle_editor(self) -> None:
+        self._editor_toggle_btn.toggle()
+
+    _EDITOR_DEFAULT_HINT = (
+        "Click a component or a copper region in the viewport to assign a "
+        "PDN role, or use the red / blue triangle buttons at the top-left "
+        "of the viewport to drop a free source / sink."
+    )
+
+    def _update_editor_panel(self) -> None:
+        """Sync the right-hand panel widgets to the current selection /
+        pending-marker state. The PDN form shows for component / free-marker
+        selections; a plain copper pick just updates the hint text."""
+        if not hasattr(self, "_editor_hint"):
+            return
+        sel = self._editor_selection
+        kind = sel.get("kind") if sel else None
+        has_form = kind in ("component", "free")
+        self._editor_form_host.setVisible(has_form)
+        self._editor_hint.setVisible(not has_form)
+        if kind == "copper" and sel:
+            self._editor_hint.setText(
+                f"Copper net <b>{_esc(sel.get('net', '') or '')}</b> "
+                "selected — connected copper is highlighted. Select a "
+                "component or drop a free marker to add a source / sink."
+            )
+        elif not has_form:
+            self._editor_hint.setText(self._EDITOR_DEFAULT_HINT)
+        self._sync_marker_buttons()
+
+    def _sync_marker_buttons(self) -> None:
+        """Reflect the armed free-marker role on the viewport source / sink
+        buttons' checked state."""
+        pend = self._editor_pending_marker
+        for role, attr in (("SOURCE", "_editor_add_source_btn"),
+                           ("SINK", "_editor_add_sink_btn")):
+            b = getattr(self, attr, None)
+            if b is not None and b.isChecked() != (pend == role):
+                b.setChecked(pend == role)
+
+    def _on_editor_add_marker(self, role: str) -> None:
+        """Arm 'drop a free <role> marker on the next viewport click'.
+        Clicking the same button again disarms it."""
+        self._editor_pending_marker = (
+            None if self._editor_pending_marker == role else role
+        )
+        self._sync_marker_buttons()
+        if self._editor_pending_marker:
+            self.statusBar().showMessage(
+                f"Click copper to drop a free {role.lower()}.", 4000)
+        else:
+            self.statusBar().clearMessage()
+
+    def _set_solve_stale(self, stale: bool) -> None:
+        """Flag editor edits as needing (or no longer needing) a re-solve
+        and show / hide the resolve button accordingly."""
+        self._solve_stale = bool(stale)
+        rbtn = getattr(self, "_resolve_btn", None)
+        if rbtn is not None:
+            rbtn.setVisible(self._solve_stale)
+            self._position_editor_overlays()
+
+    def _mark_project_dirty(self) -> None:
+        """Record that an editor edit happened: the project file is now
+        out of date and a re-solve is needed."""
+        self._project_dirty = True
+        self._set_solve_stale(True)
+
+    # --- Editor mode: selection + connectivity highlight --------------------
+
+    def _editor_alpha_array(self, layer_probes: list[dict],
+                            total_vertices: int) -> np.ndarray | None:
+        """Per-vertex alpha for editor-mode copper dimming: 1.0 for copper
+        in the connectivity highlight, 0.1 for the rest. Returns ``None``
+        when no highlight is active (the mesh then draws fully opaque)."""
+        if not self._editor_mode or not self._editor_highlight_nets:
+            return None
+        hi = self._editor_highlight_nets
+        parts: list[np.ndarray] = []
+        # layer_probes is top-first; the combined mesh was built
+        # bottom-first, so iterate reversed to match the xs/ys/tris order.
+        for p in reversed(layer_probes):
+            n = int(p.get("n_vertices", 0))
+            if n <= 0:
+                continue
+            a = 1.0 if p.get("net") in hi else 0.1
+            parts.append(np.full(n, a, dtype=np.float32))
+        if not parts:
+            return None
+        arr = np.concatenate(parts)
+        if arr.size != total_vertices:
+            return None   # ordering mismatch — skip dimming, never crash
+        return arr
+
+    def _connected_nets(self, net: str | None) -> set[str]:
+        """Nets electrically connected to ``net`` — the net itself plus
+        anything bridged to it by a SERIES directive (via the rail-group
+        union-find). Same-net copper is connected by definition, including
+        across layers through vias."""
+        if not net:
+            return set()
+        for members in self._rail_to_members.values():
+            if net in members:
+                return set(members)
+        return {net}
+
+    def _component_at(self, world_x: float, world_y: float) -> dict | None:
+        """Metadata component record whose bounding box covers the point,
+        or ``None``. Smallest box wins when component boxes nest."""
+        if not self.metadata:
+            return None
+        best: dict | None = None
+        best_area: float | None = None
+        for rec in self.metadata.get("components", []):
+            bbox = rec.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = bbox
+            if x0 <= world_x <= x1 and y0 <= world_y <= y1:
+                area = (x1 - x0) * (y1 - y0)
+                if best_area is None or area < best_area:
+                    best, best_area = rec, area
+        return best
+
+    def _net_at(self, world_x: float, world_y: float) -> str | None:
+        """Copper net under the point — solved copper first, then the
+        excluded-stub copper. ``None`` on bare substrate."""
+        hit = self._probe_at_point(world_x, world_y)
+        if hit is not None and hit[1].get("net"):
+            return hit[1]["net"]
+        stub_hit = self._probe_at_stub(world_x, world_y)
+        if stub_hit is not None and stub_hit[1].get("net"):
+            return stub_hit[1]["net"]
+        return None
+
+    def _on_editor_click(self, world_x: float, world_y: float) -> None:
+        """Editor-mode left-click: drop a pending free marker if one is
+        armed, else select the component / copper under the cursor."""
+        if self._editor_pending_marker is not None:
+            self._place_free_marker(world_x, world_y)
+            return
+        comp = self._component_at(world_x, world_y)
+        if comp is not None:
+            self._select_component(comp)
+            return
+        net = self._net_at(world_x, world_y)
+        if net:
+            self._select_copper(net)
+            return
+        # Bare substrate — clear the selection.
+        self._editor_selection = None
+        self._clear_editor_highlight()
+        self._update_editor_panel()
+
+    def _select_component(self, comp: dict) -> None:
+        """Select a PCB component for PDN editing and highlight the copper
+        connected to its pins."""
+        nets = list(comp.get("nets", []))
+        self._editor_selection = {
+            "kind": "component",
+            "designator": comp.get("designator"),
+            "nets": nets,
+            "bbox": comp.get("bbox"),
+        }
+        highlight: set[str] = set()
+        for n in nets:
+            highlight |= self._connected_nets(n)
+        self._apply_editor_highlight(highlight)
+        self._populate_editor_form()
+
+    def _select_copper(self, net: str) -> None:
+        """Select a copper net for PDN editing and highlight every net
+        connected to it."""
+        self._editor_selection = {"kind": "copper", "net": net}
+        self._apply_editor_highlight(self._connected_nets(net))
+        self._populate_editor_form()
+
+    def _apply_editor_highlight(self, nets: set[str]) -> None:
+        """Set the connectivity highlight and re-render — non-connected
+        copper dims to 10%."""
+        self._editor_highlight_nets = set(nets)
+        self._render()
+        self._update_editor_panel()
+
+    def _clear_editor_highlight(self) -> None:
+        """Drop the connectivity highlight; copper returns to full opacity."""
+        if self._editor_highlight_nets:
+            self._editor_highlight_nets = set()
+            self._render()
+
+    # --- Editor mode: PDN form + free markers -------------------------------
+
+    def _ensure_project(self):
+        """Return the in-memory :class:`ProjectFile`, creating an empty one
+        (seeded from the loaded metadata) the first time an editor edit
+        needs somewhere to live. Pickle paths stay blank until a save."""
+        if self._project is None:
+            from fypa.project_file import ProjectFile
+            self._project = ProjectFile()
+            if self.metadata:
+                self._project.prjpcb_path = self.metadata.get("prjpcb_path")
+                self._project.pcbdoc_path = self.metadata.get("pcbdoc_path")
+        return self._project
+
+    def _all_net_names(self) -> list[str]:
+        """Sorted list of every net name known to this viewer — solved
+        per-net layers, rail-group members, and metadata copper / pads /
+        vias. Used to populate the N-net picker. Cached (immutable)."""
+        cached = getattr(self, "_all_net_names_cache", None)
+        if cached is not None:
+            return cached
+        nets: set[str] = set()
+        for (_phys, net) in self._index_by_pair:
+            nets.add(net)
+        for members in self._rail_to_members.values():
+            nets.update(members)
+        md = self.metadata or {}
+        for rec in md.get("components", []):
+            nets.update(rec.get("nets", []) or [])
+        for key in ("pads", "vias", "pths", "all_copper"):
+            for rec in md.get(key, []):
+                n = rec.get("net")
+                if n:
+                    nets.add(n)
+        out = sorted(n for n in nets if n)
+        self._all_net_names_cache = out
+        return out
+
+    def _component_center(self, designator: str | None
+                          ) -> tuple[float, float] | None:
+        """Centre of the named component's bounding box, or ``None``."""
+        if not designator or not self.metadata:
+            return None
+        for rec in self.metadata.get("components", []):
+            if rec.get("designator") == designator:
+                bbox = rec.get("bbox")
+                if bbox and len(bbox) == 4:
+                    return (0.5 * (bbox[0] + bbox[2]),
+                            0.5 * (bbox[1] + bbox[3]))
+        return None
+
+    def _directive_for_selection(self):
+        """Return the :class:`EditorDirective` matching the current
+        selection (component designator or free-marker id), or ``None``."""
+        sel = self._editor_selection
+        if not sel or self._project is None:
+            return None
+        if sel.get("kind") == "component":
+            des = sel.get("designator")
+            for d in self._project.editor_directives:
+                if d.kind == "component" and d.designator == des:
+                    return d
+        elif sel.get("kind") == "free":
+            return self._project.directive_by_id(sel.get("id") or "")
+        return None
+
+    @staticmethod
+    def _clear_layout(layout) -> None:
+        """Remove and delete every widget / nested layout in ``layout``."""
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            else:
+                child = item.layout()
+                if child is not None:
+                    PdnViewer._clear_layout(child)
+
+    @staticmethod
+    def _set_combo(combo: QComboBox, value: str) -> None:
+        """Select ``value`` in ``combo``, adding it first if absent."""
+        if value is None:
+            return
+        if combo.findText(value) < 0:
+            combo.addItem(value)
+        combo.setCurrentText(value)
+
+    def _form_p_nets(self, sel: dict) -> list[str]:
+        """Candidate P-net names for the form's P picker, given the
+        selection: a component offers its pins' nets; a free marker offers
+        the connected-copper group it sits on."""
+        if sel.get("kind") == "component":
+            return list(sel.get("nets", []) or []) or self._all_net_names()
+        d = self._directive_for_selection()
+        if d is not None and d.p_net:
+            return sorted(self._connected_nets(d.p_net)) or [d.p_net]
+        return self._all_net_names()
+
+    @staticmethod
+    def _terminal_net_label(term: dict | None) -> str:
+        """Human label for a metadata directive terminal — its named net,
+        else its pins' nets, else an ideal-return / dash placeholder."""
+        if not term:
+            return "—"
+        if term.get("ideal_return"):
+            return "ideal 0 V return"
+        rn = term.get("requested_net")
+        if rn:
+            return rn
+        nets = sorted({p.get("net") for p in term.get("pins", []) or []
+                       if p.get("net")})
+        return ", ".join(nets) if nets else "—"
+
+    def _schematic_directives_for(self, sel: dict) -> list[dict]:
+        """Schematic PDN directives (from the solve metadata) belonging to
+        the selected component — matched by designator, or by a directive
+        terminal pin landing inside the component's bounding box (robust to
+        multi-channel designator re-basing)."""
+        if not self.metadata:
+            return []
+        des = sel.get("designator")
+        bbox = sel.get("bbox")
+        out: list[dict] = []
+        for d in self.metadata.get("directives", []):
+            if des and d.get("designator") == des:
+                out.append(d)
+                continue
+            if bbox and len(bbox) == 4:
+                x0, y0, x1, y1 = bbox
+                hit = False
+                for term in (d.get("terminals") or {}).values():
+                    for pin in term.get("pins", []) or []:
+                        px, py = pin.get("x_mm"), pin.get("y_mm")
+                        if (px is not None and py is not None
+                                and x0 <= px <= x1 and y0 <= py <= y1):
+                            hit = True
+                            break
+                    if hit:
+                        break
+                if hit:
+                    out.append(d)
+        return out
+
+    def _build_schematic_info(self, lay, directives: list[dict]) -> None:
+        """Read-only panel block describing a component's existing Altium
+        schematic PDN directives (PDN_ROLE / PDN_V / PDN_I / PDN_*_NET)."""
+        t = _T()
+        blocks: list[str] = []
+        for d in directives:
+            role = d.get("role", "?")
+            val = d.get("value_str") or ""
+            terms = d.get("terminals") or {}
+            tparts = [
+                f"{tname}&nbsp;=&nbsp;"
+                f"{_esc(self._terminal_net_label(terms[tname]))}"
+                for tname in ("P", "N", "OUT_P", "OUT_N", "IN_P", "IN_N")
+                if tname in terms
+            ]
+            head = f"<b>{_esc(role)}</b>"
+            if val:
+                head += f" &middot; {_esc(val)}"
+            blocks.append(head + "<br>" + " &nbsp; ".join(tparts))
+        box = QLabel(
+            f"<span style='color:{t['fg_muted']};'>Defined in the Altium "
+            f"schematic</span><br>{'<br><br>'.join(blocks)}"
+        )
+        box.setWordWrap(True)
+        box.setTextFormat(Qt.RichText)
+        box.setStyleSheet(
+            f"QLabel {{ border: 1px solid {t['border']}; border-radius: 4px;"
+            f" padding: 6px; background-color: {t['bg_alt']}; }}"
+        )
+        lay.addWidget(box)
+        note = QLabel(
+            "This rail is set up in the schematic — edit the component's "
+            "PDN_* parameters there to change it."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {t['fg_muted']}; font-size: 8pt;")
+        lay.addWidget(note)
+
+    def _populate_editor_form(self) -> None:
+        """(Re)build the PDN-role form for the current component / free
+        selection. A plain copper selection has no form."""
+        if not hasattr(self, "_editor_form_layout"):
+            return
+        self._clear_layout(self._editor_form_layout)
+        sel = self._editor_selection
+        if not sel or sel.get("kind") not in ("component", "free"):
+            self._update_editor_panel()
+            return
+        t = _T()
+        lay = self._editor_form_layout
+        existing = self._directive_for_selection()
+
+        if sel["kind"] == "component":
+            title = f"Component <b>{_esc(sel.get('designator') or '?')}</b>"
+        else:
+            title = "<b>Free marker</b>"
+        lay.addWidget(QLabel(title))
+
+        # A component already carrying PDN_* directives in the Altium
+        # schematic is shown read-only — editing it means editing the
+        # schematic, and an editor directive on top would double up.
+        if sel["kind"] == "component":
+            sch = self._schematic_directives_for(sel)
+            if sch:
+                self._build_schematic_info(lay, sch)
+                self._update_editor_panel()
+                return
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        self._ef_role = QComboBox()
+        self._ef_role.addItems(["SOURCE", "SINK"])
+        self._ef_role.currentTextChanged.connect(self._on_editor_role_changed)
+        form.addRow("PDN role", self._ef_role)
+        self._ef_value = QLineEdit()
+        self._ef_value.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self._ef_value_label = QLabel("Voltage (V)")
+        form.addRow(self._ef_value_label, self._ef_value)
+        lay.addLayout(form)
+
+        lay.addWidget(QLabel("Current model"))
+        self._ef_single = QRadioButton("Single net (point-to-point)")
+        self._ef_two = QRadioButton("Two nets (full current-path loop)")
+        self._ef_btngroup = QButtonGroup(self._editor_form_host)
+        self._ef_btngroup.addButton(self._ef_single)
+        self._ef_btngroup.addButton(self._ef_two)
+        self._ef_single.setChecked(True)
+        self._ef_single.toggled.connect(self._on_editor_model_changed)
+        lay.addWidget(self._ef_single)
+        lay.addWidget(self._ef_two)
+
+        form2 = QFormLayout()
+        form2.setContentsMargins(0, 0, 0, 0)
+        self._ef_pnet = QComboBox()
+        self._ef_pnet.addItems(self._form_p_nets(sel))
+        self._ef_pnet_label = QLabel("Net")
+        form2.addRow(self._ef_pnet_label, self._ef_pnet)
+        self._ef_nnet = QComboBox()
+        self._ef_nnet.addItems(self._all_net_names())
+        self._ef_nnet_label = QLabel("N net")
+        form2.addRow(self._ef_nnet_label, self._ef_nnet)
+        lay.addLayout(form2)
+
+        btns = QHBoxLayout()
+        self._ef_apply = QPushButton("Apply")
+        self._ef_apply.clicked.connect(self._on_editor_apply)
+        self._ef_remove = QPushButton("Remove")
+        self._ef_remove.clicked.connect(self._on_editor_remove)
+        btns.addWidget(self._ef_apply)
+        btns.addWidget(self._ef_remove)
+        lay.addLayout(btns)
+
+        self._ef_status = QLabel("")
+        self._ef_status.setWordWrap(True)
+        self._ef_status.setStyleSheet(
+            f"color: {t['fg_muted']}; font-size: 8pt;")
+        lay.addWidget(self._ef_status)
+
+        if existing is not None:
+            role = existing.role if existing.role in ("SOURCE", "SINK") else "SINK"
+            self._ef_role.setCurrentText(role)
+            val = existing.current if role == "SINK" else existing.voltage
+            self._ef_value.setText("" if val is None else f"{val:g}")
+            self._ef_single.setChecked(existing.single_net)
+            self._ef_two.setChecked(not existing.single_net)
+            if existing.p_net:
+                self._set_combo(self._ef_pnet, existing.p_net)
+            if existing.n_net:
+                self._set_combo(self._ef_nnet, existing.n_net)
+            self._ef_remove.setEnabled(True)
+        else:
+            self._ef_remove.setEnabled(False)
+        self._on_editor_role_changed(self._ef_role.currentText())
+        self._on_editor_model_changed()
+        self._update_editor_panel()
+
+    def _on_editor_role_changed(self, role: str) -> None:
+        """Swap the value field between voltage (SOURCE) and current
+        (SINK)."""
+        if not hasattr(self, "_ef_value_label"):
+            return
+        self._ef_value_label.setText(
+            "Current (A)" if role == "SINK" else "Voltage (V)"
+        )
+
+    def _on_editor_model_changed(self, *_args) -> None:
+        """Two-net shows both the 'P net' and 'N net' pickers; single-net
+        hides the N-net row entirely and relabels the P picker just 'Net'."""
+        if not hasattr(self, "_ef_two"):
+            return
+        two = self._ef_two.isChecked()
+        self._ef_nnet.setVisible(two)
+        self._ef_nnet.setEnabled(two)
+        self._ef_nnet_label.setVisible(two)
+        self._ef_pnet_label.setText("P net" if two else "Net")
+
+    def _on_editor_apply(self) -> None:
+        """Commit the form into an :class:`EditorDirective` on the project,
+        flag the project dirty + the solve stale, and refresh markers."""
+        from fypa.project_file import EditorDirective
+        sel = self._editor_selection
+        if not sel or sel.get("kind") not in ("component", "free"):
+            return
+        role = self._ef_role.currentText()
+        txt = self._ef_value.text().strip()
+        try:
+            value = float(txt)
+        except ValueError:
+            self._ef_status.setText(
+                f"<span style='color:{_T()['err']};'>Enter a numeric "
+                f"{'current' if role == 'SINK' else 'voltage'} value.</span>"
+            )
+            return
+        single = self._ef_single.isChecked()
+        p_net = self._ef_pnet.currentText() or None
+        n_net = self._ef_nnet.currentText() if not single else None
+        if not p_net:
+            self._ef_status.setText(
+                f"<span style='color:{_T()['err']};'>"
+                "Pick a P net.</span>"
+            )
+            return
+
+        existing = self._directive_for_selection()
+        d = existing if existing is not None else EditorDirective()
+        d.role = role
+        d.single_net = single
+        d.p_net = p_net
+        d.n_net = n_net
+        d.voltage = value if role in ("SOURCE", "REGULATOR") else None
+        d.current = value if role == "SINK" else None
+        if sel["kind"] == "component":
+            d.kind = "component"
+            d.designator = sel.get("designator")
+        else:
+            d.kind = "free"
+            self._editor_selection = {"kind": "free", "id": d.id}
+
+        self._ensure_project().upsert_directive(d)
+        self._mark_project_dirty()
+        self._apply_editor_highlight(self._connected_nets(p_net))
+        self._update_pending_rails()
+        self._render()
+        self._ef_status.setText(
+            f"<span style='color:{_T()['ok']};'>Applied — press Resolve "
+            "to re-solve.</span>"
+        )
+
+    def _on_editor_remove(self) -> None:
+        """Delete the directive bound to the current selection."""
+        existing = self._directive_for_selection()
+        if existing is None or self._project is None:
+            return
+        self._project.remove_directive(existing.id)
+        self._mark_project_dirty()
+        self._editor_selection = None
+        self._editor_highlight_nets = set()
+        self._update_pending_rails()
+        self._render()
+        self._populate_editor_form()
+
+    def _place_free_marker(self, world_x: float, world_y: float) -> None:
+        """Drop a free source / sink marker on the copper under the cursor
+        and open its form. No-op (with a hint) if the click missed copper."""
+        from fypa.project_file import EditorDirective
+        role = self._editor_pending_marker
+        if role is None:
+            return
+        net = self._net_at(world_x, world_y)
+        if not net:
+            self.statusBar().showMessage(
+                "No copper there — click on a copper region.", 4000)
+            return
+        hit = self._probe_at_point(world_x, world_y)
+        layer = hit[1].get("physical") if hit is not None else None
+        layer_id = hit[1].get("layer_id") if hit is not None else None
+        d = EditorDirective(
+            kind="free", role=role, anchor_xy=(world_x, world_y),
+            layer=layer, layer_id=layer_id, single_net=True, p_net=net,
+            voltage=(3.3 if role == "SOURCE" else None),
+            current=(1.0 if role == "SINK" else None),
+        )
+        self._ensure_project().upsert_directive(d)
+        self._editor_pending_marker = None
+        self._editor_selection = {"kind": "free", "id": d.id}
+        self._mark_project_dirty()
+        self._apply_editor_highlight(self._connected_nets(net))
+        self._update_pending_rails()
+        self._populate_editor_form()
+        self._render()
+
+    def _editor_marker_groups(self) -> list:
+        """MarkerGroups for the placed editor directives — drawn only in
+        editor mode so they don't clutter the normal viewer."""
+        if not self._editor_mode or self._project is None:
+            return []
+        by_role: dict[str, list[tuple[float, float]]] = {}
+        for d in self._project.editor_directives:
+            if d.kind == "free" and d.anchor_xy is not None:
+                pt = (float(d.anchor_xy[0]), float(d.anchor_xy[1]))
+            elif d.kind == "component":
+                pt = self._component_center(d.designator)
+                if pt is None:
+                    continue
+            else:
+                continue
+            by_role.setdefault(d.role, []).append(pt)
+        groups = []
+        for role, pts in by_role.items():
+            if not pts:
+                continue
+            # Match the solved-directive markers — red up-triangle SOURCE,
+            # blue down-triangle SINK (see _ROLE_MARKER_STYLE).
+            style = self._ROLE_MARKER_STYLE.get(
+                role, {"symbol": "star", "color": "#ffffff", "size": 18})
+            groups.append(MarkerGroup(
+                xs=np.array([p[0] for p in pts], dtype=np.float64),
+                ys=np.array([p[1] for p in pts], dtype=np.float64),
+                zs=np.zeros(len(pts), dtype=np.float64),
+                color=style["color"],
+                symbol=style["symbol"],
+                size=style["size"] + 4,
+                edge_color="#101010",
+                edge_width=1.4,
+            ))
+        return groups
+
+    # --- Editor mode: pending rails + resolve -------------------------------
+
+    def _rail_name_for(self, nets) -> str:
+        """Pick a display name for a rail group — prefer a '+'-prefixed
+        net, then a non-ground net, alphabetical within each tier."""
+        def rank(n: str) -> tuple[int, str]:
+            if n.startswith("+"):
+                return (0, n)
+            if n.lower() in {"0v", "gnd", "ground", "vss"}:
+                return (2, n)
+            return (1, n)
+        ordered = sorted((n for n in nets if n), key=rank)
+        return ordered[0] if ordered else "(rail)"
+
+    def _editor_pending_rails(self) -> dict[str, list[str]]:
+        """Connected-copper groups carrying at least one editor SOURCE and
+        one editor SINK that the current solution has not solved — i.e.
+        rails the user has defined but not yet resolved. Returns
+        ``{rail_name: [member nets]}``."""
+        if self._project is None:
+            return {}
+        groups: list[dict] = []
+        for d in self._project.editor_directives:
+            if d.role not in ("SOURCE", "SINK") or not d.p_net:
+                continue
+            conn = self._connected_nets(d.p_net)
+            target = None
+            for g in groups:
+                if g["nets"] & conn:
+                    target = g
+                    break
+            if target is None:
+                target = {"nets": set(), "roles": set()}
+                groups.append(target)
+            target["nets"] |= conn
+            target["roles"].add(d.role)
+        solved = set(self._rail_names)
+        pending: dict[str, list[str]] = {}
+        for g in groups:
+            if "SOURCE" in g["roles"] and "SINK" in g["roles"]:
+                name = self._rail_name_for(g["nets"])
+                if name not in solved:
+                    pending[name] = sorted(g["nets"])
+        return pending
+
+    def _update_pending_rails(self) -> None:
+        """Rebuild the pending-rail rows in the Rails list. Pending rails
+        are styled distinctly (italic, greyed, '(unsolved)') with a
+        disabled eye — not viewable until a resolve has run."""
+        if not hasattr(self, "rail_list"):
+            return
+        for item in getattr(self, "_pending_rail_items", []):
+            row = self.rail_list.row(item)
+            if row >= 0:
+                self.rail_list.takeItem(row)
+        self._pending_rail_items: list = []
+        self._pending_rails = self._editor_pending_rails()
+        t = _T()
+        for name in sorted(self._pending_rails):
+            eye = EyeButton(visible=False)
+            eye.setEnabled(False)
+            eye.setToolTip("Unsolved rail — press Resolve to compute it.")
+            row = self._build_layer_row_widget(
+                eye, swatch_color=None,
+                label_text=f"{name}  (unsolved)", bold=False,
+            )
+            row.setStyleSheet(
+                f"color: {t['fg_muted']}; font-style: italic;"
+            )
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled)
+            self.rail_list.addItem(item)
+            item.setSizeHint(row.sizeHint())
+            self.rail_list.setItemWidget(item, row)
+            self._pending_rail_items.append(item)
+        approx = self.rail_list.sizeHintForRow(0) or 22
+        self.rail_list.setFixedHeight(self.rail_list.count() * approx + 6)
+
+    def _on_resolve_clicked(self) -> None:
+        """Re-run the solver with the current editor directives applied,
+        reusing the cached design info (no Altium re-extraction)."""
+        if self._project is None or not self._project.editor_directives:
+            QMessageBox.information(
+                self, "Nothing to resolve",
+                "There are no editor directives to solve yet.",
+            )
+            return
+        prjpcb = self.metadata.get("prjpcb_path") if self.metadata else None
+        if not prjpcb:
+            QMessageBox.warning(
+                self, "Can't resolve",
+                "This solution isn't linked to an Altium project, so the "
+                "design info needed for a re-solve isn't available.",
+            )
+            return
+        pcbdoc = self.metadata.get("pcbdoc_path") if self.metadata else None
+        self._solve_settings.apply_to_modules()
+        self._start_solve_worker(
+            Path(prjpcb), self._solve_settings,
+            self._via_current_warn_a, self._display_percentile_high,
+            pcbdoc_selector=str(pcbdoc) if pcbdoc else None,
+            use_design_cache=True,
+            try_solve_cache_first=False,
+            editor_directives=list(self._project.editor_directives),
+            dialog_title="Resolving with editor changes",
+            dialog_text=(
+                "Re-solving with your editor changes…\n"
+                "Reusing the cached design info (no re-extraction)."
+            ),
+        )
+
     def _on_gl_clicked(self, _world_x: float, _world_y: float) -> None:
-        """Left-click in the viewport (no drag) → clear the Vias-tab
-        jump highlight if it's currently shown. No-op otherwise."""
+        """Left-click in the viewport (no drag). In editor mode this drives
+        component / copper selection and free-marker placement; in viewer
+        mode it just clears the Vias-tab jump highlight."""
+        if self._editor_mode:
+            self._on_editor_click(_world_x, _world_y)
+            return
         if self._highlight_via_xy is not None:
             self._highlight_via_xy = None
             self._render()
@@ -7476,9 +9699,11 @@ class PdnViewer(QMainWindow):
             if self._measure_anchor_xy is not None:
                 self._on_shift_released()
         elif et == QEvent.Resize and obj is getattr(self, "_gl_viewer", None):
-            # Keep the colour-scale overlay pinned bottom-left as the GL
-            # viewer resizes (window resize, sidebar collapse, etc.).
+            # Keep the colour-scale overlay pinned bottom-left and the
+            # editor-mode buttons pinned top-left as the GL viewer resizes
+            # (window resize, sidebar collapse, etc.).
             self._position_scale_overlay()
+            self._position_editor_overlays()
         return False
 
     def _position_scale_overlay(self) -> None:
@@ -9010,7 +11235,7 @@ class PdnViewer(QMainWindow):
         # Re-add in the original order. _vias_tab_index needs refreshing
         # because Vias is re-inserted after the others.
         self.tabs.addTab(self._build_setup_tab(), "Setup")
-        self.tabs.addTab(self._build_pins_tab(), "Nodes")
+        self.tabs.addTab(self._build_nodes_tab(), "Nodes")
         self._vias_tab_index = self.tabs.addTab(
             self._build_vias_tab(), "Vias",
         )
@@ -9531,13 +11756,37 @@ class PdnViewer(QMainWindow):
         )
         file_menu.addAction(open_proj_clean)
 
+        open_projfile = QAction("Open &Project File…", self)
+        open_projfile.setShortcut("Ctrl+Shift+P")
+        open_projfile.setStatusTip(
+            "Open a .fypa project file — its linked solution plus any "
+            "editor-mode changes."
+        )
+        open_projfile.triggered.connect(self._on_menu_open_project_file)
+        file_menu.addAction(open_projfile)
+
         file_menu.addSeparator()
 
+        save_proj = QAction("Save &Project", self)
+        save_proj.setShortcut("Ctrl+S")
+        save_proj.setStatusTip(
+            "Save the .fypa project file (editor changes, net renames, and "
+            "links to the design-info / solution pickles)."
+        )
+        save_proj.triggered.connect(self._on_ctrl_s)
+        file_menu.addAction(save_proj)
+
+        save_proj_as = QAction("Save Project &As…", self)
+        save_proj_as.setStatusTip(
+            "Save the project to a new .fypa file."
+        )
+        save_proj_as.triggered.connect(self._on_menu_save_project_as)
+        file_menu.addAction(save_proj_as)
+
         save_sol = QAction("&Save Solution…", self)
-        save_sol.setShortcut("Ctrl+S")
         save_sol.setStatusTip(
-            "Save the current solution to a .pkl file (remembers the .PrjPcb "
-            "directory and selected .PcbDoc so it can be re-solved later)."
+            "Save just the current solution to a .pkl file (remembers the "
+            ".PrjPcb directory and selected .PcbDoc so it can be re-solved)."
         )
         save_sol.triggered.connect(self._on_menu_save_solution)
         file_menu.addAction(save_sol)
@@ -9679,6 +11928,205 @@ class PdnViewer(QMainWindow):
             label.setText(
                 f"<span style='color:{_T()['ok']};'>Saved solution to "
                 f"{_esc(path_str)}</span>"
+            )
+
+    # --- Project file save / open -------------------------------------------
+
+    def _project_pickle_paths(self) -> tuple[str | None, str | None]:
+        """Best-effort ``(design_info_pkl, solve_pkl)`` cache paths for the
+        loaded project. The design-info path is returned only if the file
+        actually exists; the solve path is the standard cache location."""
+        prjpcb = self.metadata.get("prjpcb_path") if self.metadata else None
+        pcbdoc = self.metadata.get("pcbdoc_path") if self.metadata else None
+        if not prjpcb:
+            return None, None
+        try:
+            from fypa.cli import _design_info_cache_path, _solve_cache_path
+            di = _design_info_cache_path(
+                Path(prjpcb), Path(pcbdoc) if pcbdoc else None)
+            sv = _solve_cache_path(
+                Path(prjpcb), Path(pcbdoc) if pcbdoc else None)
+            return (str(di) if di.exists() else None, str(sv))
+        except Exception:
+            return None, None
+
+    def _prompt_project_path(self) -> Path | None:
+        """Ask the user where to write the ``.fypa`` project file."""
+        start = self._menu_start_dir()
+        name = "project.fypa"
+        if self.metadata and self.metadata.get("prjpcb_path"):
+            name = Path(self.metadata["prjpcb_path"]).stem + ".fypa"
+        default = str(Path(start) / name) if start else name
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Save project as", default,
+            "FYPA project (*.fypa);;All files (*)",
+        )
+        if not path_str:
+            return None
+        if not path_str.lower().endswith(".fypa"):
+            path_str += ".fypa"
+        return Path(path_str)
+
+    def _store_viewer_settings(self, proj) -> None:
+        """Fold persistable viewer state into ``proj.viewer_settings`` so the
+        next :meth:`fypa.project_file.ProjectFile.save` writes it. Currently
+        just the Board Features overlay colours — stored in full so a
+        reopened project shows exactly the colours the user left, even if a
+        built-in default changes in a later build."""
+        colors = getattr(self, "_overlay_colors", None)
+        if colors:
+            proj.viewer_settings["overlay_colors"] = {
+                key: [round(float(c), 6) for c in rgb]
+                for key, rgb in colors.items()
+            }
+
+    def _save_project(self, path: Path | None = None) -> bool:
+        """Write the ``.fypa`` project file. Falls back to a Save-As prompt
+        when no path is known yet. Returns True on success."""
+        proj = self._ensure_project()
+        if path is None:
+            path = self._project_path
+        if path is None:
+            path = self._prompt_project_path()
+            if path is None:
+                return False
+        path = Path(path)
+        di, _sv = self._project_pickle_paths()
+        if di and not proj.design_info_pickle:
+            proj.design_info_pickle = di
+        if self.metadata:
+            proj.prjpcb_path = (proj.prjpcb_path
+                                or self.metadata.get("prjpcb_path"))
+            proj.pcbdoc_path = (proj.pcbdoc_path
+                                or self.metadata.get("pcbdoc_path"))
+        self._store_viewer_settings(proj)
+        try:
+            proj.save(path)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't save project",
+                f"Failed to write {path}:\n\n{type(e).__name__}: {e}",
+            )
+            return False
+        self._project_path = path
+        self._project_dirty = False
+        self.statusBar().showMessage(f"Saved project to {path}", 5000)
+        return True
+
+    def _save_project_and_solution(self) -> bool:
+        """Write the ``.fypa`` plus the current solution. The solution goes
+        to a pickle beside the ``.fypa`` (not the shared design cache, whose
+        solve.pkl must stay the un-edited on-disk-project solve)."""
+        path = self._project_path or self._prompt_project_path()
+        if path is None:
+            return False
+        path = Path(path)
+        solve_path = path.with_name(path.stem + "_solve.pkl")
+        try:
+            from fypa.cli import save_solution_file
+            save_solution_file(solve_path, self.solution, self.metadata)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't save solution",
+                f"Failed to write {solve_path}:\n\n{type(e).__name__}: {e}",
+            )
+            return False
+        self._ensure_project().solve_pickle = str(solve_path)
+        if not self._save_project(path):
+            return False
+        self._solved_since_save = False
+        self.statusBar().showMessage(
+            f"Saved project + solution to {path}", 5000)
+        return True
+
+    def _on_ctrl_s(self) -> None:
+        """Ctrl+S → the save popup. ``S`` saves the project only; ``A``
+        also writes the latest solver run (when there is an unsaved one)."""
+        dlg = _ProjectSaveDialog(self, allow_all=self._solved_since_save)
+        if dlg.exec() != QDialog.Accepted or dlg.choice is None:
+            return
+        if dlg.choice == "all" and self._solved_since_save:
+            self._save_project_and_solution()
+        else:
+            self._save_project()
+
+    def _on_menu_save_project_as(self) -> None:
+        """File > Save Project As… → pick a new ``.fypa`` path and save."""
+        path = self._prompt_project_path()
+        if path is not None:
+            self._save_project(path)
+
+    def _on_menu_open_project_file(self) -> None:
+        """File > Open Project File… → load a ``.fypa`` and open a viewer
+        bound to it (its linked solution + editor directives)."""
+        from fypa.project_file import ProjectFile
+        start = self._menu_start_dir()
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open project file", start,
+            "FYPA project (*.fypa);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            proj = ProjectFile.load(Path(path_str))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open project",
+                f"Failed to load {path_str}:\n\n{type(e).__name__}: {e}",
+            )
+            return
+        # Resolve the solution pickle: the project's own, else the design
+        # cache's solve.pkl for the linked project.
+        sol_path = proj.solve_pickle
+        if not sol_path or not Path(sol_path).exists():
+            sol_path = None
+            if proj.prjpcb_path:
+                try:
+                    from fypa.cli import _solve_cache_path
+                    cand = _solve_cache_path(
+                        Path(proj.prjpcb_path),
+                        Path(proj.pcbdoc_path) if proj.pcbdoc_path else None,
+                    )
+                    if cand.exists():
+                        sol_path = str(cand)
+                except Exception:
+                    sol_path = None
+        if not sol_path:
+            QMessageBox.critical(
+                self, "Couldn't open project",
+                "The project file doesn't point to a readable solution "
+                "pickle, and no cached solve was found.",
+            )
+            return
+        try:
+            from fypa.cli import _load_solution_pickle
+            solution, metadata = _load_solution_pickle(Path(sol_path))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open project",
+                f"Failed to load the linked solution {sol_path}:\n\n"
+                f"{type(e).__name__}: {e}",
+            )
+            return
+        try:
+            new_win = PdnViewer(
+                solution, metadata=metadata,
+                project=proj, project_path=Path(path_str),
+            )
+            # Editor directives present but possibly not reflected by the
+            # loaded solve — offer the resolve button so the user can bring
+            # the heatmap up to date.
+            if proj.editor_directives:
+                new_win._set_solve_stale(True)
+            _register_viewer(new_win)
+            new_win.show()
+            _force_native_window_icon(new_win)
+            _set_window_aumid(new_win)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open viewer",
+                f"Project loaded but the viewer failed to open:\n\n"
+                f"{type(e).__name__}: {e}",
             )
 
     def _on_menu_open_solution(self) -> None:
@@ -9862,6 +12310,7 @@ class PdnViewer(QMainWindow):
         pcbdoc_selector: str | None = None,
         use_design_cache: bool = True,
         try_solve_cache_first: bool = False,
+        editor_directives: list | None = None,
         dialog_title: str = "Running solver",
         dialog_text: str | None = None,
     ) -> None:
@@ -9903,6 +12352,7 @@ class PdnViewer(QMainWindow):
             pcbdoc_selector=pcbdoc_selector,
             use_design_cache=use_design_cache,
             try_solve_cache_first=try_solve_cache_first,
+            editor_directives=editor_directives,
             parent=self,
         )
         self._solve_worker = worker
@@ -9912,11 +12362,20 @@ class PdnViewer(QMainWindow):
         # see the opaque "Meshing + solving" step is still progressing.
         self._solve_progress_updater = _SolveProgressUpdater(dlg, worker, self)
 
-        worker.finished_ok.connect(
-            lambda sol, meta: self._on_solve_finished(
-                sol, meta, warn_a, pct, settings,
+        # A resolve (editor directives present) opens the fresh viewer
+        # bound to the same project file so the editor state carries over.
+        if editor_directives:
+            worker.finished_ok.connect(
+                lambda sol, meta: self._on_resolve_finished(
+                    sol, meta, warn_a, pct, settings,
+                )
             )
-        )
+        else:
+            worker.finished_ok.connect(
+                lambda sol, meta: self._on_solve_finished(
+                    sol, meta, warn_a, pct, settings,
+                )
+            )
         worker.failed.connect(self._on_solve_failed)
         worker.finished.connect(self._cleanup_solve_worker)
         worker.start()
@@ -10054,6 +12513,53 @@ class PdnViewer(QMainWindow):
         # leaking a full solution into RAM on every reload.
         QTimer.singleShot(0, lambda: _retire_viewer(self))
 
+    def _on_resolve_finished(
+        self, new_solution, metadata: dict,
+        warn_a: float, pct: float, new_settings,
+    ) -> None:
+        """Resolve worker finished — open a fresh viewer bound to the same
+        project file so the editor directives + project path carry over.
+        The freshly-solved editor rails are now normal viewable rails."""
+        log = logging.getLogger(__name__)
+        prev_geometry = self.geometry()
+        prev_maximized = self.isMaximized()
+        prev_fullscreen = self.isFullScreen()
+        try:
+            new_win = PdnViewer(
+                new_solution,
+                metadata=metadata,
+                initial_settings=new_settings,
+                via_current_warn_a=warn_a,
+                display_percentile_high=pct,
+                project=self._project,
+                project_path=self._project_path,
+            )
+            _register_viewer(new_win)
+            new_win.setGeometry(prev_geometry)
+            if prev_fullscreen:
+                new_win.showFullScreen()
+            elif prev_maximized:
+                new_win.showMaximized()
+            else:
+                new_win._pending_maximize = False
+                new_win.show()
+            # The resolve produced a solution not yet written to any
+            # pickle — enable the Ctrl+S "save project + solver run" path.
+            new_win._solved_since_save = True
+            _force_native_window_icon(new_win)
+            _set_window_aumid(new_win)
+            heatmap_idx = getattr(new_win, "_heatmap_tab_index", 0)
+            new_win.tabs.setCurrentIndex(heatmap_idx)
+        except Exception as e:
+            log.exception("Failed to open viewer after resolve")
+            QMessageBox.critical(
+                self, "Couldn't open viewer",
+                f"Re-solve succeeded but the viewer failed to open:\n\n"
+                f"{type(e).__name__}: {e}",
+            )
+            return
+        QTimer.singleShot(0, lambda: _retire_viewer(self))
+
 
     # --- Setup tab ----------------------------------------------------------
 
@@ -10129,13 +12635,13 @@ class PdnViewer(QMainWindow):
         self._refresh_setup_html()
 
 
-    # --- Pins tab ------------------------------------------------------------
+    # --- Nodes tab ------------------------------------------------------------
 
-    # Columns of the Pins-tab table. (display label, numeric? — used for
+    # Columns of the Nodes-tab table. (display label, numeric? — used for
     # tab-stop alignment and sort key.)
     # Column 0 is the per-row "Go" jump cell (a clickable text cell, same
     # as the Vias tab); the rest are normal text/numeric cells.
-    _PINS_TABLE_COLUMNS: tuple[tuple[str, bool], ...] = (
+    _NODES_TABLE_COLUMNS: tuple[tuple[str, bool], ...] = (
         ("",           False),
         ("Role",       False),
         ("Designator", False),
@@ -10150,10 +12656,10 @@ class PdnViewer(QMainWindow):
         ("Power (W/mm^2)",     True),
     )
 
-    def _build_pins_tab(self) -> QWidget:
-        """Build the Pins tab — a sortable table of every directive pin
+    def _build_nodes_tab(self) -> QWidget:
+        """Build the Nodes tab — a sortable table of every directive node
         and its computed metrics. The filter combo lets users narrow down
-        to a single role (e.g. just SINKs) when there are hundreds of pins."""
+        to a single role (e.g. just SINKs) when there are hundreds of nodes."""
         widget = QWidget(self.tabs)
         outer = QVBoxLayout(widget)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -10162,53 +12668,53 @@ class PdnViewer(QMainWindow):
         # satisfy BOTH selections to be visible.
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Role:"))
-        self.pins_filter_combo = QComboBox()
-        self.pins_filter_combo.addItem("All roles")
+        self.nodes_filter_combo = QComboBox()
+        self.nodes_filter_combo.addItem("All roles")
         for role in ("SOURCE", "SINK", "RESISTOR", "REGULATOR"):
-            self.pins_filter_combo.addItem(role)
-        self.pins_filter_combo.currentTextChanged.connect(self._apply_pins_filter)
-        filter_row.addWidget(self.pins_filter_combo)
+            self.nodes_filter_combo.addItem(role)
+        self.nodes_filter_combo.currentTextChanged.connect(self._apply_nodes_filter)
+        filter_row.addWidget(self.nodes_filter_combo)
 
         filter_row.addSpacing(12)
         filter_row.addWidget(QLabel("Rail:"))
-        self.pins_rail_combo = QComboBox()
-        self.pins_rail_combo.addItem("All rails")
+        self.nodes_rail_combo = QComboBox()
+        self.nodes_rail_combo.addItem("All rails")
         for r in self._rails:
-            self.pins_rail_combo.addItem(r)
-        self.pins_rail_combo.setToolTip(
-            "Filter rows to pins on the selected rail group (a primary net "
+            self.nodes_rail_combo.addItem(r)
+        self.nodes_rail_combo.setToolTip(
+            "Filter rows to nodes on the selected rail group (a primary net "
             "plus any nets bridged to it via a SERIES directive)."
         )
-        self.pins_rail_combo.currentTextChanged.connect(self._apply_pins_filter)
-        filter_row.addWidget(self.pins_rail_combo)
+        self.nodes_rail_combo.currentTextChanged.connect(self._apply_nodes_filter)
+        filter_row.addWidget(self.nodes_rail_combo)
 
         filter_row.addStretch(1)
-        self.pins_summary_label = QLabel("")
-        self.pins_summary_label.setStyleSheet(
+        self.nodes_summary_label = QLabel("")
+        self.nodes_summary_label.setStyleSheet(
             f"QLabel {{ color: {_T()['fg_muted']}; }}"
         )
-        filter_row.addWidget(self.pins_summary_label)
+        filter_row.addWidget(self.nodes_summary_label)
         outer.addLayout(filter_row)
 
         # Table.
-        self.pins_table = QTableWidget()
-        cols = self._PINS_TABLE_COLUMNS
-        self.pins_table.setColumnCount(len(cols))
-        self.pins_table.setHorizontalHeaderLabels([c[0] for c in cols])
-        self.pins_table.setSortingEnabled(True)
-        self.pins_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.pins_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.pins_table.setAlternatingRowColors(True)
-        self.pins_table.verticalHeader().setVisible(False)
-        self.pins_table.horizontalHeader().setStretchLastSection(True)
+        self.nodes_table = QTableWidget()
+        cols = self._NODES_TABLE_COLUMNS
+        self.nodes_table.setColumnCount(len(cols))
+        self.nodes_table.setHorizontalHeaderLabels([c[0] for c in cols])
+        self.nodes_table.setSortingEnabled(True)
+        self.nodes_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.nodes_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.nodes_table.setAlternatingRowColors(True)
+        self.nodes_table.verticalHeader().setVisible(False)
+        self.nodes_table.horizontalHeader().setStretchLastSection(True)
         # Interactive (user-draggable). See _build_vias_tab for why
         # ResizeToContents during populate is a perf disaster — the same
         # one-shot ``resizeColumnsToContents`` after populate applies here.
-        self.pins_table.horizontalHeader().setSectionResizeMode(
+        self.nodes_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Interactive)
         # Theme-driven styling to match the rest of the viewer.
         _t = _T()
-        self.pins_table.setStyleSheet(
+        self.nodes_table.setStyleSheet(
             f"QTableWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
             f"               gridline-color: {_t['gridline']};"
             f"               alternate-background-color: {_t['bg_alt']}; }}"
@@ -10216,8 +12722,8 @@ class PdnViewer(QMainWindow):
             f"                       padding: 4px; border: 1px solid {_t['border']}; }}"
             f"QTableWidget::item:selected {{ background-color: {_t['bg_selection']}; }}"
         )
-        outer.addWidget(self.pins_table, 1)
-        # Deliberately NOT calling _populate_pins_table() here — the row build
+        outer.addWidget(self.nodes_table, 1)
+        # Deliberately NOT calling _populate_nodes_table() here — the row build
         # is deferred to first tab activation (see __init__ + _on_tabs_current_changed).
         return widget
 
@@ -10227,12 +12733,12 @@ class PdnViewer(QMainWindow):
         ~35 s of blocked GUI thread; doing it on initial viewer open was
         the freeze users were seeing under the "saving cache" label.
         Done once per tab — the populated flags guard against re-runs."""
-        if (index == getattr(self, "_pins_tab_index", -1)
-                and not getattr(self, "_pins_table_populated", True)):
-            self._pins_table_populated = True
+        if (index == getattr(self, "_nodes_tab_index", -1)
+                and not getattr(self, "_nodes_table_populated", True)):
+            self._nodes_table_populated = True
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                self._populate_pins_table()
+                self._populate_nodes_table()
             finally:
                 QApplication.restoreOverrideCursor()
         elif (index == getattr(self, "_vias_tab_index", -1)
@@ -10244,28 +12750,28 @@ class PdnViewer(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
 
-    def _populate_pins_table(self) -> None:
-        """Fill the Pins table from the cached pin report."""
+    def _populate_nodes_table(self) -> None:
+        """Fill the Nodes table from the cached node report."""
         log = logging.getLogger(__name__)
         _t0 = time.monotonic()
-        rows = self._compute_pin_report()
-        log.info("Pins populate: _compute_pin_report %.2fs (%d rows)",
+        rows = self._compute_node_report()
+        log.info("Nodes populate: _compute_node_report %.2fs (%d rows)",
                  time.monotonic() - _t0, len(rows))
         _t1 = time.monotonic()
         # Sidecar in original row order so the cellClicked handler can
-        # find the pin dict even after the user sorts the table.
-        self._pins_rows = rows
-        cols = self._PINS_TABLE_COLUMNS
+        # find the node dict even after the user sorts the table.
+        self._nodes_rows = rows
+        cols = self._NODES_TABLE_COLUMNS
         # Action-column styling, fetched once. Mirrors the Vias tab.
         action_fg = QBrush(QColor(_T()["accent"]))
 
         # Column 0 is the action ("Go") cell; everything else is data in
-        # columns 1..N. Stays aligned with _PINS_TABLE_COLUMNS and the
-        # ROLE_COL / NET_COL constants in _apply_pins_filter.
+        # columns 1..N. Stays aligned with _NODES_TABLE_COLUMNS and the
+        # ROLE_COL / NET_COL constants in _apply_nodes_filter.
         ACTION_COL = 0
 
-        self.pins_table.setSortingEnabled(False)  # disable while loading
-        self.pins_table.setRowCount(len(rows))
+        self.nodes_table.setSortingEnabled(False)  # disable while loading
+        self.nodes_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             # Clickable action cell. The original row index is stashed on
             # UserRole so the cellClicked handler can recover the row dict
@@ -10280,7 +12786,7 @@ class PdnViewer(QMainWindow):
                 "in, enables the node's layer if needed, and drops a "
                 "yellow highlight ring."
             )
-            self.pins_table.setItem(r, ACTION_COL, action_item)
+            self.nodes_table.setItem(r, ACTION_COL, action_item)
 
             cells = (
                 None,  # action column placeholder; we skip it below
@@ -10312,46 +12818,46 @@ class PdnViewer(QMainWindow):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 else:
                     item = QTableWidgetItem(str(value))
-                self.pins_table.setItem(r, c, item)
-        log.info("Pins populate: items %.2fs", time.monotonic() - _t1)
+                self.nodes_table.setItem(r, c, item)
+        log.info("Nodes populate: items %.2fs", time.monotonic() - _t1)
         _t2 = time.monotonic()
-        self.pins_table.setSortingEnabled(True)
+        self.nodes_table.setSortingEnabled(True)
         # Default sort: Role ascending (column 1 — column 0 is the "Go"
         # action cell).
-        self.pins_table.sortByColumn(1, Qt.AscendingOrder)
-        log.info("Pins populate: sort %.2fs", time.monotonic() - _t2)
+        self.nodes_table.sortByColumn(1, Qt.AscendingOrder)
+        log.info("Nodes populate: sort %.2fs", time.monotonic() - _t2)
         _t3 = time.monotonic()
-        self.pins_table.resizeColumnsToContents()
-        log.info("Pins populate: resizeColumnsToContents %.2fs",
+        self.nodes_table.resizeColumnsToContents()
+        log.info("Nodes populate: resizeColumnsToContents %.2fs",
                  time.monotonic() - _t3)
         # Wire the table-level click dispatcher once. See the matching
         # guard in _populate_vias_table for why disconnect() isn't used.
-        if not getattr(self, "_pins_click_handler_wired", False):
-            self.pins_table.cellClicked.connect(self._on_pins_cell_clicked)
-            self._pins_click_handler_wired = True
-        self._apply_pins_filter()  # respect current filter
-        log.info("Pins populate: TOTAL %.2fs", time.monotonic() - _t0)
+        if not getattr(self, "_nodes_click_handler_wired", False):
+            self.nodes_table.cellClicked.connect(self._on_nodes_cell_clicked)
+            self._nodes_click_handler_wired = True
+        self._apply_nodes_filter()  # respect current filter
+        log.info("Nodes populate: TOTAL %.2fs", time.monotonic() - _t0)
 
-    def _on_pins_cell_clicked(self, row: int, col: int) -> None:
+    def _on_nodes_cell_clicked(self, row: int, col: int) -> None:
         """Single-click on the action column (col 0) → jump to that node
         in the Heatmap tab. Mirrors :meth:`_on_vias_cell_clicked`."""
         if col != 0:
             return
-        item = self.pins_table.item(row, 0)
+        item = self.nodes_table.item(row, 0)
         if item is None:
             return
         orig_idx = item.data(Qt.UserRole)
         if (isinstance(orig_idx, int)
-                and 0 <= orig_idx < len(getattr(self, "_pins_rows", []))):
-            self._jump_to_node(self._pins_rows[orig_idx])
+                and 0 <= orig_idx < len(getattr(self, "_nodes_rows", []))):
+            self._jump_to_node(self._nodes_rows[orig_idx])
 
-    def _apply_pins_filter(self, *_args) -> None:
+    def _apply_nodes_filter(self, *_args) -> None:
         """Hide rows that fail either the Role filter or the Rail filter.
         Both must pass for a row to remain visible."""
-        role_choice = (self.pins_filter_combo.currentText()
-                       if hasattr(self, "pins_filter_combo") else "All roles")
-        rail_choice = (self.pins_rail_combo.currentText()
-                       if hasattr(self, "pins_rail_combo") else "All rails")
+        role_choice = (self.nodes_filter_combo.currentText()
+                       if hasattr(self, "nodes_filter_combo") else "All roles")
+        rail_choice = (self.nodes_rail_combo.currentText()
+                       if hasattr(self, "nodes_rail_combo") else "All rails")
         # Resolve the rail choice into the set of member net names. "All
         # rails" → no filtering; an explicit rail → the rail group's nets.
         if rail_choice == "All rails":
@@ -10359,26 +12865,26 @@ class PdnViewer(QMainWindow):
         else:
             allowed_nets = set(self._rail_to_members.get(rail_choice, [rail_choice]))
 
-        # Column indexes (must stay aligned with _PINS_TABLE_COLUMNS).
+        # Column indexes (must stay aligned with _NODES_TABLE_COLUMNS).
         # Column 0 is the "Go" action cell, so Role + Net shift up by one.
         ROLE_COL, NET_COL = 1, 4
 
         visible = 0
-        for r in range(self.pins_table.rowCount()):
-            role = self.pins_table.item(r, ROLE_COL).text() if self.pins_table.item(r, ROLE_COL) else ""
-            net = self.pins_table.item(r, NET_COL).text() if self.pins_table.item(r, NET_COL) else ""
+        for r in range(self.nodes_table.rowCount()):
+            role = self.nodes_table.item(r, ROLE_COL).text() if self.nodes_table.item(r, ROLE_COL) else ""
+            net = self.nodes_table.item(r, NET_COL).text() if self.nodes_table.item(r, NET_COL) else ""
             role_ok = role_choice == "All roles" or role == role_choice
             rail_ok = allowed_nets is None or net in allowed_nets
             hide = not (role_ok and rail_ok)
-            self.pins_table.setRowHidden(r, hide)
+            self.nodes_table.setRowHidden(r, hide)
             if not hide:
                 visible += 1
-        self.pins_summary_label.setText(
-            f"{visible} pin(s) shown out of {self.pins_table.rowCount()} total"
+        self.nodes_summary_label.setText(
+            f"{visible} node(s) shown out of {self.nodes_table.rowCount()} total"
         )
 
-    def _compute_pin_report(self) -> list[dict]:
-        """Build one row per directive-terminal pin with V / drop / |J| / P.
+    def _compute_node_report(self) -> list[dict]:
+        """Build one row per directive-terminal node with V / drop / |J| / P.
 
         Voltage and power-density are sampled from the per-
         (physical_layer, net) padne Layer's mesh using a
@@ -10471,7 +12977,7 @@ class PdnViewer(QMainWindow):
             role = d.get("role", "")
             desig = d.get("designator", "?")
             # ``label`` disambiguates multi-channel SOURCE/SINK pins
-            # ("U5" vs "U5#1") in the Pins-tab table.
+            # ("U5" vs "U5#1") in the Nodes-tab table.
             display_desig = str(d.get("label") or desig)
             schdoc = d.get("schdoc", "")
             for term_name, term in (d.get("terminals") or {}).items():
@@ -10649,7 +13155,7 @@ class PdnViewer(QMainWindow):
         # ``resizeColumnsToContents``.
         self.vias_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Interactive)
-        # Theme-driven styling — matches the Pins table.
+        # Theme-driven styling — matches the Nodes table.
         _t = _T()
         self.vias_table.setStyleSheet(
             f"QTableWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
@@ -11228,8 +13734,6 @@ _HELP_TAB_BODY = """
   <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>3</kbd></td><td>Switch to 3D <i>keeping the current view</i> (top-down entry)</td></tr>
   <tr><td><kbd>0</kbd></td><td>Reset the 3D view (top-down, refit to data) <span class='muted'>— 3D mode only</span></td></tr>
   <tr><td><kbd>O</kbd></td><td>Toggle <i>Show layer outlines</i></td></tr>
-  <tr><td><kbd>P</kbd></td><td>Toggle <i>Show pads</i></td></tr>
-  <tr><td><kbd>C</kbd></td><td>Toggle <i>Show all copper</i></td></tr>
   <tr><td><kbd>I</kbd></td><td>Toggle <i>Show pin markers</i></td></tr>
   <tr><td><kbd>R</kbd></td><td>Toggle <i>Show only rail net</i></td></tr>
   <tr><td><kbd>T</kbd></td><td>Toggle <i>Show cursor tooltip</i></td></tr>
@@ -11288,16 +13792,10 @@ when one of those has focus.</p>
     you see just each selected rail's primary net.</li>
   <li><b>Show pin markers</b> &mdash; SOURCE / SINK / SERIES /
     REGULATOR / VIA overlays.</li>
-  <li><b>Show layer outlines</b> &mdash; trace each copper polygon's
-    border in the layer's swatch colour.</li>
-  <li><b>Show pads</b> &mdash; trace each SMT / through-hole pad on
-    the visible copper layers with a thin black outline. SMT pads
-    appear only on their assigned layer; through-hole pads appear on
-    every enabled copper layer.</li>
-  <li><b>Show all copper</b> &mdash; trace every copper polygon on a
-    visible layer that does NOT belong to any currently selected rail,
-    in that layer's swatch colour. Helps spot where other rails and
-    signal nets sit on the same board.</li>
+  <li><b>Layer outlines</b> &mdash; the contour button on the
+    <i>All Layers</i> row (left of the wire-mesh / solid toggle, hotkey
+    <kbd>O</kbd>) traces each copper polygon's border in the layer's
+    swatch colour.</li>
   <li><b>Show cursor tooltip</b> &mdash; a small tooltip follows the
     mouse, showing the value of the current mode at that point along
     with the net and layer. Same info as the probe bar under the plot.</li>
@@ -11329,7 +13827,7 @@ when one of those has focus.</p>
   <li><b>Setup</b> &mdash; HTML report of the solved problem: stackup,
     physics constants, parsed PDN_* directives (collapsible), solver
     diagnostics, warnings / errors.</li>
-  <li><b>Nodes</b> &mdash; sortable table of every directive pin with
+  <li><b>Nodes</b> &mdash; sortable table of every directive node with
     its voltage, drop, current density, and power density. Filter by
     role or rail. The <b>Go &#9654;</b> button jumps to that node in
     the Heatmap tab (enables its layer, zooms in, drops a yellow

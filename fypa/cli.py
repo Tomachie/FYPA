@@ -354,6 +354,11 @@ def _load_solution_pickle(path, *, lean_ify: bool = True
     """
     with open(path, "rb") as f:
         obj = pickle.load(f)
+        # Split-format caches (large boards) start with a marker string and
+        # stream the rest; dispatch to the chunked reader on that marker so
+        # this function can open both auto-cache and Save-Solution pickles.
+        if isinstance(obj, str) and obj == _SPLIT_CACHE_MARKER:
+            obj = _load_split_solve_cache(f)
     if isinstance(obj, dict) and "solution" in obj:
         sol = obj["solution"]
         meta = obj.get("metadata")

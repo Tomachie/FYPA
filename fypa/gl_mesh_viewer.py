@@ -78,23 +78,28 @@ _VERTEX_SHADER_SRC = """
 #version 330 core
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in float a_value;
+layout(location = 2) in float a_alpha;
 uniform mat4 u_mvp;
 uniform vec2 u_levels;
 out float v_norm;
+out float v_alpha;
 void main() {
     gl_Position = u_mvp * vec4(a_position, 1.0);
     float span = max(u_levels.y - u_levels.x, 1e-30);
     v_norm = clamp((a_value - u_levels.x) / span, 0.0, 1.0);
+    v_alpha = a_alpha;
 }
 """
 
 _FRAGMENT_SHADER_SRC = """
 #version 330 core
 in float v_norm;
+in float v_alpha;
 uniform sampler1D u_cmap;
 out vec4 frag_color;
 void main() {
-    frag_color = texture(u_cmap, v_norm);
+    vec4 c = texture(u_cmap, v_norm);
+    frag_color = vec4(c.rgb, c.a * v_alpha);
 }
 """
 
@@ -121,6 +126,12 @@ void main() {
     frag_color = vec4(v_color, 1.0);
 }
 """
+
+
+# Viewport background (clear) colour when editor mode is active — a light
+# bluish tone so it's unmistakable which mode the user is in. Coder-tunable:
+# any "#rrggbb" hex string. Viewer mode keeps the dark substrate below.
+_EDITOR_BG_HEX = "#272735"
 
 
 @dataclass
@@ -195,6 +206,10 @@ class GLMeshViewer(QOpenGLWidget):
         self._vao: QOpenGLVertexArrayObject | None = None
         self._pos_vbo: QOpenGLBuffer | None = None
         self._val_vbo: QOpenGLBuffer | None = None
+        # Per-vertex alpha (editor-mode copper dimming). Optional — when no
+        # alpha array is uploaded, attribute 2 is fed a constant 1.0 so the
+        # mesh draws fully opaque exactly as before.
+        self._alpha_vbo: QOpenGLBuffer | None = None
         self._ibo: QOpenGLBuffer | None = None
         self._cmap_tex: QOpenGLTexture | None = None
         self._u_mvp_loc: int = -1
@@ -238,6 +253,14 @@ class GLMeshViewer(QOpenGLWidget):
         self._bdrl_vao: QOpenGLVertexArrayObject | None = None
         self._bdrl_pos_vbo: QOpenGLBuffer | None = None
         self._bdrl_col_vbo: QOpenGLBuffer | None = None
+        # Overlay-fill rendering (GL_TRIANGLES). Shares the line shader.
+        # Flat-coloured polygons for the Heatmap tab's Overlays control
+        # when an overlay is set to solid (rather than wire-mesh) fill —
+        # filled pads, vias and component bodies. Drawn on top of the
+        # heatmap mesh in both 2D and 3D modes.
+        self._ovl_vao: QOpenGLVertexArrayObject | None = None
+        self._ovl_pos_vbo: QOpenGLBuffer | None = None
+        self._ovl_col_vbo: QOpenGLBuffer | None = None
         self._gl_initialized: bool = False
 
         # --- CPU-side cached mesh data (re-uploaded when changed) ---
@@ -247,6 +270,11 @@ class GLMeshViewer(QOpenGLWidget):
         self._pending_indices: np.ndarray | None = None
         self._pending_values: np.ndarray | None = None
         self._pending_cmap: np.ndarray | None = None
+        # Per-vertex alpha batch — None means "draw fully opaque". When set,
+        # its length matches the vertex count and _draw_mesh enables
+        # blending so dimmed copper (alpha < 1) shows the background through.
+        self._pending_alpha: np.ndarray | None = None
+        self._n_alpha: int = 0
         # Outline (line) batch — packed (N, 2) positions + (N, 3) colours
         # where vertices come in pairs (GL_LINES). N == 2 * num_segments.
         self._n_line_vertices: int = 0
@@ -282,6 +310,11 @@ class GLMeshViewer(QOpenGLWidget):
         self._n_bdrl_vertices: int = 0
         self._pending_bdrl_positions: np.ndarray | None = None
         self._pending_bdrl_colors: np.ndarray | None = None
+        # Overlay-fill batch (GL_TRIANGLES). Vertex triples; flat-coloured
+        # solid-fill polygons for the Overlays control.
+        self._n_ovl_vertices: int = 0
+        self._pending_ovl_positions: np.ndarray | None = None
+        self._pending_ovl_colors: np.ndarray | None = None
 
         # Wireframe overlay over the main heatmap mesh. Off by default;
         # toggled by :meth:`set_show_mesh_edges`. When on, paintGL redraws
@@ -355,6 +388,11 @@ class GLMeshViewer(QOpenGLWidget):
         self._overlay_top_left_html: str = ""
         self._overlay_top_right_html: str = ""
         self._markers: list[MarkerGroup] = []
+        # Overlay text labels (reference designators for the Overlays
+        # control). Each entry: ``{"x", "y", "z", "text", "color",
+        # "height_mm", "rotation_deg"}``. Drawn by the QPainter overlay
+        # pass, projected through :meth:`world_to_screen`.
+        self._overlay_labels: list[dict] = []
         # Measurement-line endpoints in world mm: (x0, y0, x1, y1) or
         # ``None`` when no measurement is active. Drawn by the QPainter
         # overlay pass as a thin white line on top of everything else.
@@ -364,6 +402,16 @@ class GLMeshViewer(QOpenGLWidget):
         self._bg_r = 0x1f / 255.0
         self._bg_g = 0x1f / 255.0
         self._bg_b = 0x1f / 255.0
+
+        # --- Editor mode ---
+        # Viewer mode (default) uses the dark substrate above; editor mode
+        # swaps in a bluish background + a faint world-mm grid so it is
+        # unmistakable which mode the user is in. ``paintGL`` picks the
+        # clear colour each frame from ``_editor_mode``.
+        self._editor_mode: bool = False
+        self._bg_normal = (self._bg_r, self._bg_g, self._bg_b)
+        # Editor-mode clear colour, from the coder-tunable _EDITOR_BG_HEX.
+        self._bg_editor = QColor(_EDITOR_BG_HEX).getRgbF()[:3]
 
         # --- 3D camera animation state ---
         # Used by :meth:`reset_3d_view` to interpolate yaw / pitch /
@@ -403,6 +451,10 @@ class GLMeshViewer(QOpenGLWidget):
         self._pending_indices = indices
         self._n_vertices = positions.shape[0]
         self._n_indices = indices.size
+        # A new mesh invalidates any per-vertex alpha (vertex count and
+        # ordering changed); the host re-pushes it via set_vertex_alpha.
+        self._pending_alpha = None
+        self._n_alpha = 0
         if data_bounds is not None:
             self._data_bounds = (float(data_bounds[0]), float(data_bounds[1]),
                                   float(data_bounds[2]), float(data_bounds[3]))
@@ -506,6 +558,25 @@ class GLMeshViewer(QOpenGLWidget):
         if vmax <= vmin:
             vmax = vmin + 1e-12
         self._levels = (float(vmin), float(vmax))
+        self.update()
+
+    def set_vertex_alpha(self, alphas: np.ndarray | None) -> None:
+        """Set (or clear) the per-vertex alpha used to dim copper in editor
+        mode. ``alphas`` must match the vertex count from the most recent
+        :meth:`set_mesh`; pass ``None`` to go back to fully-opaque drawing."""
+        if alphas is None:
+            self._pending_alpha = None
+            self._n_alpha = 0
+            self.update()
+            return
+        arr = np.asarray(alphas, dtype=np.float32)
+        if arr.size != self._n_vertices:
+            raise ValueError(
+                f"set_vertex_alpha length {arr.size} doesn't match vertex "
+                f"count {self._n_vertices}"
+            )
+        self._pending_alpha = arr
+        self._n_alpha = arr.size
         self.update()
 
     def set_colormap(self, lut_rgba_256: np.ndarray) -> None:
@@ -667,6 +738,49 @@ class GLMeshViewer(QOpenGLWidget):
         self._n_stub_vertices = 0
         self._pending_stub_positions = None
         self._pending_stub_colors = None
+        self.update()
+
+    def set_overlay_fills(self, positions: np.ndarray,
+                          colors: np.ndarray) -> None:
+        """Push a batch of solid-fill overlay triangles to the GPU.
+
+        Used by the Heatmap tab's Overlays control for overlays set to
+        solid (rather than wire-mesh) fill — filled pads, vias and
+        component bodies. ``positions`` is an (N, 3) float array of vertex
+        triples (consecutive triples form one triangle), so N must be a
+        multiple of 3. ``colors`` is an (N, 3) RGB array in [0..1] of
+        matching length. Drawn on top of the heatmap in 2D and 3D.
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] % 3 != 0:
+            raise ValueError("positions must be (3*k, 3)")
+        if col.shape != pos.shape:
+            raise ValueError("colors shape must match positions")
+        self._pending_ovl_positions = pos
+        self._pending_ovl_colors = col
+        self._n_ovl_vertices = pos.shape[0]
+        self.update()
+
+    def clear_overlay_fills(self) -> None:
+        self._n_ovl_vertices = 0
+        self._pending_ovl_positions = None
+        self._pending_ovl_colors = None
+        self.update()
+
+    def set_overlay_labels(self, labels: list[dict]) -> None:
+        """Set the overlay text labels (reference designators).
+
+        ``labels`` is a list of dicts, each with ``x``/``y`` (world mm),
+        optional ``z`` (world mm, default 0), ``text``, ``color`` (a
+        ``#rrggbb`` string), ``height_mm`` (character height in world mm)
+        and optional ``rotation_deg``. Drawn by the QPainter overlay pass.
+        """
+        self._overlay_labels = list(labels or [])
+        self.update()
+
+    def clear_overlay_labels(self) -> None:
+        self._overlay_labels = []
         self.update()
 
     def set_series_bars(self, positions: np.ndarray,
@@ -961,6 +1075,15 @@ class GLMeshViewer(QOpenGLWidget):
         self._markers = []
         self.update()
 
+    def set_editor_mode(self, on: bool) -> None:
+        """Toggle the editor-mode look — bluish background + faint world-mm
+        grid. Pure display state; does not touch any mesh data."""
+        on = bool(on)
+        if on == self._editor_mode:
+            return
+        self._editor_mode = on
+        self.update()
+
     def set_measurement_line(self, x0: float, y0: float,
                               x1: float, y1: float) -> None:
         """Show a thin white line from world-mm ``(x0, y0)`` to ``(x1, y1)``.
@@ -1128,6 +1251,8 @@ class GLMeshViewer(QOpenGLWidget):
         self._pos_vbo.create()
         self._val_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         self._val_vbo.create()
+        self._alpha_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._alpha_vbo.create()
         self._ibo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
         self._ibo.create()
 
@@ -1206,6 +1331,14 @@ class GLMeshViewer(QOpenGLWidget):
         self._bdrl_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         self._bdrl_col_vbo.create()
 
+        # Overlay-fill VAO/VBOs — share the line shader.
+        self._ovl_vao = QOpenGLVertexArrayObject()
+        self._ovl_vao.create()
+        self._ovl_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._ovl_pos_vbo.create()
+        self._ovl_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._ovl_col_vbo.create()
+
         self._gl_initialized = True
 
     def resizeGL(self, w: int, h: int) -> None:
@@ -1218,6 +1351,11 @@ class GLMeshViewer(QOpenGLWidget):
         self.viewChanged.emit()
 
     def paintGL(self) -> None:
+        # Clear colour follows the editor/viewer mode — set per-frame here
+        # (rather than once in initializeGL) so set_editor_mode takes effect
+        # without needing the GL context made current off the paint path.
+        bg = self._bg_editor if self._editor_mode else self._bg_normal
+        GL.glClearColor(bg[0], bg[1], bg[2], 1.0)
         # Depth test only matters in 3D where overlapping layers and
         # cylinders need correct front/back ordering. In 2D it would
         # discard fragments from later draws even when they intentionally
@@ -1253,6 +1391,11 @@ class GLMeshViewer(QOpenGLWidget):
         if (over_count > 0
                 and self._line_program is not None):
             self._draw_series_bars(over_first, over_count)
+        # Overlay solid fills before the line batch so wire-mesh overlay
+        # outlines (and the pad / layer outlines) sit crisply on top.
+        if (self._n_ovl_vertices > 0
+                and self._line_program is not None):
+            self._draw_overlay_fills()
         if (self._n_line_vertices > 0
                 and self._line_program is not None):
             self._draw_lines()
@@ -1300,6 +1443,12 @@ class GLMeshViewer(QOpenGLWidget):
                                    self._pending_values.nbytes)
             self._val_vbo.release()
             self._pending_values = None
+        if self._pending_alpha is not None:
+            self._alpha_vbo.bind()
+            self._alpha_vbo.allocate(self._pending_alpha.tobytes(),
+                                     self._pending_alpha.nbytes)
+            self._alpha_vbo.release()
+            self._pending_alpha = None
         if self._pending_cmap is not None:
             self._cmap_tex.bind()
             self._cmap_tex.setData(0, QOpenGLTexture.RGBA,
@@ -1402,6 +1551,22 @@ class GLMeshViewer(QOpenGLWidget):
             )
             self._bdrl_col_vbo.release()
             self._pending_bdrl_colors = None
+        if self._pending_ovl_positions is not None:
+            self._ovl_pos_vbo.bind()
+            self._ovl_pos_vbo.allocate(
+                self._pending_ovl_positions.tobytes(),
+                self._pending_ovl_positions.nbytes,
+            )
+            self._ovl_pos_vbo.release()
+            self._pending_ovl_positions = None
+        if self._pending_ovl_colors is not None:
+            self._ovl_col_vbo.bind()
+            self._ovl_col_vbo.allocate(
+                self._pending_ovl_colors.tobytes(),
+                self._pending_ovl_colors.nbytes,
+            )
+            self._ovl_col_vbo.release()
+            self._pending_ovl_colors = None
 
     def _draw_mesh(self) -> None:
         prog = self._program
@@ -1425,12 +1590,30 @@ class GLMeshViewer(QOpenGLWidget):
         GL.glEnableVertexAttribArray(1)
         GL.glVertexAttribPointer(1, 1, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
         self._val_vbo.release()
+        # Per-vertex alpha (attribute 2). When the host has uploaded an
+        # alpha array matching the vertex count, bind it + enable blending
+        # so dimmed copper shows the background through; otherwise feed a
+        # constant 1.0 and the mesh draws fully opaque exactly as before.
+        use_alpha = (self._n_alpha == self._n_vertices and self._n_alpha > 0)
+        if use_alpha:
+            self._alpha_vbo.bind()
+            GL.glEnableVertexAttribArray(2)
+            GL.glVertexAttribPointer(2, 1, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+            self._alpha_vbo.release()
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        else:
+            GL.glDisableVertexAttribArray(2)
+            GL.glVertexAttrib1f(2, 1.0)
         self._ibo.bind()
         GL.glDrawElements(GL.GL_TRIANGLES, self._n_indices,
                           GL.GL_UNSIGNED_INT, None)
         self._ibo.release()
         GL.glDisableVertexAttribArray(0)
         GL.glDisableVertexAttribArray(1)
+        if use_alpha:
+            GL.glDisableVertexAttribArray(2)
+            GL.glDisable(GL.GL_BLEND)
         self._vao.release()
         self._cmap_tex.release()
         prog.release()
@@ -1547,6 +1730,33 @@ class GLMeshViewer(QOpenGLWidget):
         self._stub_vao.release()
         prog.release()
 
+    def _draw_overlay_fills(self) -> None:
+        """Draw the solid-fill overlay triangle batch via the line shader.
+
+        Flat-coloured polygons for the Overlays control's solid-fill mode
+        (filled pads, vias, component bodies). Drawn on top of the heatmap
+        in both 2D and 3D."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._ovl_vao.bind()
+        self._ovl_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._ovl_pos_vbo.release()
+        self._ovl_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._ovl_col_vbo.release()
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self._n_ovl_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._ovl_vao.release()
+        prog.release()
+
     def _draw_series_bars(self, first: int, count: int) -> None:
         """Draw a slice of the series-bar triangle batch via the line
         shader. ``first`` and ``count`` are vertex indices; both must be
@@ -1628,6 +1838,8 @@ class GLMeshViewer(QOpenGLWidget):
     def _draw_overlays(self) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        self._draw_editor_grid(painter)
+        self._draw_overlay_labels(painter)
         self._draw_markers(painter)
         self._draw_measurement_line(painter)
         self._draw_overlay_chip(
@@ -1637,6 +1849,53 @@ class GLMeshViewer(QOpenGLWidget):
             painter, self._overlay_top_right_html, anchor_right=True
         )
         painter.end()
+
+    def _draw_editor_grid(self, painter: QPainter) -> None:
+        """Faint world-mm grid for editor mode. 2D only — a grid drawn over
+        the stacked layers in 3D would just be visual noise. The spacing
+        snaps to a 1/2/5×10ⁿ mm value chosen so adjacent lines land roughly
+        70 px apart at the current zoom; lines on whole-10ⁿ-mm coordinates
+        are drawn slightly brighter as a coarse reference."""
+        if not self._editor_mode or self._view_mode == "3d":
+            return
+        mpp = max(float(self._mm_per_pixel), 1e-9)
+        w, h = float(self.width()), float(self.height())
+        raw_mm = 70.0 * mpp
+        if raw_mm <= 0.0:
+            return
+        base = 10.0 ** math.floor(math.log10(raw_mm))
+        step_mm = base
+        for mult in (1.0, 2.0, 5.0, 10.0):
+            step_mm = base * mult
+            if step_mm / mpp >= 70.0:
+                break
+        x_min, x_max, y_min, y_max = self.view_range()
+        major_every = 5   # every 5th line is the brighter "major" line
+        thin = QPen(QColor(120, 150, 210, 45))
+        thick = QPen(QColor(140, 170, 230, 90))
+        for pen in (thin, thick):
+            pen.setWidthF(1.0)
+            pen.setCosmetic(True)
+        painter.save()
+        i0 = math.ceil(x_min / step_mm)
+        i = i0
+        x = i0 * step_mm
+        while x <= x_max:
+            px, _ = self.world_to_screen(x, y_min)
+            painter.setPen(thick if i % major_every == 0 else thin)
+            painter.drawLine(QPointF(px, 0.0), QPointF(px, h))
+            i += 1
+            x += step_mm
+        j0 = math.ceil(y_min / step_mm)
+        j = j0
+        y = j0 * step_mm
+        while y <= y_max:
+            _, py = self.world_to_screen(x_min, y)
+            painter.setPen(thick if j % major_every == 0 else thin)
+            painter.drawLine(QPointF(0.0, py), QPointF(w, py))
+            j += 1
+            y += step_mm
+        painter.restore()
 
     def _draw_measurement_line(self, painter: QPainter) -> None:
         """Draw the host-supplied measurement line (Shift-drag voltage
@@ -1666,6 +1925,46 @@ class GLMeshViewer(QOpenGLWidget):
         # underlying copper.
         painter.setBrush(QBrush(QColor("#ffffff")))
         painter.drawEllipse(QPointF(x0_px, y0_px), 3.0, 3.0)
+        painter.restore()
+
+    def _draw_overlay_labels(self, painter: QPainter) -> None:
+        """Draw the overlay text labels (reference designators) as world-
+        anchored text that tracks pan / zoom. The font size follows each
+        label's world-mm height; labels too small to read at the current
+        zoom are skipped (keeps the canvas uncluttered and the painter
+        cheap on dense boards)."""
+        if not self._overlay_labels:
+            return
+        mpp = max(float(self._mm_per_pixel), 1e-9)
+        w, h = self.width(), self.height()
+        painter.save()
+        font = QFont(painter.font())
+        for lab in self._overlay_labels:
+            text = lab.get("text") or ""
+            if not text:
+                continue
+            wz = float(lab.get("z", 0.0) or 0.0)
+            px, py = self.world_to_screen(
+                float(lab["x"]), float(lab["y"]), wz)
+            if px < -1e8 or py < -1e8:
+                continue  # behind the 3D camera
+            if px < -200 or px > w + 200 or py < -200 or py > h + 200:
+                continue
+            size_px = float(lab.get("height_mm", 1.0) or 1.0) / mpp
+            if size_px < 5.0:
+                continue  # too small to read at this zoom — skip
+            font.setPixelSize(int(round(min(size_px, 48.0))))
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(lab.get("color", "#d0d0d0"))))
+            rot = float(lab.get("rotation_deg", 0.0) or 0.0) % 360.0
+            if rot != 0.0:
+                painter.save()
+                painter.translate(px, py)
+                painter.rotate(-rot)  # screen y is down; Altium rotates CCW
+                painter.drawText(QPointF(0.0, 0.0), text)
+                painter.restore()
+            else:
+                painter.drawText(QPointF(px, py), text)
         painter.restore()
 
     def _draw_markers(self, painter: QPainter) -> None:
