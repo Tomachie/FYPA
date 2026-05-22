@@ -162,9 +162,10 @@ _EDITOR_BG_HEX = "#272735"
 
 # Outline width (device px) of the yellow editor-mode selection box drawn
 # around the selected component. Matches the selected source / sink
-# marker's edge thickness (altium_viewer._EDITOR_MARKER_SELECT_SCALE) so
-# the two selection cues read as one consistent style.
-_EDITOR_SELECTION_BOX_PX = 1.8
+# marker's edge thickness (altium_viewer._EDITOR_MARKER_EDGE_W ×
+# _EDITOR_MARKER_SELECT_SCALE) so the two selection cues read as one
+# consistent style.
+_EDITOR_SELECTION_BOX_PX = 3.6
 
 
 @dataclass

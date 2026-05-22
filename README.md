@@ -40,6 +40,8 @@ or voltage), point this tool at the `.PrjPcb`, and it:
    - Drag handles or type values to clamp the colour scale
    - Hover for a probe readout
    - Cross-check per-pin voltages and per-via currents in sortable tables
+   - Switch to **editor mode** to place sources / sinks and re-solve
+     without editing the Altium schematic (see below)
 
 ## Download (prebuilt Windows binary)
 
@@ -256,6 +258,27 @@ python FYPA.py solve       YourBoard.PrjPcb out.pkl   # solve + pickle
 python FYPA.py show        out.pkl                    # open viewer on a saved pickle
 python FYPA.py paraview    out.pkl out.vtu            # export to ParaView VTK
 ```
+
+### Editor mode — sources / sinks without touching the schematic
+
+You don't have to round-trip through the Altium schematic to set up an
+analysis. The viewer has an **editor mode** for placing the PDN directly on
+the board:
+
+- Click a component to attach a `SOURCE` or `SINK` to it, or drop a *free
+  marker* on any copper to load a net with no component in the way.
+- Set the role, voltage / current, and net(s) in the side panel — single-net
+  or two-net, the same choices the `PDN_*` parameters give you.
+- A component that already carries schematic `PDN_*` directives can be
+  *unlocked* and overridden, for quick "what-if" values without editing
+  Altium.
+- Hit **Resolve** to re-run the solver with your edits applied — it reuses
+  the cached design extraction, so it's far quicker than a cold load.
+
+Editor edits are stored in a small `.fypa` project file beside the board, so
+they (and the linked solve) survive a save / reopen and never modify the
+Altium source files. A step-by-step walkthrough will follow in a separate
+user guide.
 
 ### Solve cache
 

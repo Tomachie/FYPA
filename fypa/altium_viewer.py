@@ -1137,6 +1137,22 @@ _EDITOR_MARKER_HIT_PX = 14.0
 # unselected source / sink markers.
 _EDITOR_MARKER_SELECT_SCALE = 1.3
 
+# Base outline width (px) of an editor source / sink marker. Wide enough
+# that the P-side black / N-side green edge reads clearly against the
+# marker fill; the selected marker scales this by _EDITOR_MARKER_SELECT_
+# SCALE, and the yellow selection box reuses the selected width.
+_EDITOR_MARKER_EDGE_W = 2.8
+
+# Directive terminals carrying the return ("N-side") net. Their pin
+# markers are drawn with a green outline (vs black for the P side) and
+# skip the rail-visibility filter, so an N net — typically ground, and
+# rarely the rail being viewed — always shows its source / sink marker.
+_N_SIDE_TERMINALS = frozenset({"N", "OUT_N", "IN_N"})
+
+# Outline colour for an N-side directive marker — green, to set the
+# return-net markers apart from the black-outlined P-side ones.
+_N_NET_MARKER_EDGE = "#008000"
+
 
 def _overlay_ribbon_offsets(polyline, half_w: float, *,
                             closed: bool):
@@ -8427,8 +8443,12 @@ class PdnViewer(QMainWindow):
                 and phys_list and target_layer_ids):
             rail_members = set(self._effective_rail_members(rail_names))
 
-            per_role: dict[str, tuple[list[float], list[float],
-                                        list[float]]] = {}
+            # Keyed (role, is_n_side): the P side and N side of a
+            # directive draw as separate groups so the N side can carry
+            # the green outline.
+            per_role: dict[tuple[str, bool],
+                           tuple[list[float], list[float],
+                                 list[float]]] = {}
             hover_rows: list[dict] = []
             for d in self.metadata.get("directives", []):
                 role = d.get("role")
@@ -8439,6 +8459,7 @@ class PdnViewer(QMainWindow):
                                       or "")
                 for term_name, term in (d.get("terminals") or {}).items():
                     term_pins = term.get("pins") or []
+                    is_n_side = term_name in _N_SIDE_TERMINALS
                     # Per-pin current = directive total / pins in THIS
                     # terminal. The lumped element couples to each pin in
                     # a terminal through equal-valued star resistors, so
@@ -8459,9 +8480,17 @@ class PdnViewer(QMainWindow):
                         lid = pin.get("layer_id")
                         if lid not in target_layer_ids:
                             continue
-                        if rail_members and pin.get("net") not in rail_members:
+                        # In editor mode N-side markers skip the rail
+                        # filter so the return net (rarely the viewed
+                        # rail) always shows; in normal viewing they
+                        # follow the rail filter like the P side, so only
+                        # markers on the selected rails appear.
+                        rail_exempt = is_n_side and self._editor_mode
+                        if (not rail_exempt and rail_members
+                                and pin.get("net") not in rail_members):
                             continue
-                        xs, ys, zs = per_role.setdefault(role, ([], [], []))
+                        xs, ys, zs = per_role.setdefault(
+                            (role, is_n_side), ([], [], []))
                         px = pin.get("x_mm", 0.0)
                         py = pin.get("y_mm", 0.0)
                         xs.append(px)
@@ -8488,7 +8517,8 @@ class PdnViewer(QMainWindow):
 
             self._set_marker_hover_rows(hover_rows)
 
-            for role, (xs, ys, zs) in per_role.items():
+            legend_seen_roles: set[str] = set()
+            for (role, is_n_side), (xs, ys, zs) in per_role.items():
                 if not xs:
                     continue
                 style = self._ROLE_MARKER_STYLE[role]
@@ -8499,11 +8529,16 @@ class PdnViewer(QMainWindow):
                     color=style["color"],
                     symbol=style["symbol"],
                     size=int(style["size"]),
-                    edge_color="#000000",
-                    edge_width=0.8,
+                    edge_color=(_N_NET_MARKER_EDGE if is_n_side
+                                else "#000000"),
+                    edge_width=1.6,
                 ))
-                legend_rows.append((style["label"], style["symbol"],
-                                     style["color"]))
+                # One legend row per role — the P / N split is a marker
+                # detail, not a separate legend entry.
+                if role not in legend_seen_roles:
+                    legend_rows.append((style["label"], style["symbol"],
+                                         style["color"]))
+                    legend_seen_roles.add(role)
 
             # Via *markers* (orange dots) — skipped in 3D where the via
             # *cylinders* (drawn natively in GL) take over the same role.
@@ -10039,36 +10074,45 @@ class PdnViewer(QMainWindow):
             return []
         selected = self._directive_for_selection()
         sel_id = selected.id if selected is not None else None
-        # Keyed (role, is_selected) so the selected marker lands in its
-        # own group and can carry a larger size / thicker outline.
-        by_key: dict[tuple[str, bool], list[tuple[float, float]]] = {}
+        # Keyed (role, is_selected, is_n_side): the selected marker lands
+        # in its own group (larger / thicker), and the N-side pins land in
+        # theirs so they can carry the green outline.
+        by_key: dict[tuple[str, bool, bool],
+                     list[tuple[float, float]]] = {}
         sel_pts: list[tuple[float, float]] = []
         for d in self._project.editor_directives:
+            # Pin points split into P-side and N-side.
+            p_pts: list[tuple[float, float]] = []
+            n_pts: list[tuple[float, float]] = []
             if d.kind == "free" and d.anchor_xy is not None:
-                pts = [(float(d.anchor_xy[0]), float(d.anchor_xy[1]))]
+                p_pts = [(float(d.anchor_xy[0]), float(d.anchor_xy[1]))]
             elif d.kind == "component":
                 # One marker per component pin on the directive's net(s),
                 # mirroring the solved-directive pin markers. Falls back to
                 # a single glyph at the component centre when no pad matches.
-                nets = [d.p_net]
+                p_pts = self._component_pad_points(d.designator, [d.p_net])
                 if not d.single_net and d.n_net:
-                    nets.append(d.n_net)
-                pts = self._component_pad_points(d.designator, nets)
-                if not pts:
+                    n_pts = self._component_pad_points(
+                        d.designator, [d.n_net])
+                if not p_pts and not n_pts:
                     ctr = self._component_center(d.designator)
                     if ctr is None:
                         continue
-                    pts = [ctr]
+                    p_pts = [ctr]
             else:
                 continue
             is_sel = d.id == sel_id
-            by_key.setdefault((d.role, is_sel), []).extend(pts)
+            for is_n_side, pts in ((False, p_pts), (True, n_pts)):
+                if pts:
+                    by_key.setdefault(
+                        (d.role, is_sel, is_n_side), []).extend(pts)
             if is_sel:
-                sel_pts.extend(pts)
+                sel_pts.extend(p_pts)
+                sel_pts.extend(n_pts)
         # Outline width shared by the selected marker and its box.
-        sel_edge_w = 1.4 * _EDITOR_MARKER_SELECT_SCALE
+        sel_edge_w = _EDITOR_MARKER_EDGE_W * _EDITOR_MARKER_SELECT_SCALE
         groups = []
-        for (role, is_sel), pts in by_key.items():
+        for (role, is_sel, is_n_side), pts in by_key.items():
             if not pts:
                 continue
             # Match the solved-directive markers — red up-triangle SOURCE,
@@ -10083,8 +10127,8 @@ class PdnViewer(QMainWindow):
                 color=style["color"],
                 symbol=style["symbol"],
                 size=int(round((style["size"] + 4) * emph)),
-                edge_color="#101010",
-                edge_width=sel_edge_w if is_sel else 1.4,
+                edge_color=(_N_NET_MARKER_EDGE if is_n_side else "#101010"),
+                edge_width=sel_edge_w if is_sel else _EDITOR_MARKER_EDGE_W,
             ))
         # Yellow selection box around the emphasised marker — an unfilled
         # rectangle hugging the enlarged glyph (the *_box symbols draw the
@@ -10236,9 +10280,10 @@ class PdnViewer(QMainWindow):
                 "Re-solving with your editor changes…\n"
                 "Reusing the cached design info (no re-extraction)."
             ),
-            # ~2.78x Qt's auto-sized width — the standard solve dialog's
-            # 1.44x, widened further for the longer editor-changes message.
-            dialog_width_scale=2.78208,
+            # ~3.20x Qt's auto-sized width — the standard solve dialog's
+            # 1.44x, widened further for the longer editor-changes message
+            # and then another 15% wider on top of that.
+            dialog_width_scale=3.199392,
         )
 
     def _on_gl_clicked(self, _world_x: float, _world_y: float) -> None:
