@@ -94,9 +94,9 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    # console=True keeps a terminal window so CLI subcommands (solve, extract,
-    # geometry …) can print output and errors remain visible on crash.
-    console=True,
+    # GUI launcher — no terminal window. CLI subcommands still run but their
+    # stdout/stderr is discarded; rely on the file logger for diagnostics.
+    console=False,
     icon=os.path.join(_REPO_ROOT, 'assets', 'icon_titlebar.ico'),
 )
 

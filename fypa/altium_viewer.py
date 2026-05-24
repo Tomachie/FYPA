@@ -4022,7 +4022,9 @@ class LauncherWindow(QMainWindow):
 
     def _on_menu_open_project(self, *, clean: bool = False) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
-            self, "Open Altium project", "",
+            self,
+            "Import Altium project (clean)" if clean else "Import Altium project",
+            "",
             "Altium project (*.PrjPcb);;All files (*)",
         )
         if not path_str:
@@ -4347,6 +4349,14 @@ class PdnViewer(QMainWindow):
         self._init_log.info("PdnViewer init: START")
         self.solution = solution
         self.metadata = metadata
+        # Backward compat: older pickles pre-date the per-primitive
+        # ``primitives`` block. Default to empty buckets so the viewer-mode
+        # copper-click feature simply produces no hits instead of crashing.
+        if isinstance(self.metadata, dict):
+            self.metadata.setdefault("primitives", {
+                "tracks": [], "arcs": [], "regions": [],
+                "shape_based_regions": [], "fills": [],
+            })
 
         # --- Editor mode + project-file state ---
         # The .fypa project (links the two cache pickles + editor
@@ -4363,10 +4373,16 @@ class PdnViewer(QMainWindow):
         # design-info cache.
         self._loaded_project = loaded_project
         # _project_dirty: editor edits not yet written to the .fypa.
-        # _solve_stale:   editor edits not yet reflected by a solve.
-        # A viewer opened by a resolve already reflects the editor
-        # directives, so it starts non-stale.
+        # _settings_dirty: Settings-tab fields differ from the values
+        #                  the current solve was run against.
+        # _initial_solve_stale: viewer loaded with edits not yet
+        #                       reflected by the solve (e.g. .fypa with
+        #                       editor directives + a stale solve pickle).
+        # _solve_stale: derived = OR of the three above; drives the
+        #               Resolve overlay button.
         self._project_dirty: bool = False
+        self._settings_dirty: bool = False
+        self._initial_solve_stale: bool = False
         self._solve_stale: bool = False
         # Whether a solver run has happened that isn't yet persisted to a
         # pickle — gates the "Save project + latest solver run" option in
@@ -4377,6 +4393,15 @@ class PdnViewer(QMainWindow):
         # Current editor selection: a dict carrying 'kind' plus
         # selection-specific keys, or None when nothing is selected.
         self._editor_selection: dict | None = None
+        # Viewer-mode copper-primitive click selection. ``None`` when
+        # nothing is selected; otherwise a dict ``{"kind", "record",
+        # "layer_id", "net"}`` returned by :meth:`_primitive_at_point`.
+        # Drives the dashed-yellow GL overlay and the right-panel form.
+        self._copper_selection: dict | None = None
+        # Lazy ``(layer_id, net) -> [primitive dict]`` index over
+        # ``metadata['primitives']``. Built on first click.
+        self._primitives_by_layer_net: dict[
+            tuple[int, str], list[dict]] | None = None
         # Net names currently highlighted (connected copper); everything
         # else renders dimmed. Empty = no highlight active.
         self._editor_highlight_nets: set[str] = set()
@@ -4433,6 +4458,16 @@ class PdnViewer(QMainWindow):
         # Defer the maximise until after show() — calling showMaximized()
         # during __init__ doesn't always stick on Windows.
         self._pending_maximize: bool = True
+
+        # Re-entrancy guard for _run_with_busy_popup so a signal fired by
+        # processEvents() during the popup-paint can't stack a second
+        # dialog on top of the first.
+        self._render_busy_active: bool = False
+        # Throttle timestamp for _pump_busy_ui — caps the marquee-bar
+        # repaint rate at ~33 Hz so the pump can be sprinkled in hot
+        # inner loops (every polygon, every per-(phys, net) tile) without
+        # blowing up overhead. Reset to 0.0 when the popup opens.
+        self._last_pump_time: float = 0.0
 
         # Index every padne Layer by (physical, net). The net here is what we
         # used to call "rail" in the naming convention — but now we group
@@ -5256,12 +5291,17 @@ class PdnViewer(QMainWindow):
         plot_widget.setLayout(plot_layout)
         outer.addWidget(plot_widget, 1)
 
-        # Right-hand editor panel — hidden in viewer mode, shown when the
-        # user enters editor mode. Carries the PDN-role form + free-marker
-        # palette. Built collapsed so it costs nothing until used.
+        # Right-hand panel — overlaid on the GL viewer's right edge
+        # rather than added to the outer layout. Floating it as a child
+        # widget (same pattern as ``_scale_overlay``) keeps the viewport's
+        # pixel size and pan / zoom centre invariant when the panel
+        # appears, so the visible copper doesn't shift sideways. Carries
+        # the PDN editor form in editor mode and the copper-properties
+        # form in viewer mode.
         self._editor_panel = self._build_editor_panel()
+        self._editor_panel.setParent(self._gl_viewer)
         self._editor_panel.hide()
-        outer.addWidget(self._editor_panel)
+        self._position_editor_panel()
 
         self._init_log.info(
             "PdnViewer init: pre-tabs done (%.2fs)",
@@ -5337,16 +5377,16 @@ class PdnViewer(QMainWindow):
         # layer_list.itemChanged is wired in _build_ui via
         # _on_layer_visibility_changed so we can pause-and-resume during
         # programmatic checks without spamming renders.
-        self.mode_combo.currentTextChanged.connect(self._render)
-        self.rail_only_box.toggled.connect(self._render)
+        self.mode_combo.currentTextChanged.connect(self._render_with_busy_popup)
+        self.rail_only_box.toggled.connect(self._render_with_busy_popup)
         self.show_markers_box.toggled.connect(self._render)
         self.show_mesh_box.toggled.connect(
             lambda checked: self._gl_viewer.set_show_mesh_edges(checked)
         )
-        self.colour_stubs_box.toggled.connect(self._render)
+        self.colour_stubs_box.toggled.connect(self._render_with_busy_popup)
         self.cursor_tooltip_box.toggled.connect(self._on_cursor_tooltip_toggled)
         self.view_3d_box.toggled.connect(self._on_view_3d_toggled)
-        self.heatmap_vias_box.toggled.connect(self._render)
+        self.heatmap_vias_box.toggled.connect(self._render_with_busy_popup)
         self.show_arrows_box.toggled.connect(self._on_arrows_toggled)
         # Keep the View-menu item labels in step whenever one of their
         # backing checkboxes flips — whether from the menu action, a
@@ -5487,7 +5527,7 @@ class PdnViewer(QMainWindow):
 
     def _on_layer_visibility_changed(self, _item: object = None) -> None:
         """Layer eye toggled in the layer list → re-render."""
-        self._render()
+        self._render_with_busy_popup()
 
     def _visible_layers(self) -> list[str]:
         """Names of the physical layers currently visible (eye open),
@@ -5502,14 +5542,16 @@ class PdnViewer(QMainWindow):
         independent of the FEM heatmap, so only the overlay geometry needs
         rebuilding — no full re-render."""
         self._sync_all_layers_eye2()
-        self._refresh_overlay_geometry(self._visible_rails())
+        rails = self._visible_rails()
+        self._run_with_busy_popup(lambda: self._refresh_overlay_geometry(rails))
 
     def _on_all_layers_eye2_toggled(self, on: bool) -> None:
         """The "All Layers" all-copper eye — show/hide all copper on every
         layer at once."""
         for _name, eye2 in self._layer_eye2_buttons:
             eye2.setVisibleState(on, emit=False)
-        self._refresh_overlay_geometry(self._visible_rails())
+        rails = self._visible_rails()
+        self._run_with_busy_popup(lambda: self._refresh_overlay_geometry(rails))
 
     def _sync_all_layers_eye2(self) -> None:
         """Reflect "any layer's all-copper shown" in the All Layers eye."""
@@ -5547,14 +5589,14 @@ class PdnViewer(QMainWindow):
         """An individual rail's eye was clicked."""
         self._sync_all_rails_eye()
         self._sync_rail_only_visibility()
-        self._render()
+        self._render_with_busy_popup()
 
     def _on_all_rails_toggled(self, on: bool) -> None:
         """The "All Rails" eye was clicked — show or hide every rail."""
         for _name, eye in self._rail_eye_buttons:
             eye.setVisibleState(on, emit=False)
         self._sync_rail_only_visibility()
-        self._render()
+        self._render_with_busy_popup()
 
     def _sync_all_rails_eye(self) -> None:
         """Reflect "any rail visible" in the All Rails eye state."""
@@ -6086,6 +6128,7 @@ class PdnViewer(QMainWindow):
         def _net_match(nets) -> bool:
             return bool(rail_members) and bool(set(nets) & rail_members)
 
+        self._pump_busy_ui()
         # Overlay graphics — silkscreen tracks / arcs. Each is drawn at its
         # real track width with round end caps, so it matches Altium's
         # round-capped tracks and consecutive segments join smoothly. No
@@ -6093,6 +6136,7 @@ class PdnViewer(QMainWindow):
         sides = self._overlay_side_states("silkscreen")
         alphas = self._overlay_side_alpha("silkscreen")
         for rec in md.get("silkscreen", []):
+            self._pump_busy_ui()
             if rec.get("kind") == "text":
                 continue  # legacy pickles only — text isn't an Overlay item
             side = rec.get("side", "top")
@@ -6126,6 +6170,7 @@ class PdnViewer(QMainWindow):
                     poly, half, _OVERLAY_WIRE_HALF_MM, closed=False),
                     z, rgb, alpha=a, **bucket)
 
+        self._pump_busy_ui()
         # Vias — one circle per via (the Vias row has no top/bottom split).
         vsub = self._overlay_state["vias"]["both"]
         if vsub["vis"] is not None:
@@ -6135,6 +6180,7 @@ class PdnViewer(QMainWindow):
             rails_only = vsub["vis"] == "rails"
             if via_alpha > 0.0:
                 for rec in md.get("vias", []):
+                    self._pump_busy_ui()
                     if rails_only and not _net_match([rec.get("net")]):
                         continue
                     r = 0.5 * float(rec.get("diameter_mm", 0.0) or 0.0)
@@ -6145,10 +6191,12 @@ class PdnViewer(QMainWindow):
                     _emit(_shape_tris(ring, solid), side_z["top"], rgb,
                           alpha=via_alpha)
 
+        self._pump_busy_ui()
         # Components — axis-aligned bounding box per component.
         sides = self._overlay_side_states("components")
         alphas = self._overlay_side_alpha("components")
         for rec in md.get("components", []):
+            self._pump_busy_ui()
             side = rec.get("side", "top")
             vis, solid = sides.get(side, (None, False))
             if vis is None:
@@ -6165,6 +6213,7 @@ class PdnViewer(QMainWindow):
             _emit(_shape_tris(_overlay_box_ring(*bbox), solid),
                   feature_z[side], rgb, alpha=a, **_side_buckets(side))
 
+        self._pump_busy_ui()
         # Pads — outline ring per pad, drawn on whichever board side(s)
         # the pad's copper layers include (through-hole pads → both).
         # Emitted AFTER components: the 2D overlay batch has no depth test,
@@ -6176,6 +6225,7 @@ class PdnViewer(QMainWindow):
         sides = self._overlay_side_states("pads")
         alphas = self._overlay_side_alpha("pads")
         for rec in md.get("pads", []):
+            self._pump_busy_ui()
             ring = rec.get("outline")
             if not ring:
                 continue
@@ -6195,6 +6245,7 @@ class PdnViewer(QMainWindow):
                 _emit(_shape_tris(ring, solid), feature_z[side], rgb,
                       alpha=a, **_side_buckets(side))
 
+        self._pump_busy_ui()
         # Designators — drawn in Altium's actual single-stroke font: the
         # loader lays each one out into stroke polylines, which render as
         # thin round-capped ribbons (same path as silkscreen). TrueType-
@@ -6202,6 +6253,7 @@ class PdnViewer(QMainWindow):
         sides = self._overlay_side_states("designators")
         alphas = self._overlay_side_alpha("designators")
         for rec in md.get("designators", []):
+            self._pump_busy_ui()
             side = rec.get("side", "top")
             vis, solid = sides.get(side, (None, False))
             if vis is None:
@@ -6229,6 +6281,7 @@ class PdnViewer(QMainWindow):
                     "rotation_deg": float(rec.get("rotation_deg", 0.0) or 0.0),
                 })
 
+        self._pump_busy_ui()
         # Physical-layer "all copper" — the per-layer second eye. For every
         # layer whose all-copper eye is on, draw all of that layer's copper
         # that ISN'T part of a selected rail (the rails are already the
@@ -6275,6 +6328,10 @@ class PdnViewer(QMainWindow):
                 recs = ac_by_layer.get(self._phys_name_to_layer_id.get(name))
                 if not recs:
                     continue
+                # Per-layer pump — for a 16-layer board with all-copper on,
+                # this gives ~16 marquee-bar ticks during the heaviest
+                # section of the overlay refresh.
+                self._pump_busy_ui()
                 fb = fill_by_name.get(name)
                 solid = bool(fb.isSolid()) if fb is not None else False
                 tb = transp_by_name.get(name)
@@ -6311,6 +6368,12 @@ class PdnViewer(QMainWindow):
                     net = rec.get("net")
                     if net in rail_members:
                         continue
+                    # Per-rec pump — a single layer on Corvette can have
+                    # hundreds of all-copper records; without a pump in
+                    # this loop the marquee freezes for the duration of
+                    # one layer's emit. Throttled, so overhead stays
+                    # near-zero.
+                    self._pump_busy_ui()
                     # Editor-mode connectivity focus: copper not connected
                     # to the current selection recedes toward the
                     # background (mirrors the heatmap mesh dimming).
@@ -6495,6 +6558,10 @@ class PdnViewer(QMainWindow):
                 layer_index = self._index_by_pair.get((phys, net))
                 if layer_index is None:
                     continue
+                # Per-(phys, net) pump — this loop is the bulk of
+                # _build_rail_arrays cost on multi-rail, multi-layer
+                # selections. The throttle keeps the overhead negligible.
+                self._pump_busy_ui()
                 entry = self._layer_arrays(layer_index, derive_fn)
                 n_in = entry["xs"].size
                 if n_in == 0 or entry["tris"].size == 0:
@@ -6944,6 +7011,94 @@ class PdnViewer(QMainWindow):
             return
         self._gl_viewer.set_arrows(segs, color=(1.0, 1.0, 1.0))
 
+    # Runs an arbitrary display-update callable. If it takes longer than
+    # ``_BUSY_POPUP_DELAY_MS`` the modal "Updating display…" popup
+    # appears mid-flight; if it finishes faster, no popup is ever shown.
+    # The deferred-show pattern means we don't have to predict slowness
+    # up front — fast cached operations cost nothing, slow ones get the
+    # dialog without flashing it on quick toggles. Used by both the
+    # render path and the overlay-refresh path (all-copper toggles on
+    # big boards run through :meth:`_refresh_overlay_geometry`, not
+    # :meth:`_render`).
+    _BUSY_POPUP_DELAY_MS = 400
+
+    def _run_with_busy_popup(self, work) -> None:
+        # Re-entrancy: the inner work pumps QApplication.processEvents()
+        # (via :meth:`_pump_busy_ui`) so the deferred-show timer can fire
+        # and the marquee can repaint. If a queued signal re-enters this
+        # wrapper mid-flight, drop it — running the work twice would
+        # corrupt GL state (half-pushed meshes, mis-ordered overlay
+        # batches). The popup itself is ApplicationModal so it blocks
+        # user input on other windows; in practice this guard only fires
+        # on stray internal signals.
+        if self._render_busy_active:
+            return
+        self._render_busy_active = True
+        self._last_pump_time = 0.0
+        # Mutable box so the timer slot below can publish the created
+        # dialog back to the finally block for cleanup.
+        dlg_box: list[QProgressDialog | None] = [None]
+
+        def _show_popup() -> None:
+            # The timer slot can theoretically run after the finally block
+            # has cleared the busy flag (if it fires between work
+            # returning and timer.stop() in finally). Guard against that.
+            if not self._render_busy_active or dlg_box[0] is not None:
+                return
+            d = QProgressDialog("Updating display…", "", 0, 0, self)
+            d.setWindowTitle("Working")
+            # The work isn't cancellable — it's one synchronous call.
+            # Strip the cancel button so the dialog is unambiguously a
+            # busy indicator.
+            d.setCancelButton(None)
+            d.setWindowModality(Qt.ApplicationModal)
+            d.setMinimumDuration(0)
+            d.setAutoClose(False)
+            d.setAutoReset(False)
+            d.setWindowFlags(d.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+            d.show()
+            # Let Qt paint the dialog frame in this same processEvents
+            # tick so the marquee shows up immediately rather than after
+            # the next pump.
+            QApplication.processEvents()
+            dlg_box[0] = d
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(_show_popup)
+        timer.start(self._BUSY_POPUP_DELAY_MS)
+        try:
+            work()
+        finally:
+            timer.stop()
+            timer.deleteLater()
+            if dlg_box[0] is not None:
+                dlg_box[0].close()
+                dlg_box[0].deleteLater()
+            self._render_busy_active = False
+
+    # Backwards-compat thin wrapper: existing toggle signals connect to
+    # this name. New callers should prefer :meth:`_run_with_busy_popup`
+    # directly with their specific work function.
+    def _render_with_busy_popup(self) -> None:
+        self._run_with_busy_popup(self._render)
+
+    def _pump_busy_ui(self) -> None:
+        """Yield briefly to Qt so the busy popup's deferred-show timer
+        can fire AND the marquee bar can repaint mid-work. Cheap when no
+        popup is up (single bool check) and throttled to ~33 Hz when one
+        is, so callers can sprinkle it in hot inner loops (every polygon,
+        every per-(phys, net) tile) without blowing up overhead. Qt's
+        marquee animates by an internal timer at ~30 Hz; pumping faster
+        than that wastes CPU."""
+        if not self._render_busy_active:
+            return
+        now = time.perf_counter()
+        if now - self._last_pump_time < 0.03:
+            return
+        self._last_pump_time = now
+        QApplication.processEvents()
+
     def _render(self) -> None:
         # Optional per-stage timing. When ``self._render_profile`` is a
         # list (set by tools/bench_recolor.py) each stage appends a
@@ -6959,6 +7114,10 @@ class PdnViewer(QMainWindow):
                 _now = time.perf_counter()
                 _prof.append((_name, _now - _tprev))
                 _tprev = _now
+            # Pump the Qt event loop at every stage boundary so the busy
+            # popup's marquee bar keeps animating during long renders.
+            # No-op when no popup is up; ~microseconds when one is.
+            self._pump_busy_ui()
 
         phys_list, rails, mode = self._current_selection()
         label, unit, derive_fn = self._mode_derive_fn(mode)
@@ -9817,7 +9976,7 @@ class PdnViewer(QMainWindow):
             self._gl_viewer.set_view_mode("3d" if checked else "2d")
         # _render rebuilds arrows internally so they get re-emitted with
         # (N, 3) z-lifted vertices in 3D or flat (N, 2) in 2D.
-        self._render()
+        self._render_with_busy_popup()
 
     def _on_layer_spacing_changed(self, value: int) -> None:
         """Live update of the 3D vertical-exaggeration uniform — affects
@@ -10076,9 +10235,14 @@ class PdnViewer(QMainWindow):
             rbtn.raise_()
 
     def _build_editor_panel(self) -> QWidget:
-        """Right-hand panel shown in editor mode: a PDN-role form, filled
-        on selection by :meth:`_populate_editor_form`. Free source / sink
-        markers are placed from the viewport-overlay buttons, not here."""
+        """Right-hand panel — multi-purpose. In editor mode it hosts the
+        PDN-role form (filled by :meth:`_populate_editor_form` on
+        component / free-marker selection). In viewer mode it hosts the
+        copper-properties form (filled by
+        :meth:`_populate_copper_props_form` when the user clicks a
+        copper primitive). The two contents live in sibling host
+        widgets, swapped by :meth:`_show_pdn_editor_layout` /
+        :meth:`_show_copper_props_layout`."""
         t = _T()
         panel = QWidget()
         panel.setFixedWidth(300)
@@ -10087,7 +10251,10 @@ class PdnViewer(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
 
-        lay.addWidget(QLabel("<b>PDN Editor</b>"))
+        # Title is swappable so the same widget can read as "PDN Editor"
+        # in editor mode and "Copper Properties" in viewer mode.
+        self._editor_panel_title = QLabel("<b>PDN Editor</b>")
+        lay.addWidget(self._editor_panel_title)
 
         self._editor_hint = QLabel(self._EDITOR_DEFAULT_HINT)
         self._editor_hint.setWordWrap(True)
@@ -10102,8 +10269,37 @@ class PdnViewer(QMainWindow):
         self._editor_form_host.hide()
         lay.addWidget(self._editor_form_host)
 
+        # Sibling host for the viewer-mode copper-properties form.
+        self._copper_props_host = QWidget()
+        self._copper_props_layout = QVBoxLayout(self._copper_props_host)
+        self._copper_props_layout.setContentsMargins(0, 0, 0, 0)
+        self._copper_props_layout.setSpacing(6)
+        self._copper_props_host.hide()
+        lay.addWidget(self._copper_props_host)
+
         lay.addStretch(1)
         return panel
+
+    def _show_pdn_editor_layout(self) -> None:
+        """Switch the right panel to its editor-mode contents (title,
+        hint, PDN-role form host). Visibility of the form host itself is
+        still driven by :meth:`_update_editor_panel`."""
+        if not hasattr(self, "_editor_panel_title"):
+            return
+        self._editor_panel_title.setText("<b>PDN Editor</b>")
+        self._editor_hint.show()
+        self._copper_props_host.hide()
+        # _update_editor_panel decides whether _editor_form_host is on.
+
+    def _show_copper_props_layout(self) -> None:
+        """Switch the right panel to its viewer-mode contents (title +
+        copper-properties form host). The editor-mode form / hint hide."""
+        if not hasattr(self, "_editor_panel_title"):
+            return
+        self._editor_panel_title.setText("<b>Copper Properties</b>")
+        self._editor_hint.hide()
+        self._editor_form_host.hide()
+        self._copper_props_host.show()
 
     def _on_editor_mode_toggled(self, checked: bool) -> None:
         """Enter / leave editor mode — swaps the viewport look, shows /
@@ -10111,7 +10307,20 @@ class PdnViewer(QMainWindow):
         on the way out (placed directives persist in the project)."""
         self._editor_mode = bool(checked)
         self._gl_viewer.set_editor_mode(self._editor_mode)
-        self._editor_panel.setVisible(self._editor_mode)
+        # The right-hand panel serves both modes; clear the other mode's
+        # selection before swapping its contents.
+        if self._editor_mode:
+            # Entering editor mode: drop any viewer-mode copper selection
+            # (its dashed outline and props form would conflict with the
+            # PDN-editor form).
+            self._clear_copper_selection()
+            self._show_pdn_editor_layout()
+        else:
+            self._show_pdn_editor_layout()  # safe; visibility checked below
+        self._editor_panel.setVisible(
+            self._editor_mode or self._copper_selection is not None)
+        if self._editor_panel.isVisible():
+            self._position_editor_panel()
         # Keep the toggle button in sync when entered via the E hotkey.
         if self._editor_toggle_btn.isChecked() != self._editor_mode:
             self._editor_toggle_btn.blockSignals(True)
@@ -10190,9 +10399,19 @@ class PdnViewer(QMainWindow):
             self.statusBar().clearMessage()
 
     def _set_solve_stale(self, stale: bool) -> None:
-        """Flag editor edits as needing (or no longer needing) a re-solve
-        and show / hide the resolve button accordingly."""
-        self._solve_stale = bool(stale)
+        """Force-flag the displayed solve as stale (used at viewer load
+        when the loaded solve pre-dates the project's editor directives).
+        Editor / settings dirty flags can independently extend
+        staleness — see :meth:`_refresh_solve_stale_overlay`."""
+        self._initial_solve_stale = bool(stale)
+        self._refresh_solve_stale_overlay()
+
+    def _refresh_solve_stale_overlay(self) -> None:
+        """Recompute ``_solve_stale`` from the editor / settings / initial
+        dirty flags, then show or hide the Resolve overlay button."""
+        self._solve_stale = (bool(self._project_dirty)
+                             or bool(self._settings_dirty)
+                             or bool(self._initial_solve_stale))
         rbtn = getattr(self, "_resolve_btn", None)
         if rbtn is not None:
             rbtn.setVisible(self._solve_stale)
@@ -10202,7 +10421,7 @@ class PdnViewer(QMainWindow):
         """Record that an editor edit happened: the project file is now
         out of date and a re-solve is needed."""
         self._project_dirty = True
-        self._set_solve_stale(True)
+        self._refresh_solve_stale_overlay()
 
     # --- Editor mode: selection + connectivity highlight --------------------
 
@@ -10594,7 +10813,466 @@ class PdnViewer(QMainWindow):
                             "layer_id": layer_id}
         return None
 
-    def _on_editor_click(self, world_x: float, world_y: float) -> None:
+    # --- Viewer-mode copper-primitive picker ------------------------------
+    #
+    # Click-to-select on any visible copper primitive in viewer mode. The
+    # selected primitive's outline is drawn as a dashed yellow polygon
+    # (gl_mesh_viewer.set_primitive_selection_outline) and the right-hand
+    # editor panel widget is repurposed to show its properties (kind,
+    # net, layer, geometry). Bare-substrate clicks (or Escape) clear.
+
+    def _primitives_index(self) -> dict[tuple[int, str], list[dict]]:
+        """Lazy ``(layer_id, net) -> [primitive dicts]`` index over
+        ``metadata['primitives']``. Built once per project; the per-shape
+        caches survive on the dicts so repeat hits stay cheap."""
+        if self._primitives_by_layer_net is not None:
+            return self._primitives_by_layer_net
+        idx: dict[tuple[int, str], list[dict]] = {}
+        md = self.metadata or {}
+        prims = md.get("primitives") or {}
+        for bucket in ("tracks", "arcs", "regions",
+                       "shape_based_regions", "fills"):
+            for rec in prims.get(bucket, []):
+                key = (int(rec.get("layer_id", -1)),
+                       str(rec.get("net", "")))
+                idx.setdefault(key, []).append(rec)
+        self._primitives_by_layer_net = idx
+        return idx
+
+    def _primitive_prepared_shape(self, prim: dict):
+        """Build (and cache on the primitive dict) a prepared shapely
+        geometry for ``prim``. Returns ``None`` if the geometry can't be
+        constructed (degenerate primitive)."""
+        cached = prim.get("_prepared_shape")
+        if cached is not None:
+            return cached
+        kind = prim.get("kind")
+        shp = None
+        try:
+            if kind == "track":
+                line = _sg.LineString([(prim["ax"], prim["ay"]),
+                                       (prim["bx"], prim["by"])])
+                # Round caps + joins to match the actual copper polygon
+                # (altium_geometry._track_polygon uses cap_style=1).
+                shp = line.buffer(max(prim["width_mm"] * 0.5, 1e-6),
+                                  cap_style=1, join_style=1,
+                                  resolution=8)
+            elif kind == "arc":
+                start = math.radians(prim["start_angle_deg"])
+                end = math.radians(prim["end_angle_deg"])
+                sweep = end - start
+                if sweep <= 1e-9:
+                    sweep += 2.0 * math.pi
+                cx, cy, r = prim["cx"], prim["cy"], prim["radius_mm"]
+                half_w = max(prim["width_mm"] * 0.5, 1e-6)
+                steps = max(8, int(abs(sweep) / math.radians(6.0)) + 1)
+                pts = [(cx + r * math.cos(start + sweep * k / steps),
+                        cy + r * math.sin(start + sweep * k / steps))
+                       for k in range(steps + 1)]
+                line = _sg.LineString(pts)
+                # Round caps + joins to match the actual copper polygon
+                # (altium_geometry._arc_polygon uses cap_style=1). Round
+                # caps at the (coincident) endpoints of a full-circle
+                # arc overlap cleanly into the tube; flat / square caps
+                # would stick a radial sliver inside the ring.
+                shp = line.buffer(half_w, cap_style=1, join_style=1,
+                                  resolution=8)
+            elif kind == "fill":
+                import shapely.affinity as _sa
+                box = _sg.box(prim["x1_mm"], prim["y1_mm"],
+                              prim["x2_mm"], prim["y2_mm"])
+                rot = float(prim.get("rotation_deg", 0.0) or 0.0)
+                shp = (_sa.rotate(box, rot, origin="center")
+                       if rot else box)
+            elif kind in ("region", "shape_based_region"):
+                outline = prim.get("outline") or []
+                if len(outline) >= 3:
+                    holes = [h for h in (prim.get("holes") or [])
+                             if len(h) >= 3]
+                    shp = _sg.Polygon(outline, holes)
+        except Exception:
+            shp = None
+        if shp is None or shp.is_empty:
+            return None
+        prepped = _sp.prep(shp)
+        prim["_prepared_shape"] = prepped
+        prim["_shape"] = shp
+        return prepped
+
+    def _via_or_pad_at_point(self, world_x: float, world_y: float
+                              ) -> dict | None:
+        """Fast path for via / through-hole-pad / SMT-pad clicks. These
+        sit on top of copper polygons, so they need to be tested before
+        the per-polygon all-copper hit-test would shadow them.
+
+        Returns a primitive-shaped dict ``{"kind", "record", "layer_id",
+        "net"}`` for the topmost visible hit, or ``None``."""
+        md = self.metadata or {}
+        visible = self._visible_all_copper_layer_ids()
+        if not visible:
+            return None
+        best: dict | None = None
+        best_rank = 1 << 30
+
+        def _take(kind: str, rec: dict, layer_ids: list[int]) -> None:
+            nonlocal best, best_rank
+            for lid in layer_ids:
+                phys = visible.get(int(lid))
+                if phys is None:
+                    continue
+                rank = self._phys_stackup_rank.get(phys, 1 << 30)
+                if rank < best_rank:
+                    best_rank = rank
+                    best = {"kind": kind, "record": rec,
+                            "layer_id": int(lid),
+                            "net": rec.get("net", "") or ""}
+                break
+
+        for bucket_kind, bucket in (("via", md.get("vias") or []),
+                                     ("pth", md.get("pths") or [])):
+            for rec in bucket:
+                d = float(rec.get("diameter_mm", 0.0) or 0.0)
+                if d <= 0.0:
+                    continue
+                dx = world_x - float(rec.get("x_mm", 0.0))
+                dy = world_y - float(rec.get("y_mm", 0.0))
+                if (dx * dx + dy * dy) > (d * 0.5) ** 2:
+                    continue
+                ls = int(rec.get("layer_start", 0))
+                le = int(rec.get("layer_end", 0))
+                if ls and le:
+                    span = list(range(min(ls, le), max(ls, le) + 1))
+                else:
+                    span = []
+                _take(bucket_kind, rec, span)
+
+        pads = md.get("pads") or []
+        if pads:
+            pt = _sg.Point(world_x, world_y)
+            for rec in pads:
+                outline = rec.get("outline") or []
+                if len(outline) < 3:
+                    continue
+                try:
+                    poly = _sg.Polygon(outline)
+                    if poly.is_empty or not poly.contains(pt):
+                        continue
+                except Exception:
+                    continue
+                _take("pad", rec, list(rec.get("layer_ids") or []))
+        return best
+
+    def _primitive_at_point(self, world_x: float, world_y: float
+                             ) -> dict | None:
+        """Topmost visible copper primitive containing the world-mm point.
+        Returns a dict ``{"kind", "record", "layer_id", "net"}`` or
+        ``None`` on bare substrate / hidden copper.
+
+        Probe order: vias / pads first (they sit on top of pours), then
+        ``_all_copper_at_point`` narrows the topmost-visible (layer, net),
+        then walks the per-(layer, net) primitive list for the
+        track / arc / fill / region whose shape contains the point."""
+        hit = self._via_or_pad_at_point(world_x, world_y)
+        if hit is not None:
+            return hit
+        cover = self._all_copper_at_point(world_x, world_y)
+        if cover is None:
+            return None
+        key = (int(cover["layer_id"]), str(cover["net"]))
+        prims = self._primitives_index().get(key) or []
+        if not prims:
+            return None
+        pt = _sg.Point(world_x, world_y)
+        for prim in prims:
+            prepped = self._primitive_prepared_shape(prim)
+            if prepped is None:
+                continue
+            try:
+                if not prepped.contains(pt):
+                    continue
+            except Exception:
+                continue
+            return {"kind": prim["kind"], "record": prim,
+                    "layer_id": int(prim["layer_id"]),
+                    "net": str(prim["net"])}
+        return None
+
+    def _primitive_outline_rings(self, hit: dict
+                                  ) -> list[list[tuple[float, float]]]:
+        """Closed world-mm rings outlining the selected primitive — the
+        geometry the GL viewer draws as a dashed yellow polygon. Always
+        returns at least one ring (caller has a hit)."""
+        kind = hit.get("kind")
+        rec = hit.get("record") or {}
+        if kind in ("via", "pth"):
+            cx = float(rec.get("x_mm", 0.0))
+            cy = float(rec.get("y_mm", 0.0))
+            r = float(rec.get("diameter_mm", 0.0)) * 0.5
+            steps = 64
+            return [[
+                (cx + r * math.cos(2.0 * math.pi * k / steps),
+                 cy + r * math.sin(2.0 * math.pi * k / steps))
+                for k in range(steps)
+            ]]
+        if kind == "pad":
+            outline = rec.get("outline") or []
+            return [[(float(x), float(y)) for x, y in outline]]
+        shp = rec.get("_shape")
+        if shp is None:
+            self._primitive_prepared_shape(rec)
+            shp = rec.get("_shape")
+        rings: list[list[tuple[float, float]]] = []
+        if shp is not None:
+            polys = (list(shp.geoms)
+                     if shp.geom_type == "MultiPolygon" else [shp])
+            for poly in polys:
+                ext = getattr(poly, "exterior", None)
+                if ext is None or ext.is_empty:
+                    continue
+                rings.append([(float(x), float(y))
+                              for x, y in ext.coords])
+                for hole in getattr(poly, "interiors", []):
+                    if not hole.is_empty:
+                        rings.append([(float(x), float(y))
+                                      for x, y in hole.coords])
+        if not rings:
+            outline = rec.get("outline")
+            if outline:
+                rings = [[(float(x), float(y)) for x, y in outline]]
+        return rings
+
+    @staticmethod
+    def _fmt_mm(v) -> str:
+        try:
+            return f"{float(v):.3f} mm"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_xy(x, y) -> str:
+        try:
+            return f"({float(x):.3f}, {float(y):.3f}) mm"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_deg(v) -> str:
+        try:
+            return f"{float(v):.2f}°"
+        except (TypeError, ValueError):
+            return "—"
+
+    _PAD_SHAPE_NAMES = {
+        1: "Round",
+        2: "Rectangular",
+        3: "Octagonal",
+        9: "Rounded Rectangle",
+    }
+
+    def _layer_name_for_id(self, layer_id) -> str:
+        """Physical-layer name for ``layer_id`` (the inverse of
+        ``_phys_name_to_layer_id``). Returns the raw id as a string when
+        the layer isn't in the stackup map."""
+        if layer_id is None:
+            return "—"
+        try:
+            lid = int(layer_id)
+        except (TypeError, ValueError):
+            return str(layer_id)
+        for name, mapped in self._phys_name_to_layer_id.items():
+            if mapped == lid:
+                return name
+        return f"layer {lid}"
+
+    def _populate_copper_props_form(self, hit: dict) -> None:
+        """(Re)build the right-panel form describing the selected copper
+        primitive. Rows are kind-specific; the common header lists shape,
+        net, and layer (or layer span for via / PTH / multi-layer pad)."""
+        if not hasattr(self, "_copper_props_layout"):
+            return
+        lay = self._copper_props_layout
+        self._clear_layout(lay)
+
+        kind = hit.get("kind") or "?"
+        rec = hit.get("record") or {}
+        net = str(hit.get("net") or rec.get("net") or "")
+
+        kind_label = {
+            "track": "Track",
+            "arc": "Arc",
+            "fill": "Fill",
+            "region": "Region",
+            "shape_based_region": "Region (shape-based)",
+            "via": "Via",
+            "pth": "Through-hole pad",
+            "pad": "Pad",
+        }.get(kind, kind.title())
+
+        lay.addWidget(QLabel(f"<b>{_esc(kind_label)}</b>"))
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+
+        def add(label: str, value: str) -> None:
+            v = QLabel(value)
+            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            v.setWordWrap(True)
+            form.addRow(QLabel(label), v)
+
+        add("Net", net or "(no net)")
+
+        if kind in ("via", "pth"):
+            ls = self._layer_name_for_id(rec.get("layer_start"))
+            le = self._layer_name_for_id(rec.get("layer_end"))
+            add("Layer span", f"{ls} → {le}" if ls != le else ls)
+        elif kind == "pad":
+            ids = list(rec.get("layer_ids") or [])
+            if len(ids) <= 1:
+                add("Layer", self._layer_name_for_id(
+                    ids[0] if ids else hit.get("layer_id")))
+            else:
+                names = [self._layer_name_for_id(i) for i in ids]
+                add("Layers", ", ".join(names))
+        else:
+            add("Layer", self._layer_name_for_id(hit.get("layer_id")))
+
+        if kind == "track":
+            ax, ay = float(rec["ax"]), float(rec["ay"])
+            bx, by = float(rec["bx"]), float(rec["by"])
+            length = math.hypot(bx - ax, by - ay)
+            add("Start", self._fmt_xy(ax, ay))
+            add("End", self._fmt_xy(bx, by))
+            add("Width", self._fmt_mm(rec.get("width_mm")))
+            add("Length", self._fmt_mm(length))
+            if rec.get("is_polygon_outline"):
+                add("Polygon outline", "yes")
+            if rec.get("is_keepout"):
+                add("Keepout", "yes")
+        elif kind == "arc":
+            start_deg = float(rec.get("start_angle_deg", 0.0))
+            end_deg = float(rec.get("end_angle_deg", 0.0))
+            sweep = (end_deg - start_deg) % 360.0
+            if sweep == 0.0 and start_deg != end_deg:
+                sweep = 360.0
+            r = float(rec.get("radius_mm", 0.0))
+            arc_len = r * math.radians(sweep)
+            add("Center", self._fmt_xy(rec.get("cx"), rec.get("cy")))
+            add("Radius", self._fmt_mm(r))
+            add("Start angle", self._fmt_deg(start_deg))
+            add("End angle", self._fmt_deg(end_deg))
+            add("Sweep angle", self._fmt_deg(sweep))
+            add("Width", self._fmt_mm(rec.get("width_mm")))
+            add("Arc length", self._fmt_mm(arc_len))
+            if rec.get("is_keepout"):
+                add("Keepout", "yes")
+        elif kind == "fill":
+            x1 = float(rec.get("x1_mm", 0.0))
+            y1 = float(rec.get("y1_mm", 0.0))
+            x2 = float(rec.get("x2_mm", 0.0))
+            y2 = float(rec.get("y2_mm", 0.0))
+            add("Corner 1", self._fmt_xy(x1, y1))
+            add("Corner 2", self._fmt_xy(x2, y2))
+            add("Width", self._fmt_mm(abs(x2 - x1)))
+            add("Height", self._fmt_mm(abs(y2 - y1)))
+            add("Rotation", self._fmt_deg(rec.get("rotation_deg")))
+            add("Area", f"{abs((x2 - x1) * (y2 - y1)):.3f} mm²")
+            if rec.get("is_keepout"):
+                add("Keepout", "yes")
+        elif kind in ("region", "shape_based_region"):
+            outline = rec.get("outline") or []
+            shp = rec.get("_shape")
+            if shp is None:
+                self._primitive_prepared_shape(rec)
+                shp = rec.get("_shape")
+            add("Vertices", f"{len(outline)}")
+            if kind == "shape_based_region":
+                add("Arc edges", f"{int(rec.get('arc_edge_count', 0))}")
+            if shp is not None:
+                minx, miny, maxx, maxy = shp.bounds
+                add("Bounding box",
+                    f"x: {minx:.3f} → {maxx:.3f} mm\n"
+                    f"y: {miny:.3f} → {maxy:.3f} mm")
+                add("Area", f"{shp.area:.4f} mm²")
+            if rec.get("is_polygon_outline"):
+                add("Polygon outline", "yes")
+            if rec.get("is_keepout"):
+                add("Keepout", "yes")
+            if rec.get("is_board_cutout"):
+                add("Board cutout", "yes")
+        elif kind in ("via", "pth"):
+            add("Center",
+                self._fmt_xy(rec.get("x_mm"), rec.get("y_mm")))
+            add("Outer diameter", self._fmt_mm(rec.get("diameter_mm")))
+            add("Hole diameter",
+                self._fmt_mm(rec.get("hole_diameter_mm")))
+            if kind == "pth":
+                des = rec.get("designator")
+                if des:
+                    add("Designator", str(des))
+            else:
+                lbl = rec.get("ipc4761_label")
+                if lbl:
+                    add("IPC-4761", str(lbl))
+                fm = rec.get("fill_material")
+                if fm:
+                    add("Fill material", str(fm))
+        elif kind == "pad":
+            des = rec.get("designator")
+            if des:
+                add("Designator", str(des))
+            add("Center",
+                self._fmt_xy(rec.get("x_mm"), rec.get("y_mm")))
+            add("Width", self._fmt_mm(rec.get("width_mm")))
+            add("Height", self._fmt_mm(rec.get("height_mm")))
+            shape_code = int(rec.get("shape_code", 0) or 0)
+            add("Shape",
+                self._PAD_SHAPE_NAMES.get(shape_code,
+                                          f"code {shape_code}"))
+            add("Rotation", self._fmt_deg(rec.get("rotation_deg")))
+            if shape_code == 9:
+                add("Corner radius",
+                    f"{int(rec.get('corner_radius_pct', 0))}%")
+            if rec.get("is_through_hole"):
+                add("Hole diameter", self._fmt_mm(rec.get("hole_mm")))
+            if rec.get("is_smt"):
+                add("Mount", "SMT")
+            elif rec.get("is_through_hole"):
+                add("Mount", "Through-hole")
+
+        lay.addLayout(form)
+
+    def _select_copper_primitive(self, hit: dict) -> None:
+        """Store the click-selected primitive, push its dashed-yellow
+        outline to the GL viewer, populate the right-panel form, and
+        show the panel."""
+        self._copper_selection = hit
+        rings = self._primitive_outline_rings(hit)
+        self._gl_viewer.set_primitive_selection_outline(rings)
+        self._populate_copper_props_form(hit)
+        self._show_copper_props_layout()
+        self._position_editor_panel()
+        self._editor_panel.show()
+
+    def _clear_copper_selection(self) -> None:
+        """Drop any viewer-mode copper selection — clears the dashed-yellow
+        GL overlay, empties the right-panel form, and hides the panel
+        (unless editor mode is active, in which case the panel stays
+        visible with the PDN editor contents)."""
+        if self._copper_selection is None:
+            return
+        self._copper_selection = None
+        gl = getattr(self, "_gl_viewer", None)
+        if gl is not None:
+            gl.set_primitive_selection_outline(None)
+        lay = getattr(self, "_copper_props_layout", None)
+        if lay is not None:
+            self._clear_layout(lay)
+        if not self._editor_mode:
+            self._show_pdn_editor_layout()
+            panel = getattr(self, "_editor_panel", None)
+            if panel is not None:
+                panel.hide()
         """Editor-mode left-click: drop a pending free marker if one is
         armed, else select the component / placed marker / copper under
         the cursor."""
@@ -11896,13 +12574,20 @@ class PdnViewer(QMainWindow):
     def _on_gl_clicked(self, _world_x: float, _world_y: float) -> None:
         """Left-click in the viewport (no drag). In editor mode this drives
         component / copper selection and free-marker placement; in viewer
-        mode it just clears the Vias-tab jump highlight."""
+        mode it clears the Vias-tab jump highlight and runs the
+        copper-primitive picker — a hit opens the properties panel, a
+        miss closes any open one."""
         if self._editor_mode:
             self._on_editor_click(_world_x, _world_y)
             return
         if self._highlight_via_xy is not None:
             self._highlight_via_xy = None
             self._render()
+        hit = self._primitive_at_point(_world_x, _world_y)
+        if hit is not None:
+            self._select_copper_primitive(hit)
+        else:
+            self._clear_copper_selection()
 
     def _on_legend_row_clicked(self, key: str) -> None:
         """Toggle visibility of the marker category whose legend row was
@@ -11945,6 +12630,15 @@ class PdnViewer(QMainWindow):
             if (not event.isAutoRepeat()
                     and self.isActiveWindow()):
                 self._on_shift_pressed()
+        elif (et == QEvent.KeyPress and event.key() == Qt.Key_Escape
+              and not event.isAutoRepeat() and self.isActiveWindow()
+              and self._copper_selection is not None
+              and not self._editor_mode):
+            # Escape clears the viewer-mode copper selection (mirrors the
+            # "click off into empty space" close path). Consume the event
+            # so it doesn't bubble up and close the window.
+            self._clear_copper_selection()
+            return True
         elif et == QEvent.KeyRelease and event.key() == Qt.Key_Shift:
             if (not event.isAutoRepeat()
                     and self._measure_anchor_xy is not None):
@@ -11953,11 +12647,13 @@ class PdnViewer(QMainWindow):
             if self._measure_anchor_xy is not None:
                 self._on_shift_released()
         elif et == QEvent.Resize and obj is getattr(self, "_gl_viewer", None):
-            # Keep the colour-scale overlay pinned bottom-left and the
-            # editor-mode buttons pinned top-left as the GL viewer resizes
-            # (window resize, sidebar collapse, etc.).
+            # Keep the colour-scale overlay pinned bottom-left, the
+            # editor-mode buttons pinned top-left, and the editor /
+            # copper-properties panel pinned right edge as the GL viewer
+            # resizes (window resize, sidebar collapse, etc.).
             self._position_scale_overlay()
             self._position_editor_overlays()
+            self._position_editor_panel()
         return False
 
     def _position_scale_overlay(self) -> None:
@@ -11973,6 +12669,24 @@ class PdnViewer(QMainWindow):
         y = gl.height() - bar.height() - margin
         bar.move(margin, max(margin, y))
         bar.raise_()
+
+    def _position_editor_panel(self) -> None:
+        """Pin the right-hand editor / copper-properties panel to the GL
+        viewer's right edge, full height (minus margins). The panel is a
+        child of the GL viewer so it floats over the viewport rather than
+        consuming layout space — that keeps the visible copper from
+        shifting sideways when the panel appears / disappears. Wired to
+        every GL-viewer resize via :meth:`eventFilter`."""
+        panel = getattr(self, "_editor_panel", None)
+        gl = getattr(self, "_gl_viewer", None)
+        if panel is None or gl is None:
+            return
+        margin = 0
+        w = panel.width()
+        h = max(0, gl.height() - 2 * margin)
+        panel.setFixedHeight(max(h, 50))
+        panel.move(gl.width() - w - margin, margin)
+        panel.raise_()
 
     def closeEvent(self, event) -> None:
         """Uninstall the application-wide Shift filter on window close
@@ -13154,8 +13868,8 @@ class PdnViewer(QMainWindow):
         ("via_current_warn_a",
          "Via current warning level |I|",
          "A",
-         "Vias whose worst-segment current exceeds this threshold are "
-         "highlighted red in the Vias tab and contribute to the tab-title "
+         "Vias whose worst-segment current is at or above this threshold "
+         "are highlighted red in the Vias tab and contribute to the tab-title "
          "warning count."),
         ("display_percentile_high",
          "Heatmap colour-scale clip percentile",
@@ -13245,13 +13959,12 @@ class PdnViewer(QMainWindow):
             "little benefit on densely via-stitched planes. "
             "Off = uniform mesh (most accurate — the default)."
         )
+        self._settings_adaptive_check.toggled.connect(
+            self._on_settings_field_changed)
         _solve_layout = solve_box.layout()
         if _solve_layout is not None:
             _solve_layout.addRow(self._settings_adaptive_check)
         outer.addWidget(solve_box)
-
-        # ----- Sink load currents group -----
-        outer.addWidget(self._build_sinks_settings_box())
 
         # ----- Stackup copper-thickness group -----
         outer.addWidget(self._build_stackup_settings_box())
@@ -13347,6 +14060,12 @@ class PdnViewer(QMainWindow):
             f"            border: 1px solid {t['border']}; padding: 3px 6px;"
             f"            selection-background-color: {t['bg_selection']}; }}"
             f"QLineEdit:focus {{ border: 1px solid {t['accent']}; }}"
+            # Out-of-date field outline / colour: the dynamic ``dirty``
+            # property is toggled by _update_settings_field_styles when
+            # the field diverges from / matches the current solve.
+            f"QLineEdit[dirty=\"true\"] {{ border: 1px solid {t['warn_fg']}; }}"
+            f"QLineEdit[dirty=\"true\"]:focus {{ border: 1px solid {t['warn_fg']}; }}"
+            f"QCheckBox[dirty=\"true\"] {{ color: {t['warn_fg']}; }}"
         )
         return widget
 
@@ -13395,6 +14114,7 @@ class PdnViewer(QMainWindow):
             edit.setMaximumWidth(160)
             edit.setToolTip(tooltip)
             setattr(self, f"{attr_prefix}{key}", edit)
+            edit.textChanged.connect(self._on_settings_field_changed)
 
             _t = _T()
             row = QHBoxLayout()
@@ -13408,6 +14128,31 @@ class PdnViewer(QMainWindow):
                           f"(default: {self._fmt_settings_value(default_val)})</span>"
                           if default_val is not None else "")
             row.addWidget(hint)
+            if key == "via_current_warn_a":
+                # In-place re-check button: applies the new threshold to
+                # the Vias tab without a full re-solve. Hidden until the
+                # field diverges from the currently-applied level.
+                row.addSpacing(12)
+                btn = QPushButton("Re-run Via Check")
+                btn.setToolTip(
+                    "Re-check vias against the new warning level (no "
+                    "re-solve). Refreshes the Vias tab title, summary, "
+                    "and warning highlights in place."
+                )
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {_t['accent_btn']};"
+                    f"              color: {_t['fg_strong']};"
+                    f"              border: 1px solid {_t['accent_btn_hov']};"
+                    f"              padding: 3px 10px; font-weight: 600; }}"
+                    f"QPushButton:hover {{ background-color: {_t['accent_btn_hov']}; }}"
+                )
+                btn.clicked.connect(self._on_rerun_via_check)
+                btn.setVisible(False)
+                self._settings_rerun_via_check_btn = btn
+                row.addWidget(btn)
+                edit.textChanged.connect(
+                    lambda _t=None: self._update_via_check_btn_visibility()
+                )
             row.addStretch(1)
             row_widget = QWidget()
             row_widget.setLayout(row)
@@ -13830,6 +14575,7 @@ class PdnViewer(QMainWindow):
                              "thickness override has no effect on the "
                              "FEM until plane support lands.")
             edit.setToolTip(tooltip)
+            edit.textChanged.connect(self._on_settings_field_changed)
 
             self._stackup_thickness_edits[lid] = (edit, thk_mm)
 
@@ -13906,156 +14652,6 @@ class PdnViewer(QMainWindow):
         self._stackup_collapse_btn = header
         return wrap
 
-    def _build_sinks_settings_box(self) -> QWidget:
-        """List every SINK directive parsed from the project with an
-        editable load-current field (mA). Edits apply on the next press
-        of Re-run Solver — empty fields keep the existing value.
-
-        Sink overrides are keyed by ``(designator, schdoc, channel_index)``
-        so a board with two ``U1`` references across different schematics
-        — or one part with multiple indexed SINK channels (PDN_I, PDN1_I,
-        …) — still round-trips cleanly. The current value comes from the
-        metadata bundle so it reflects exactly what the FEM used for this
-        solve.
-
-        Wrapped in a click-to-expand collapsible section because boards
-        can have dozens of sinks and the user usually only needs to tweak
-        one or two.
-        """
-        # ``self._sink_current_edits`` maps
-        # (designator, schdoc, channel_index) → (QLineEdit, original_current_A).
-        # Used by _gather_settings_from_form to collect overrides and by
-        # _on_settings_reset to restore them.
-        self._sink_current_edits: dict[tuple[str, str, int | None],
-                                        tuple[QLineEdit, float]] = {}
-
-        sinks: list[dict] = []
-        if self.metadata:
-            for d in (self.metadata.get("directives") or []):
-                if d.get("role") == "SINK":
-                    sinks.append(d)
-
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 4, 0, 0)
-        body_layout.setSpacing(6)
-
-        count_text = ("no sinks" if not sinks
-                       else f"{len(sinks)} sink"
-                            + ("s" if len(sinks) != 1 else ""))
-        title = f"Sink load currents ({count_text})"
-
-        # ----- Empty-state ------------------------------------------------
-        if not sinks:
-            info = QLabel(
-                f"<i style='color:{_T()['fg_dim']};'>No SINK directives in this "
-                "project — nothing to override.</i>"
-            )
-            info.setWordWrap(True)
-            body_layout.addWidget(info)
-            # An empty section can't be edited, so don't bother making
-            # the user click — show it pre-expanded so they immediately
-            # see the explanation.
-            wrap, header = self._make_collapsible_section(
-                title, body, expanded=True,
-            )
-            self._sinks_collapse_btn = header
-            self._sinks_collapse_body = body
-            return wrap
-
-        # ----- Populated body --------------------------------------------
-        intro = QLabel(
-            "Type a new value in <b>mA</b> to override a sink's load "
-            "current. Empty (or unchanged) fields keep the existing "
-            "value. Set 0 mA to remove a load entirely."
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet(f"QLabel {{ color: {_T()['fg_label']}; }}")
-        body_layout.addWidget(intro)
-
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(6)
-
-        for d in sinks:
-            desig = str(d.get("designator", "?"))
-            schdoc = str(d.get("schdoc", ""))
-            ch_idx = d.get("channel_index")
-            label_text = str(d.get("label") or desig)
-            current_a = float(d.get("value", 0.0) or 0.0)
-            current_ma = current_a * 1000.0
-            # Net context — the first pin's net on the P terminal is a
-            # short label for "which rail does this sink load?". Falls
-            # back to the N terminal if P has no resolved pins.
-            terms = d.get("terminals") or {}
-            net_name = ""
-            for tname in ("P", "N"):
-                pins = (terms.get(tname) or {}).get("pins") or []
-                if pins:
-                    net_name = pins[0].get("net", "") or ""
-                    if net_name:
-                        break
-
-            edit = QLineEdit(self._fmt_settings_value(current_ma))
-            validator = QDoubleValidator(self)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            validator.setBottom(0.0)
-            edit.setValidator(validator)
-            edit.setMinimumWidth(110)
-            edit.setMaximumWidth(160)
-            edit.setToolTip(
-                f"Override the load current of {label_text} (originally "
-                f"{current_ma:g} mA). Press Re-run Solver to commit."
-            )
-
-            self._sink_current_edits[(desig, schdoc, ch_idx)] = (edit, current_a)
-
-            _t = _T()
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            row.addWidget(edit)
-            unit_lbl = QLabel("mA")
-            unit_lbl.setStyleSheet(f"QLabel {{ color: {_t['fg_muted']}; }}")
-            row.addWidget(unit_lbl)
-            row.addSpacing(8)
-            hint_bits = [f"was {self._fmt_settings_value(current_ma)} mA"]
-            if net_name:
-                hint_bits.append(
-                    f"on <code style='color:{_t['code']};'>{_esc(net_name)}</code>"
-                )
-            if schdoc:
-                hint_bits.append(_esc(schdoc))
-            hint = QLabel(
-                f"<span style='color:{_t['fg_hint']};'>({' · '.join(hint_bits)})</span>"
-            )
-            row.addWidget(hint)
-            row.addStretch(1)
-            row_widget = QWidget()
-            row_widget.setLayout(row)
-
-            label_widget = QLabel(label_text)
-            label_widget.setStyleSheet(
-                f"QLabel {{ color: {_t['fg']}; font-weight: 600; }}"
-            )
-            label_widget.setToolTip(
-                f"SINK directive {label_text}"
-                + (f" ({schdoc})" if schdoc else "")
-            )
-            form.addRow(label_widget, row_widget)
-
-        form_wrap = QWidget()
-        form_wrap.setLayout(form)
-        body_layout.addWidget(form_wrap)
-
-        wrap, header = self._make_collapsible_section(
-            title, body, expanded=False,
-        )
-        self._sinks_collapse_btn = header
-        self._sinks_collapse_body = body
-        return wrap
-
     @staticmethod
     def _fmt_settings_value(v) -> str:
         """Format a numeric setting for display in a QLineEdit. Uses %g
@@ -14090,11 +14686,6 @@ class PdnViewer(QMainWindow):
             edit = getattr(self, f"settings_edit_{key}", None)
             if edit is not None:
                 edit.setText(self._fmt_settings_value(display_defaults[key]))
-        # Restore sink-current fields to the values bundled with this
-        # solve's metadata (i.e. the project's annotated load currents).
-        for (edit, original_a) in getattr(
-                self, "_sink_current_edits", {}).values():
-            edit.setText(self._fmt_settings_value(original_a * 1000.0))
         # Restore stackup copper-thickness fields to metadata defaults.
         for (edit, original_mm) in getattr(
                 self, "_stackup_thickness_edits", {}).values():
@@ -14102,6 +14693,156 @@ class PdnViewer(QMainWindow):
         self._settings_status_label.setText(
             f"<span style='color:{_T()['accent']};'>Fields reset — press "
             "<b>Re-run Solver</b> to commit.</span>"
+        )
+
+    @staticmethod
+    def _mark_field_dirty(widget, dirty: bool) -> None:
+        """Set / clear the ``dirty`` dynamic property on a Settings-tab
+        widget and re-polish so the parent stylesheet's
+        ``[dirty="true"]`` selector kicks in (red outline / text)."""
+        new_val = "true" if dirty else "false"
+        if widget.property("dirty") == new_val:
+            return
+        widget.setProperty("dirty", new_val)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _update_settings_field_styles(self) -> bool:
+        """Walk every Settings-tab field, mark each one's ``dirty``
+        property True when it differs from the current solve baseline,
+        False otherwise. Bad input counts as dirty so the red outline
+        stays up while the user is mid-edit. Returns True iff any
+        field is dirty."""
+        any_dirty = False
+        mark = self._mark_field_dirty
+
+        for key, *_ in self._SETTINGS_FIELDS:
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is None:
+                continue
+            baseline = getattr(self._solve_settings, key, None)
+            if baseline is None:
+                mark(edit, False)
+                continue
+            try:
+                val = float(edit.text().strip())
+                dirty = abs(val - float(baseline)) > 1e-12
+            except ValueError:
+                dirty = True
+            mark(edit, dirty)
+            any_dirty = any_dirty or dirty
+
+        chk = getattr(self, "_settings_adaptive_check", None)
+        if chk is not None:
+            dirty = bool(chk.isChecked()) != bool(
+                getattr(self._solve_settings, "adaptive_mesh", False))
+            mark(chk, dirty)
+            any_dirty = any_dirty or dirty
+
+        for key, baseline in (
+            ("via_current_warn_a", self._via_current_warn_a),
+            ("display_percentile_high", self._display_percentile_high),
+        ):
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is None:
+                continue
+            try:
+                val = float(edit.text().strip())
+                dirty = abs(val - float(baseline)) > 1e-12
+            except ValueError:
+                dirty = True
+            mark(edit, dirty)
+            any_dirty = any_dirty or dirty
+
+        for _lid, (edit, original_mm) in getattr(
+                self, "_stackup_thickness_edits", {}).items():
+            text = edit.text().strip()
+            if not text:
+                mark(edit, False)
+                continue
+            try:
+                new_um = float(text)
+                dirty = abs(new_um / 1000.0 - original_mm) > 1.0e-6
+            except ValueError:
+                dirty = True
+            mark(edit, dirty)
+            any_dirty = any_dirty or dirty
+
+        return any_dirty
+
+    def _on_settings_field_changed(self, *_args) -> None:
+        """Slot wired to every Settings-tab editor's change signal:
+        refresh per-field dirty outlines and update ``_settings_dirty``
+        against the current solve baseline, then refresh the Resolve
+        overlay button."""
+        new_dirty = self._update_settings_field_styles()
+        if new_dirty == self._settings_dirty:
+            return
+        self._settings_dirty = new_dirty
+        self._refresh_solve_stale_overlay()
+
+    def _update_via_check_btn_visibility(self) -> None:
+        """Show the Re-run Via Check button only when the field value
+        differs from the currently-applied via warning threshold."""
+        btn = getattr(self, "_settings_rerun_via_check_btn", None)
+        edit = getattr(self, "settings_edit_via_current_warn_a", None)
+        if btn is None or edit is None:
+            return
+        try:
+            val = float(edit.text().strip())
+        except ValueError:
+            btn.setVisible(False)
+            return
+        btn.setVisible(abs(val - self._via_current_warn_a) > 1e-12)
+
+    def _on_rerun_via_check(self) -> None:
+        """Apply the new Via current warning level to the Vias tab in
+        place — no FEM re-solve. Updates the warning count in the tab
+        title, refreshes the filter checkbox label and summary line,
+        and re-styles the table cells against the new threshold."""
+        edit = getattr(self, "settings_edit_via_current_warn_a", None)
+        if edit is None:
+            return
+        text = edit.text().strip()
+        try:
+            new_warn = float(text)
+        except ValueError:
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['warn_fg']};'>Via current warning "
+                f"level: not a number ({text!r})</span>"
+            )
+            return
+        if new_warn < 0:
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['warn_fg']};'>Via current warning "
+                f"level must be ≥ 0</span>"
+            )
+            return
+        self._via_current_warn_a = new_warn
+        if hasattr(self, "vias_warn_only_box"):
+            self.vias_warn_only_box.setText(
+                f"Show only warnings (|I| ≥ {self._via_current_warn_a:g} A)"
+            )
+        if getattr(self, "_vias_table_populated", False):
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                self._populate_vias_table()
+            finally:
+                QApplication.restoreOverrideCursor()
+        else:
+            rows = self._get_or_compute_via_rows()
+            warn_count = sum(
+                1 for r in rows
+                if r.get("current") is not None
+                and abs(r["current"]) >= self._via_current_warn_a
+            )
+            self._vias_warn_count = warn_count
+            self._update_vias_tab_title(warn_count)
+        self._update_via_check_btn_visibility()
+        self._on_settings_field_changed()
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['accent']};'>Via check re-run "
+            f"against |I| ≥ {self._via_current_warn_a:g} A.</span>"
         )
 
     def _gather_stackup_overrides(self) -> dict[int, float]:
@@ -14133,40 +14874,11 @@ class PdnViewer(QMainWindow):
                 overrides[lid] = new_mm
         return overrides
 
-    def _gather_sink_overrides(self) -> dict[tuple[str, str, int | None], float]:
-        """Collect non-no-op sink-current overrides from the form.
-
-        Returns ``{(designator, schdoc, channel_index): current_amperes}``
-        for sinks whose field value differs from the original by more than
-        1 µA (the threshold filters out cosmetic re-format jitter like
-        ``25`` vs ``25.0``). Blank fields are treated as "no override".
-        Raises ``ValueError`` on un-parseable input.
-        """
-        overrides: dict[tuple[str, str, int | None], float] = {}
-        for key, (edit, original_a) in getattr(
-                self, "_sink_current_edits", {}).items():
-            text = edit.text().strip()
-            if not text:
-                continue
-            try:
-                new_ma = float(text)
-            except ValueError:
-                desig, _schdoc, ch_idx = key
-                label = desig if ch_idx is None else f"{desig}#{ch_idx}"
-                raise ValueError(
-                    f"sink {label}: not a number ({text!r})"
-                )
-            new_a = new_ma / 1000.0
-            if abs(new_a - original_a) > 1.0e-6:
-                overrides[key] = new_a
-        return overrides
-
     def _gather_settings_from_form(self) -> tuple[object, float, float,
-                                                   dict[tuple[str, str, int | None], float],
                                                    dict[int, float]]:
         """Read the current text in every Settings-tab QLineEdit and return
         ``(SolveSettings, via_current_warn_a, display_percentile,
-        sink_overrides, stackup_overrides)``. Raises ``ValueError``
+        stackup_overrides)``. Raises ``ValueError``
         (caught by the Re-run handler) on bad input."""
         from fypa.altium_loader import SolveSettings as _SolveSettings
         kwargs: dict[str, float] = {}
@@ -14202,9 +14914,8 @@ class PdnViewer(QMainWindow):
         if not (0.0 < pct <= 100.0):
             raise ValueError("Heatmap colour-scale clip percentile must "
                               "be in (0, 100]")
-        sink_overrides = self._gather_sink_overrides()
         stackup_overrides = self._gather_stackup_overrides()
-        return new_settings, warn_a, pct, sink_overrides, stackup_overrides
+        return new_settings, warn_a, pct, stackup_overrides
 
     # --- File menu ----------------------------------------------------------
 
@@ -14408,7 +15119,8 @@ class PdnViewer(QMainWindow):
         always re-extracts + re-solves. Uses the current viewer's
         SolveSettings + display knobs as defaults for the new viewer."""
         path_str, _ = QFileDialog.getOpenFileName(
-            self, "Open Altium project",
+            self,
+            "Import Altium project (clean)" if clean else "Import Altium project",
             self._menu_start_dir(),
             "Altium project (*.PrjPcb);;All files (*)",
         )
@@ -14771,10 +15483,9 @@ class PdnViewer(QMainWindow):
             return
 
         # 2. Read the form fields into a SolveSettings + display values
-        # + sink-current overrides + stackup overrides.
+        # + stackup overrides.
         try:
             (new_settings, warn_a, pct,
-             sink_overrides,
              stackup_overrides) = self._gather_settings_from_form()
         except ValueError as e:
             self._settings_status_label.setText(
@@ -14806,7 +15517,6 @@ class PdnViewer(QMainWindow):
                 pcbdoc_selector = str(pinned)
         self._start_solve_worker(
             prjpcb_path, new_settings, warn_a, pct,
-            sink_overrides=sink_overrides,
             stackup_overrides=stackup_overrides,
             pcbdoc_selector=pcbdoc_selector,
             dialog_title="Re-running solver",
@@ -14837,7 +15547,6 @@ class PdnViewer(QMainWindow):
 
         try:
             (new_settings, warn_a, pct,
-             sink_overrides,
              stackup_overrides) = self._gather_settings_from_form()
         except ValueError as e:
             self._settings_status_label.setText(
@@ -14860,7 +15569,6 @@ class PdnViewer(QMainWindow):
                 pcbdoc_selector = str(pinned)
         self._start_solve_worker(
             prjpcb_path, new_settings, warn_a, pct,
-            sink_overrides=sink_overrides,
             stackup_overrides=stackup_overrides,
             pcbdoc_selector=pcbdoc_selector,
             use_design_cache=False,
@@ -15797,7 +16505,7 @@ class PdnViewer(QMainWindow):
 
         filter_row.addSpacing(12)
         self.vias_warn_only_box = QCheckBox(
-            f"Show only warnings (|I| > {self._via_current_warn_a:g} A)"
+            f"Show only warnings (|I| ≥ {self._via_current_warn_a:g} A)"
         )
         self.vias_warn_only_box.toggled.connect(self._apply_vias_filter)
         filter_row.addWidget(self.vias_warn_only_box)
@@ -15869,7 +16577,7 @@ class PdnViewer(QMainWindow):
         warn_count = sum(
             1 for r in rows
             if r.get("current") is not None
-            and abs(r["current"]) > self._via_current_warn_a
+            and abs(r["current"]) >= self._via_current_warn_a
         )
         self._vias_warn_count = warn_count
         self._update_vias_tab_title(warn_count)
@@ -15910,7 +16618,7 @@ class PdnViewer(QMainWindow):
         warn_count = 0
         for r, row in enumerate(rows):
             is_warn = (row.get("current") is not None
-                       and abs(row["current"]) > self._via_current_warn_a)
+                       and abs(row["current"]) >= self._via_current_warn_a)
             if is_warn:
                 warn_count += 1
             # Clickable action cell. We stash the original row index on
@@ -16047,16 +16755,16 @@ class PdnViewer(QMainWindow):
             except (ValueError, AttributeError):
                 cur = 0.0
             rail_ok = allowed_nets is None or net in allowed_nets
-            warn_ok = (not warn_only) or abs(cur) > self._via_current_warn_a
+            warn_ok = (not warn_only) or abs(cur) >= self._via_current_warn_a
             hide = not (rail_ok and warn_ok)
             self.vias_table.setRowHidden(r, hide)
             if not hide:
                 visible += 1
-                if abs(cur) > self._via_current_warn_a:
+                if abs(cur) >= self._via_current_warn_a:
                     warn_visible += 1
         self.vias_summary_label.setText(
             f"{visible} via(s) shown of {self.vias_table.rowCount()} total — "
-            f"{warn_visible} above {self._via_current_warn_a:g} A"
+            f"{warn_visible} at or above {self._via_current_warn_a:g} A"
         )
 
     def _compute_via_report(self) -> list[dict]:
@@ -16866,7 +17574,7 @@ when one of those has focus.</p>
     that via in the Heatmap tab (enables its layer, zooms in, drops a
     yellow highlight ring &mdash; left-click anywhere to clear).
     The tab title also shows a warning count if any via current
-    exceeds the threshold.</li>
+    reaches the threshold.</li>
   <li><b>Settings</b> &mdash; tunable physics, meshing, and display
     options, plus per-layer copper thicknesses. Edits apply on the next
     solve: <b>Re-run Solver</b> re-solves with the new settings and

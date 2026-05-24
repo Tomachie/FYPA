@@ -644,6 +644,12 @@ class GLMeshViewer(QOpenGLWidget):
         # (or a non-component) is selected.
         self._editor_selection_bbox: tuple[
             float, float, float, float] | None = None
+        # World-mm closed rings outlining a click-selected copper primitive
+        # (viewer mode). Drawn as a dashed yellow polygon over the copper.
+        # ``None`` when nothing is selected. A track / arc gets one ring; a
+        # region-with-holes gets the outer ring plus one ring per hole.
+        self._primitive_selection_rings: list[
+            list[tuple[float, float]]] | None = None
         # Free-marker drag: the host registers a pure hit-test callback
         # (``world_x, world_y -> bool``); a left press over a marker is
         # claimed as a drag gesture instead of a pan / click, and the
@@ -1471,6 +1477,20 @@ class GLMeshViewer(QOpenGLWidget):
         if new == self._editor_selection_bbox:
             return
         self._editor_selection_bbox = new
+        self.update()
+
+    def set_primitive_selection_outline(self, rings) -> None:
+        """Set (or clear, with ``None``) the dashed-yellow outline drawn
+        over a click-selected copper primitive. ``rings`` is a list of
+        closed rings, each a list of ``(x_mm, y_mm)`` world-mm tuples.
+        No-op when unchanged so a redundant push doesn't repaint."""
+        if rings is None:
+            new = None
+        else:
+            new = [[(float(x), float(y)) for x, y in ring] for ring in rings]
+        if new == self._primitive_selection_rings:
+            return
+        self._primitive_selection_rings = new
         self.update()
 
     def set_measurement_line(self, x0: float, y0: float,
@@ -2486,6 +2506,7 @@ class GLMeshViewer(QOpenGLWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         self._draw_editor_grid(painter)
         self._draw_editor_selection(painter)
+        self._draw_primitive_selection(painter)
         self._draw_overlay_labels(painter)
         self._draw_markers(painter)
         self._draw_measurement_line(painter)
@@ -2573,6 +2594,38 @@ class GLMeshViewer(QOpenGLWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawPolygon(poly)
+        painter.restore()
+
+    def _draw_primitive_selection(self, painter: QPainter) -> None:
+        """Dashed yellow outline around the click-selected copper primitive.
+        World-mm rings (set via :meth:`set_primitive_selection_outline`)
+        projected to screen each frame, so the dashes track pan / zoom and
+        the 3D camera. Works in any view mode; same yellow + thickness as
+        the editor-mode selection box."""
+        if self._primitive_selection_rings is None:
+            return
+        painter.save()
+        pen = QPen(QColor("#ffff00"))
+        pen.setWidthF(_EDITOR_SELECTION_BOX_PX)
+        pen.setStyle(Qt.DashLine)
+        pen.setJoinStyle(Qt.MiterJoin)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        for ring in self._primitive_selection_rings:
+            if len(ring) < 2:
+                continue
+            poly = QPolygonF()
+            ok = True
+            for wx, wy in ring:
+                px, py = self.world_to_screen(wx, wy, 0.0)
+                if px < -1e8 or py < -1e8:   # behind 3D camera
+                    ok = False
+                    break
+                poly.append(QPointF(px, py))
+            if not ok or poly.size() < 2:
+                continue
+            painter.drawPolygon(poly)
         painter.restore()
 
     def _draw_measurement_line(self, painter: QPainter) -> None:

@@ -1536,7 +1536,136 @@ def build_solve_metadata(
                 "is_smt": bool(p.is_smt),
                 "designator": designator,
                 "net": _net_name(p.net_index),
+                "width_mm": float(p.width_mm),
+                "height_mm": float(p.height_mm),
+                "hole_mm": float(p.hole_mm),
+                "shape_code": int(p.shape),
+                "rotation_deg": float(p.rotation_deg),
+                "corner_radius_pct": int(p.corner_radius_pct),
+                "x_mm": float(p.center.x),
+                "y_mm": float(p.center.y),
             })
+
+    # Per-primitive copper records for the viewer's click-to-select
+    # feature. Mirrors the per-(layer, net) ``all_copper`` polygons but
+    # preserves individual track / arc / region / shape-based-region /
+    # fill records so the viewer can identify the exact primitive under
+    # the cursor and show its geometric properties. Vias and pads are
+    # already individually recorded above. Skips primitives with no net
+    # (``NO_NET``) since there is nothing useful to report on those.
+    primitives: dict[str, list[dict]] = {
+        "tracks": [],
+        "arcs": [],
+        "regions": [],
+        "shape_based_regions": [],
+        "fills": [],
+    }
+    for i, t in enumerate(proj.tracks):
+        _gil_yield(i)
+        if t.net_index == NO_NET:
+            continue
+        primitives["tracks"].append({
+            "id": len(primitives["tracks"]),
+            "kind": "track",
+            "layer_id": int(t.layer_id),
+            "net": _net_name(t.net_index),
+            "ax": float(t.a.x), "ay": float(t.a.y),
+            "bx": float(t.b.x), "by": float(t.b.y),
+            "width_mm": float(t.width_mm),
+            "is_polygon_outline": bool(t.is_polygon_outline),
+            "is_keepout": bool(t.is_keepout),
+        })
+    for i, a in enumerate(proj.arcs):
+        _gil_yield(i)
+        if a.net_index == NO_NET:
+            continue
+        primitives["arcs"].append({
+            "id": len(primitives["arcs"]),
+            "kind": "arc",
+            "layer_id": int(a.layer_id),
+            "net": _net_name(a.net_index),
+            "cx": float(a.center.x), "cy": float(a.center.y),
+            "radius_mm": float(a.radius_mm),
+            "start_angle_deg": float(a.start_angle_deg),
+            "end_angle_deg": float(a.end_angle_deg),
+            "width_mm": float(a.width_mm),
+            "is_keepout": bool(a.is_keepout),
+        })
+    for i, rg in enumerate(proj.regions):
+        _gil_yield(i)
+        if rg.net_index == NO_NET:
+            continue
+        primitives["regions"].append({
+            "id": len(primitives["regions"]),
+            "kind": "region",
+            "layer_id": int(rg.layer_id),
+            "net": _net_name(rg.net_index),
+            "outline": [[float(p.x), float(p.y)] for p in rg.outline],
+            "holes": [[[float(p.x), float(p.y)] for p in h]
+                      for h in rg.holes],
+            "kind_code": int(rg.kind),
+            "is_polygon_outline": bool(rg.is_polygon_outline),
+            "is_keepout": bool(rg.is_keepout),
+            "is_board_cutout": bool(rg.is_board_cutout),
+            "polygon_index": int(rg.polygon_index),
+        })
+    # Shape-based regions: outline can contain arc segments. The saved
+    # ``outline`` is a tessellated polyline (so the viewer can hit-test
+    # with a plain shapely polygon); ``arc_edge_count`` is reported in
+    # the properties panel.
+    for i, rg in enumerate(proj.shape_based_regions):
+        _gil_yield(i)
+        if rg.net_index == NO_NET:
+            continue
+        pts: list[list[float]] = []
+        arc_count = 0
+        n = len(rg.outline)
+        for vi in range(n):
+            v = rg.outline[vi]
+            pts.append([float(v.pos.x), float(v.pos.y)])
+            if v.is_arc:
+                arc_count += 1
+                start = math.radians(v.start_angle_deg)
+                end = math.radians(v.end_angle_deg)
+                sweep = end - start
+                if sweep <= 1e-9:
+                    sweep += 2.0 * math.pi
+                steps = max(2, int(abs(sweep) / math.radians(12.0)) + 1)
+                for k in range(1, steps):
+                    ang = start + sweep * k / steps
+                    pts.append([
+                        float(v.center.x) + v.radius_mm * math.cos(ang),
+                        float(v.center.y) + v.radius_mm * math.sin(ang),
+                    ])
+        primitives["shape_based_regions"].append({
+            "id": len(primitives["shape_based_regions"]),
+            "kind": "shape_based_region",
+            "layer_id": int(rg.layer_id),
+            "net": _net_name(rg.net_index),
+            "outline": pts,
+            "holes": [[[float(p.x), float(p.y)] for p in h]
+                      for h in rg.holes],
+            "arc_edge_count": arc_count,
+            "kind_code": int(rg.kind),
+            "is_polygon_outline": bool(rg.is_polygon_outline),
+            "is_keepout": bool(rg.is_keepout),
+            "is_board_cutout": bool(rg.is_board_cutout),
+            "polygon_index": int(rg.polygon_index),
+        })
+    for i, f in enumerate(proj.fills):
+        _gil_yield(i)
+        if f.net_index == NO_NET:
+            continue
+        primitives["fills"].append({
+            "id": len(primitives["fills"]),
+            "kind": "fill",
+            "layer_id": int(f.layer_id),
+            "net": _net_name(f.net_index),
+            "x1_mm": float(f.x1_mm), "y1_mm": float(f.y1_mm),
+            "x2_mm": float(f.x2_mm), "y2_mm": float(f.y2_mm),
+            "rotation_deg": float(f.rotation_deg),
+            "is_keepout": bool(f.is_keepout),
+        })
 
     via_coupling_count = sum(
         1 for n in problem.networks
@@ -1653,6 +1782,7 @@ def build_solve_metadata(
         "pads": pads_outline,
         "stubs": stubs,
         "all_copper": all_copper,
+        "primitives": primitives,
         # Overlays-control geometry (Heatmap tab): silkscreen lines,
         # component bounding boxes, reference-designator text.
         "silkscreen": overlay_records["silkscreen"],
