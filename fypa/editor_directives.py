@@ -364,12 +364,52 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
     nets = list(extracted.nets)
     name_to_index: dict[str, int] = {n.name: i for i, n in enumerate(nets)}
 
-    # Per-rename: ``layer_id`` and a prepared polygon representing the
-    # connected component of NO_NET copper containing the anchor.
-    # Primitives matching ``net_index == NO_NET`` and overlapping this
-    # polygon get re-pointed at the rename's net_index.
+    # Per-rename: ``layer_id`` and a prepared polygon representing one
+    # connected component of NO_NET copper. After flood-filling across
+    # vias / through-hole pads, a single rename can produce many match
+    # records (one per electrically-connected NO_NET component reached
+    # across layers). Primitives matching ``net_index == NO_NET`` and
+    # overlapping any of these polygons get re-pointed at the rename's
+    # net_index.
     matches: list[tuple[int, _sg.base.BaseGeometry, int]] = []
     enabled = extracted.enabled_copper_layer_ids()
+
+    from fypa.altium_geometry import MULTI_LAYER_PAD_LAYER_ID
+
+    def _bridge_layers_for_via(v) -> list[int]:
+        lo = min(v.layer_start, v.layer_end)
+        hi = max(v.layer_start, v.layer_end)
+        return [lid for lid in enabled if lo <= lid <= hi]
+
+    def _bridge_layers_for_pad(p) -> list[int]:
+        if p.is_through_hole or p.layer_id == MULTI_LAYER_PAD_LAYER_ID:
+            return list(enabled)
+        return [p.layer_id]
+
+    # Cross-layer bridges: vias + through-hole pads currently labelled
+    # NO_NET (Gerber-sourced projects haven't tagged them yet). Each
+    # bridge has a centre and the set of enabled layers it spans, so the
+    # flood-fill below can step from one layer's component to another's
+    # along the bridge.
+    no_net_bridges: list[tuple[_sg.Point, list[int]]] = []
+    for v in extracted.vias:
+        if v.net_index != NO_NET:
+            continue
+        layers = _bridge_layers_for_via(v)
+        if len(layers) <= 1:
+            continue
+        no_net_bridges.append(
+            (_sg.Point(float(v.center.x), float(v.center.y)), layers))
+    for p in extracted.pads:
+        if p.net_index != NO_NET:
+            continue
+        if not (p.is_through_hole or p.layer_id == MULTI_LAYER_PAD_LAYER_ID):
+            continue
+        layers = _bridge_layers_for_pad(p)
+        if len(layers) <= 1:
+            continue
+        no_net_bridges.append(
+            (_sg.Point(float(p.center.x), float(p.center.y)), layers))
 
     def _no_net_pieces_on_layer(layer_id: int):
         """Every NO_NET primitive's individual polygon on ``layer_id``.
@@ -413,6 +453,63 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
     # Per-layer union cache — multiple renames on the same layer reuse it.
     union_cache: dict[int, _sg.base.BaseGeometry] = {}
 
+    def _layer_components(lid: int) -> list[_sg.base.BaseGeometry]:
+        if lid not in union_cache:
+            pieces = _no_net_pieces_on_layer(lid)
+            if pieces:
+                union_cache[lid] = _sops.unary_union(pieces)
+            else:
+                union_cache[lid] = _sg.GeometryCollection()
+        unioned = union_cache[lid]
+        if unioned.is_empty:
+            return []
+        return (list(unioned.geoms)
+                if unioned.geom_type == "MultiPolygon"
+                else [unioned])
+
+    def _flood_components(seed_lid: int, seed_poly):
+        """Walk vias / THP pads to collect every NO_NET copper component
+        electrically connected to ``seed_poly`` on ``seed_lid``. The seed
+        is included in the result. Returns a list of
+        ``(layer_id, component_polygon)`` tuples."""
+        out: list[tuple[int, _sg.base.BaseGeometry]] = [(seed_lid, seed_poly)]
+        # Visited keyed by object identity — each unary_union produces
+        # distinct component geometries we can hash by id.
+        visited: set[tuple[int, int]] = {(seed_lid, id(seed_poly))}
+        frontier: list[tuple[int, _sg.base.BaseGeometry]] = [(seed_lid, seed_poly)]
+        while frontier:
+            cur_lid, cur_poly = frontier.pop()
+            for centre, span_layers in no_net_bridges:
+                if cur_lid not in span_layers:
+                    continue
+                try:
+                    if not cur_poly.contains(centre):
+                        continue
+                except Exception:
+                    continue
+                for other_lid in span_layers:
+                    if other_lid == cur_lid:
+                        continue
+                    for comp in _layer_components(other_lid):
+                        key = (other_lid, id(comp))
+                        if key in visited:
+                            continue
+                        if comp.is_empty:
+                            continue
+                        try:
+                            if comp.contains(centre):
+                                visited.add(key)
+                                out.append((other_lid, comp))
+                                frontier.append((other_lid, comp))
+                                break
+                        except Exception:
+                            continue
+        return out
+
+    # Visited across all renames so a later rename can't claim a component
+    # already absorbed into an earlier rename's flood (first wins).
+    claimed: set[tuple[int, int]] = set()
+
     for c in copper_names:
         layer_id = int(c.layer_id)
         if layer_id not in enabled:
@@ -420,14 +517,8 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
                 f"Copper rename {c.name!r}: layer {layer_id} is not in "
                 "the enabled copper stack; skipped.")
             continue
-        if layer_id not in union_cache:
-            pieces = _no_net_pieces_on_layer(layer_id)
-            if pieces:
-                union_cache[layer_id] = _sops.unary_union(pieces)
-            else:
-                union_cache[layer_id] = _sg.GeometryCollection()
-        unioned = union_cache[layer_id]
-        if unioned.is_empty:
+        components = _layer_components(layer_id)
+        if not components:
             warnings.append(
                 f"Copper rename {c.name!r}: no unnamed copper on layer "
                 f"{layer_id}; skipped.")
@@ -436,9 +527,6 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
         # the rename's anchor. Other disjoint NO_NET components stay
         # unaffected.
         anchor = _sg.Point(float(c.anchor_xy[0]), float(c.anchor_xy[1]))
-        components = (list(unioned.geoms)
-                      if unioned.geom_type == "MultiPolygon"
-                      else [unioned])
         match_poly = None
         for comp in components:
             if comp.is_empty:
@@ -464,7 +552,18 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
             nets.append(RawNet(name=c.name))
             net_idx = len(nets) - 1
             name_to_index[c.name] = net_idx
-        matches.append((layer_id, match_poly, net_idx))
+        # Flood from the anchor's component across vias / THP pads so
+        # connected NO_NET copper on adjacent layers picks up the same
+        # name. A via that lands on a NO_NET piece on one layer but on a
+        # *named* piece on another layer doesn't continue the flood — the
+        # named layer's polygon isn't part of the NO_NET union, so the
+        # frontier just stops there.
+        for lid, comp in _flood_components(layer_id, match_poly):
+            key = (lid, id(comp))
+            if key in claimed:
+                continue
+            claimed.add(key)
+            matches.append((lid, comp, net_idx))
 
     if not matches:
         # No anchors landed on NO_NET copper — every rename was a no-op
@@ -542,21 +641,15 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
     # build_problem drops these terminals and multi-layer rails stay
     # disconnected. On Altium-sourced projects vias arrive pre-tagged so
     # this loop is a no-op.
-    from fypa.altium_geometry import MULTI_LAYER_PAD_LAYER_ID
-
-    def _via_layers(v):
-        lo = min(v.layer_start, v.layer_end)
-        hi = max(v.layer_start, v.layer_end)
-        return [lid for lid in enabled if lo <= lid <= hi]
-
     def _retag_via(v):
         if v.net_index != NO_NET:
             return v
-        if not any(lid in rename_layers for lid in _via_layers(v)):
+        v_layers = _bridge_layers_for_via(v)
+        if not any(lid in rename_layers for lid in v_layers):
             return v
         anchor_pt = _sg.Point(float(v.center.x), float(v.center.y))
         for lid, match_poly, net_idx in matches:
-            if lid not in _via_layers(v):
+            if lid not in v_layers:
                 continue
             try:
                 if match_poly.contains(anchor_pt):
@@ -565,19 +658,15 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
                 continue
         return v
 
-    def _pad_layers(p):
-        if p.layer_id == MULTI_LAYER_PAD_LAYER_ID:
-            return list(enabled)
-        return [p.layer_id]
-
     def _retag_pad(p):
         if p.net_index != NO_NET:
             return p
-        if not any(lid in rename_layers for lid in _pad_layers(p)):
+        p_layers = _bridge_layers_for_pad(p)
+        if not any(lid in rename_layers for lid in p_layers):
             return p
         anchor_pt = _sg.Point(float(p.center.x), float(p.center.y))
         for lid, match_poly, net_idx in matches:
-            if lid not in _pad_layers(p):
+            if lid not in p_layers:
                 continue
             try:
                 if match_poly.contains(anchor_pt):

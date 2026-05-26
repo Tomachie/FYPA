@@ -67,7 +67,7 @@ _LAYER_ROLE_LABELS: list[tuple[int, str]] = (
         (LAYER_ID_SILK_TOP, "Top Silk"),
         (LAYER_ID_SILK_BOT, "Bottom Silk"),
         (LAYER_ID_OUTLINE, "Outline"),
-        (LAYER_ID_DRILL, "Drill (Excellon)"),
+        (LAYER_ID_DRILL, "Drill (Excellon or Gerber X2)"),
     ]
 )
 

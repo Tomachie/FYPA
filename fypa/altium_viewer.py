@@ -1428,15 +1428,28 @@ def _overlay_ribbon_offsets(polyline, half_w: float, *,
         prev_norm[0] = enorm[0]        # open start has no incoming edge
     bis = enorm + prev_norm
     blen = np.linalg.norm(bis, axis=1)
-    flat = blen < 1e-9
+    # Treat near-hairpins (incoming ≈ -outgoing) as flat. With a tiny
+    # 1e-9 threshold a vertex with ``blen`` just above 1e-9 normalises
+    # to a numerically arbitrary direction, so ``dot`` (below) can come
+    # out as a small *negative* — flipping the offset to the wrong
+    # side of the polyline and producing a long triangular spike at
+    # that one vertex. 1e-3 corresponds to a turn within ~0.06° of a
+    # perfect 180° reverse, well below any meaningful corner.
+    flat = blen < 1e-3
     bis[flat] = enorm[flat]
     blen[flat] = 1.0
     bis /= blen[:, None]
-    # Miter length = half_w / cos(theta/2); clamp so a sharp corner can't
-    # spike the offset out toward infinity.
+    # Miter length = half_w / cos(theta/2). Clamp by |dot| so noise on
+    # the sign cannot invert the offset; the bisector direction
+    # (already chosen on the outside of the polygon) is the only
+    # signed quantity we need to preserve. 0.5 caps the miter at
+    # 2 × half_w — anything sharper visibly spikes a triangular wedge
+    # into the polygon interior on dense pad/track outlines where
+    # cos(theta/2) crosses 0.25 (≈ a 150° turn) routinely. A 0.5 cap
+    # keeps full miters intact through 120° turns (more than enough
+    # for normal PCB corner geometry) and bevels harder turns flat.
     dot = np.einsum("ij,ij->i", bis, enorm)
-    dot = np.where(np.abs(dot) < 0.25,
-                   np.where(dot < 0.0, -0.25, 0.25), dot)
+    dot = np.maximum(np.abs(dot), 0.5)
     off = bis * (half_w / dot)[:, None]
     return pts, pts + off, pts - off
 
@@ -3018,6 +3031,12 @@ class _SolveProgressUpdater(QObject):
     Both counters tick once a second via a QTimer parented to ``self``
     (so it dies when the updater is deleted). Call :meth:`stop` from the
     worker's cleanup path to stop ticking before the dialog closes.
+
+    The dialog starts as an indeterminate barber-pole (the caller builds
+    it with range 0–0) and is upgraded to a determinate bar as soon as
+    the worker emits ``total_stages``. Each subsequent ``stage_changed``
+    ticks the bar one step; if the worker overruns its forecast, the
+    maximum is extended so progress is always monotonic.
     """
 
     def __init__(self, dlg: QProgressDialog, worker: _SolveWorker,
@@ -3027,6 +3046,14 @@ class _SolveProgressUpdater(QObject):
         self._stage_text: str = ""
         self._substage_text: str = ""
         self._stage_start: float = 0.0
+        # Determinate-bar bookkeeping: a stage counter that ticks once per
+        # stage_changed and a maximum that's set when the worker emits
+        # total_stages. Until then the dialog stays in barber-pole mode
+        # (range 0–0); the swap to a determinate bar happens the moment
+        # we hear back from the worker — typically within milliseconds of
+        # start().
+        self._stage_count: int = 0
+        self._stage_max: int = 0
         # Wall-clock start of the whole load, for the bottom-left total
         # counter. Set now (the dialog is already shown) so it counts
         # from the moment the dialog appears, not from the first stage.
@@ -3040,7 +3067,24 @@ class _SolveProgressUpdater(QObject):
         self._timer.start()
         worker.stage_changed.connect(self._on_stage)
         worker.substage_changed.connect(self._on_substage)
+        # Both _SolveWorker and _GerberImportWorker expose total_stages;
+        # duck-typed so a future worker that doesn't can still be used
+        # with this updater (the dialog just stays indeterminate).
+        if hasattr(worker, "total_stages"):
+            worker.total_stages.connect(self._on_total_stages)
         self._render()
+
+    def _on_total_stages(self, n: int) -> None:
+        if n <= 0:
+            return
+        self._stage_max = n
+        # setRange(0, N) flips QProgressDialog out of barber-pole mode
+        # into a determinate bar. Reflect whatever stages have already
+        # fired (rare in practice — total_stages is emitted at the top
+        # of run(), before any stage_changed) so the bar starts at the
+        # right position rather than snapping back to 0.
+        self._dlg.setRange(0, n)
+        self._dlg.setValue(min(self._stage_count, n))
 
     @staticmethod
     def _make_elapsed_label(dlg: QProgressDialog) -> QLabel:
@@ -3074,6 +3118,16 @@ class _SolveProgressUpdater(QObject):
         self._stage_text = text
         self._substage_text = ""
         self._stage_start = time.monotonic()
+        self._stage_count += 1
+        if self._stage_max > 0:
+            # If the worker emits more stages than _expected_stage_count
+            # forecast (e.g. an unexpected fallback branch), extend the
+            # maximum on the fly. We never shrink it, so visual progress
+            # only ever moves forward.
+            if self._stage_count > self._stage_max:
+                self._stage_max = self._stage_count
+                self._dlg.setMaximum(self._stage_max)
+            self._dlg.setValue(self._stage_count)
         self._render()
 
     def _on_substage(self, text: str) -> None:
@@ -3165,6 +3219,11 @@ class _SolveWorker(QThread):
                                           # under the main stage label (e.g.
                                           # pdnsolver's per-step log records
                                           # during meshing + solving)
+    total_stages = Signal(int)            # emitted once at run() start so the
+                                          # QProgressDialog can switch from
+                                          # indeterminate barber-pole to a
+                                          # determinate bar that ticks per
+                                          # stage_changed.
     finished_ok = Signal(object, object, object)  # (LeanSolution, metadata,
                                           # pristine LoadedProject | None)
     failed = Signal(str)                  # error message for the UI
@@ -3225,6 +3284,41 @@ class _SolveWorker(QThread):
         # (normal load / Re-run / clean), which load design info as before.
         self._loaded_project = loaded_project
 
+    def _expected_stage_count(self) -> int:
+        """Best-effort count of stage_changed emissions ``run()`` will fire,
+        used to scale the QProgressDialog bar. Branches that depend on
+        cache hit/miss (only known at runtime) are estimated by assuming
+        the miss path — i.e. the bar will read slightly under 100% on a
+        cache hit, which is acceptable since hits finish in <5 s anyway.
+        """
+        # "Checking solve cache…" — only when the fast-path is eligible.
+        fast_path_eligible = (self._try_solve_cache_first
+                              and not self._stackup_overrides
+                              and not self._sink_overrides
+                              and not self._editor_directives)
+        n = 1 if fast_path_eligible else 0
+        # Design-info: exactly one stage emitted in every variant
+        # (loaded reuse / cache hit message / "Checking…" / "Loading from disk…").
+        n += 1
+        # Save-design-info-cache stage fires after a fresh disk load when
+        # the design cache is enabled.
+        if self._use_design_cache and self._loaded_project is None:
+            n += 1
+        # One stage per override / directive application.
+        for opt in (self._stackup_overrides, self._sink_overrides,
+                    self._copper_names, self._editor_directives):
+            if opt:
+                n += 1
+        # Assemble FEM + mesh+solve + package metadata + package convert
+        # + opening viewer.
+        n += 5
+        # Save-solve-cache fires unless overrides / editor directives are
+        # active (which would poison the cached solve).
+        if not (self._stackup_overrides or self._sink_overrides
+                or self._editor_directives):
+            n += 1
+        return n
+
     def run(self) -> None:  # type: ignore[override]
         # Bias the OS scheduler toward the GUI thread. The packaging phase
         # (build_solve_metadata + to_lean_solution + cache pickle) is pure
@@ -3232,6 +3326,7 @@ class _SolveWorker(QThread):
         # thread starves, the QProgressDialog barber-pole pauses, and
         # Windows flags the window "Not Responding" on large boards.
         self.setPriority(QThread.LowPriority)
+        self.total_stages.emit(self._expected_stage_count())
         try:
             from fypa.altium.loader import (
                 build_problem,
@@ -3994,6 +4089,8 @@ class LauncherWindow(QMainWindow):
             " (Ctrl+O) to pick a <code>.PrjPcb</code>,<br>"
             f"<a href='open-project-clean' style='{link_style}'>Import Altium Design (Clean)&hellip;</a>"
             " (Ctrl+Shift+L) to force a fresh extract + solve,<br>"
+            f"<a href='import-gerber' style='{link_style}'>Import Gerber Files&hellip;</a>"
+            " (Ctrl+G) to import Gerber (RS-274X) + Excellon drill files,<br>"
             "or "
             f"<a href='open-solution' style='{link_style}'>Load Solution&hellip;</a>"
             " (Ctrl+Shift+O) to load a saved <code>.pkl</code>."
@@ -4046,6 +4143,8 @@ class LauncherWindow(QMainWindow):
             self._on_menu_open_project(clean=False)
         elif href == "open-project-clean":
             self._on_menu_open_project(clean=True)
+        elif href == "import-gerber":
+            self._on_menu_import_gerber()
         elif href == "open-solution":
             self._on_menu_open_solution()
 
@@ -4112,16 +4211,87 @@ class LauncherWindow(QMainWindow):
 
     def _on_menu_import_gerber(self) -> None:
         """File > Import Gerber Files…  —  picks Gerber + drill files,
-        runs the layer-mapping + stackup dialogs, builds a LoadedProject
-        and opens it in :class:`PdnViewer` with a stub solution. The user
-        can then add directives via editor mode and press Resolve."""
-        result = _perform_gerber_import(self)
-        if result is None:
+        runs the layer-mapping + stackup dialogs, then hands the heavy
+        per-layer render + geometry build off to a background
+        :class:`_GerberImportWorker` (so Windows doesn't flag the app
+        as not responding). A modal :class:`QProgressDialog` shows the
+        per-stage progress; on completion, the resulting viewer opens
+        and the launcher closes."""
+        picked = _pick_gerber_inputs(self)
+        if picked is None:
             return
-        stub_solution, metadata, loaded, pf = result
-        self._open_viewer_and_close(
-            stub_solution, metadata, loaded_project=loaded, project=pf,
+        result, pseudo = picked
+        dlg = QProgressDialog(
+            "Starting Gerber import…", "Cancel", 0, 0, self,
         )
+        dlg.setWindowTitle("Importing Gerber files")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.show()
+        QApplication.processEvents()
+        _sz = dlg.size()
+        # 2.5x Qt's default width — Gerber import stage labels are longer
+        # than the solve dialog's ("Rendering 16 Gerber layers…", etc.)
+        # and Qt's auto-sized width clips them.
+        dlg.setFixedSize(int(_sz.width() * 2.5), _sz.height())
+
+        worker = _GerberImportWorker(result, pseudo, parent=self)
+        updater = _SolveProgressUpdater(dlg, worker, self)
+        self._gerber_worker = worker
+        self._gerber_dlg = dlg
+        self._gerber_updater = updater
+
+        def _cleanup() -> None:
+            try:
+                updater.stop()
+                updater.deleteLater()
+            except Exception:
+                pass
+            try:
+                dlg.canceled.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            dlg.close()
+            worker.deleteLater()
+            self._gerber_worker = None
+            self._gerber_dlg = None
+            self._gerber_updater = None
+
+        def _on_ok(res) -> None:
+            stub_solution, metadata, loaded, pf = res
+            _cleanup()
+            self._open_viewer_and_close(
+                stub_solution, metadata,
+                loaded_project=loaded, project=pf,
+            )
+
+        def _on_fail(msg: str) -> None:
+            _cleanup()
+            QMessageBox.critical(
+                self, "Gerber import failed",
+                f"Could not finish the Gerber import:\n\n{msg}",
+            )
+
+        def _on_cancel() -> None:
+            # The heavy work uses a ProcessPoolExecutor and shapely calls
+            # that don't honour cooperative cancellation, so we let the
+            # worker run to completion in the background and just drop
+            # its result. The dialog is closed immediately for the user.
+            if self._gerber_worker is not None:
+                try:
+                    self._gerber_worker.finished_ok.disconnect(_on_ok)
+                    self._gerber_worker.failed.disconnect(_on_fail)
+                except (RuntimeError, TypeError):
+                    pass
+            _cleanup()
+
+        worker.finished_ok.connect(_on_ok)
+        worker.failed.connect(_on_fail)
+        dlg.canceled.connect(_on_cancel)
+        worker.start()
 
     def _on_menu_open_project(self, *, clean: bool = False) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
@@ -4508,6 +4678,14 @@ class PdnViewer(QMainWindow):
         # Net names currently highlighted (connected copper); everything
         # else renders dimmed. Empty = no highlight active.
         self._editor_highlight_nets: set[str] = set()
+        # Polygon identities currently highlighted as part of the same
+        # electrical net as the editor-mode selection. Keyed by
+        # ``(layer_id, id(poly_dict))`` — the poly dicts come from
+        # ``metadata['all_copper']`` and stay stable across renders.
+        # Used when the click lands on copper with no usable net name
+        # (e.g. Gerber-sourced ``"(none)"`` copper) so the dim mask can
+        # still distinguish the picked rail from disjoint unnamed pieces.
+        self._editor_highlight_polys: set[tuple[int, int]] = set()
         # "drop a free marker of this role on the next viewport click" —
         # None, or "SOURCE" / "SINK".
         self._editor_pending_marker: str | None = None
@@ -4763,9 +4941,8 @@ class PdnViewer(QMainWindow):
         # legend label (same value used as the LegendRow ``key``).
         self._hidden_legend_keys: set[str] = set()
         # Currently highlighted via location (world mm). When non-None,
-        # a yellow ring is drawn on the GL viewer at this point — always
-        # shown, even if "Show pin markers" is off. Cleared by another
-        # jump or by :meth:`_clear_via_highlight`.
+        # a yellow ring is drawn on the GL viewer at this point. Cleared
+        # by another jump or by :meth:`_clear_via_highlight`.
         self._highlight_via_xy: tuple[float, float] | None = None
 
         # Per-(physical, net) nearest-vertex voltage lookups, built lazily
@@ -5236,14 +5413,14 @@ class PdnViewer(QMainWindow):
         # affected by toggling it.
         self._sync_rail_only_visibility()
 
-        self.show_markers_box = QCheckBox("Show pin markers (I)")
-        self.show_markers_box.setChecked(True)
-        self.show_markers_box.setToolTip(
-            "When on, the directive pin markers (SOURCE / SINK / SERIES / "
-            "REGULATOR / VIA) and their legend are drawn on top of the "
-            "heatmap. Turn off for an unobstructed view of the copper."
+        self.via_span_box = QCheckBox("Show via span")
+        self.via_span_box.setChecked(False)
+        self.via_span_box.setToolTip(
+            "When on, each visible via is labelled with its copper-layer "
+            "span (e.g. 1:8 = layer 1 → layer 8, 1:2 = blind/buried L1→L2). "
+            "The label is drawn centred inside the via."
         )
-        side.addWidget(self.show_markers_box)
+        side.addWidget(self.via_span_box)
 
         self.cursor_tooltip_box = QCheckBox("Show cursor tooltip (T)")
         self.cursor_tooltip_box.setChecked(False)
@@ -5518,7 +5695,9 @@ class PdnViewer(QMainWindow):
         # programmatic checks without spamming renders.
         self.mode_combo.currentTextChanged.connect(self._render_with_busy_popup)
         self.rail_only_box.toggled.connect(self._render_with_busy_popup)
-        self.show_markers_box.toggled.connect(self._render)
+        self.via_span_box.toggled.connect(
+            lambda _checked: self._refresh_overlay_geometry(
+                self._visible_rails()))
         self.show_mesh_box.toggled.connect(
             lambda checked: self._gl_viewer.set_show_mesh_edges(checked)
         )
@@ -6494,9 +6673,11 @@ class PdnViewer(QMainWindow):
                 # per-net distinction, so editor-mode connectivity dim
                 # falls back to a per-rec emit on this path — the wire-
                 # mesh fill keeps the precise per-net dim anyway.
+                editor_dim_active = (self._editor_mode and (
+                    self._editor_highlight_nets
+                    or self._editor_highlight_polys))
                 if (solid and layer_alpha < 1.0
-                        and not (self._editor_mode
-                                  and self._editor_highlight_nets)):
+                        and not editor_dim_active):
                     merged = self._merged_solid_all_copper_tris(
                         name, recs, rail_members)
                     if merged is not None:
@@ -6507,6 +6688,7 @@ class PdnViewer(QMainWindow):
                     net = rec.get("net")
                     if net in rail_members:
                         continue
+                    rec_layer_id = rec.get("layer_id")
                     # Per-rec pump — a single layer on Corvette can have
                     # hundreds of all-copper records; without a pump in
                     # this loop the marquee freezes for the duration of
@@ -6515,9 +6697,14 @@ class PdnViewer(QMainWindow):
                     self._pump_busy_ui()
                     # Editor-mode connectivity focus: copper not connected
                     # to the current selection recedes toward the
-                    # background (mirrors the heatmap mesh dimming).
-                    rgb = self._editor_dim_rgb(lrgb, net)
+                    # background (mirrors the heatmap mesh dimming). The
+                    # dim choice is per-polygon — a record can hold both
+                    # highlighted and dimmed pieces when the user picked
+                    # one piece of unnamed copper but other disjoint
+                    # ``"(none)"`` pieces share the same record.
                     for poly in rec.get("polygons", []):
+                        rgb = self._editor_dim_rgb(
+                            lrgb, net, rec_layer_id, poly)
                         if solid:
                             _emit(self._triangulate_stub(poly), z, rgb,
                                   alpha=layer_alpha, **ac_bucket)
@@ -6543,6 +6730,9 @@ class PdnViewer(QMainWindow):
                 under_mesh_count=under_count)
         else:
             gv.clear_overlay_fills()
+        if getattr(self, "via_span_box", None) is not None \
+                and self.via_span_box.isChecked():
+            labels.extend(self._build_via_span_labels(rail_members))
         if labels:
             gv.set_overlay_labels(labels)
         else:
@@ -7294,6 +7484,9 @@ class PdnViewer(QMainWindow):
             self._probe_unit = unit
         self._layer_probes: list[dict] = []
 
+        is_stub = bool(
+            getattr(self.solution, "solver_info", {}).get("stub", False)
+        )
         if not phys_list or not rails:
             self._gl_viewer.clear_mesh()
             self._gl_viewer.clear_outlines()
@@ -7314,6 +7507,11 @@ class PdnViewer(QMainWindow):
             self._refresh_board_outline()
             if not phys_list:
                 self.summary_label.setText("(no layers selected)")
+            elif is_stub:
+                self.summary_label.setText(
+                    "(import complete — add Source / Sink directives "
+                    "and press Resolve to compute voltage distribution)"
+                )
             else:
                 self.summary_label.setText("(no rails selected)")
             return
@@ -7337,7 +7535,13 @@ class PdnViewer(QMainWindow):
             self._gl_viewer.set_overlay_top_right("")
             self._gl_viewer.clear_markers()
             self._refresh_board_outline()
-            self.summary_label.setText("(no mesh — selected layers have no copper on these rails)")
+            if is_stub:
+                self.summary_label.setText(
+                    "(import complete — press Resolve to compute "
+                    "voltage distribution for the placed directives)"
+                )
+            else:
+                self.summary_label.setText("(no mesh — selected layers have no copper on these rails)")
             return
 
         # Vertices referenced by at least one triangle. Orphan vertices
@@ -7570,9 +7774,6 @@ class PdnViewer(QMainWindow):
 
         # Markers + legend (also overlaid via the GLMeshViewer's QPainter
         # layer, so they don't trigger Qt's raster-fallback compositor).
-        # The Vias-tab "Go" highlight is appended regardless of the
-        # show_markers checkbox so the user can still find the via they
-        # just jumped to.
         self._update_markers_and_legend(phys_list, rails)
         _mark("markers_legend")
 
@@ -8739,13 +8940,22 @@ class PdnViewer(QMainWindow):
         """Constrained-Delaunay triangulate one OGC-valid shapely Polygon
         into a flat ``(N*3, 2)`` float32 GL_TRIANGLES vertex soup.
 
-        Returns an empty array if Triangle declines the polygon. The
-        caller must hand in geometry that is already valid — see
-        :meth:`_triangulate_stub` for the validity repair.
+        Returns an empty array only when both backends decline the
+        polygon. The caller must hand in geometry that is already valid —
+        see :meth:`_triangulate_stub` for the validity repair.
+
+        Primary backend is Shewchuk's Triangle (the ``triangle`` PyPI
+        package); on dense Gerber-derived pour rings it occasionally
+        declines the PSLG silently (returns no triangles) — the polygon
+        would then vanish from the all-copper overlay while remaining
+        pickable, since the picker tests Shapely containment. The GEOS
+        ``constrained_delaunay_triangles`` fallback is the same
+        backend the Gerber stub-solution pre-triangulation uses
+        successfully, so it picks up the cases Triangle drops.
         """
         verts, segs, hole_markers = self._poly_to_triangle_input(poly)
         if not verts or not segs:
-            return np.empty((0, 2), dtype=np.float32)
+            return self._triangulate_via_geos(poly)
         try:
             import triangle as _triangle
             tri_input: dict = {"vertices": verts, "segments": segs}
@@ -8762,12 +8972,40 @@ class PdnViewer(QMainWindow):
         out_verts = out.get("vertices") if out else None
         out_tris = out.get("triangles") if out else None
         if out_verts is None or out_tris is None or len(out_tris) == 0:
-            return np.empty((0, 2), dtype=np.float32)
+            return self._triangulate_via_geos(poly)
         v_arr = np.asarray(out_verts, dtype=np.float32)
         t_arr = np.asarray(out_tris, dtype=np.int32)
         # Expand the index list into a flat (N*3, 2) GL_TRIANGLES vertex
         # soup — matches the buffer layout the GL stub/overlay batch wants.
         return v_arr[t_arr.ravel()].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _triangulate_via_geos(poly) -> np.ndarray:
+        """GEOS constrained-Delaunay fallback for the Triangle-library
+        path in :meth:`_triangulate_simple_polygon`. Returns the same
+        flat ``(N*3, 2)`` float32 GL_TRIANGLES soup, or an empty array
+        if GEOS also can't triangulate the polygon."""
+        try:
+            import shapely
+            tri_coll = shapely.constrained_delaunay_triangles(poly)
+        except Exception:
+            return np.empty((0, 2), dtype=np.float32)
+        if tri_coll is None or tri_coll.is_empty:
+            return np.empty((0, 2), dtype=np.float32)
+        tris = list(getattr(tri_coll, "geoms", [tri_coll]))
+        coords: list[tuple[float, float]] = []
+        for t in tris:
+            if t.is_empty:
+                continue
+            ring = list(t.exterior.coords)
+            if len(ring) < 4:
+                continue
+            coords.append(ring[0])
+            coords.append(ring[1])
+            coords.append(ring[2])
+        if not coords:
+            return np.empty((0, 2), dtype=np.float32)
+        return np.asarray(coords, dtype=np.float32)
 
     @staticmethod
     def _poly_to_triangle_input(poly) -> tuple[
@@ -9552,11 +9790,10 @@ class PdnViewer(QMainWindow):
         """Build the marker overlay + legend for the current view and
         push both to the GL viewer.
 
-        Role markers (SOURCE / SINK / SERIES / REGULATOR) and the orange
-        via dots are gated behind the "Show pin markers" checkbox. The
-        Vias-tab "Go" highlight (a yellow ring at
-        :attr:`_highlight_via_xy`) is ALWAYS drawn regardless of that
-        checkbox so the user can still find a via they just jumped to.
+        Role markers (SOURCE / SINK / SERIES / REGULATOR), the orange
+        via dots, and the Vias-tab "Go" highlight (a yellow ring at
+        :attr:`_highlight_via_xy`) are drawn whenever a layer and rail
+        are selected.
 
         Each legend row is also a per-category visibility toggle: clicking
         a row sets :attr:`_hidden_legend_keys` and the matching marker
@@ -9591,7 +9828,6 @@ class PdnViewer(QMainWindow):
         self._marker_hover_index_cache = None
         hover_rows: list[dict] = []
 
-        show_role_markers = self.show_markers_box.isChecked()
         target_layer_ids: set[int] = set()
         for phys in phys_list:
             lid = self._phys_name_to_layer_id.get(phys)
@@ -9605,7 +9841,7 @@ class PdnViewer(QMainWindow):
         mode = self.mode_combo.currentText()
         is_via_current = (mode == _VIA_CURRENT_MODE)
 
-        if (show_role_markers and self.metadata is not None
+        if (self.metadata is not None
                 and phys_list and target_layer_ids):
             rail_members = set(self._effective_rail_members(rail_names))
 
@@ -9910,6 +10146,75 @@ class PdnViewer(QMainWindow):
             return outer
         return self._VIA_MARKER_FALLBACK_DIAM_MM
 
+    def _build_via_span_labels(self, rail_members: set[str]) -> list[dict]:
+        """Per-via ``"1:8"`` / ``"1:2"`` text labels, anchored at the via's
+        centre. Filters vias the same way the via markers do (span touches
+        any visible layer, rail-member net), then formats the span using
+        copper-layer ranks (1-based top→bottom). Text height is sized to
+        sit inside the drill barrel so the label visually lives in the via.
+
+        Returns label dicts in the format accepted by
+        :meth:`gl_mesh_viewer.GLMeshViewer.set_overlay_labels`.
+        """
+        if self.metadata is None:
+            return []
+        visible_phys = self._visible_layers()
+        target_layer_ids: set[int] = {
+            lid for lid in
+            (self._phys_name_to_layer_id.get(p) for p in visible_phys)
+            if lid is not None
+        }
+        if not target_layer_ids:
+            return []
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        labels: list[dict] = []
+        seen: set[tuple[float, float]] = set()
+        for v in self.metadata.get("vias", []):
+            ls = v.get("layer_start")
+            le = v.get("layer_end")
+            if ls is None or le is None:
+                continue
+            lo, hi = (ls, le) if ls <= le else (le, ls)
+            if not any(lo <= lid <= hi for lid in target_layer_ids):
+                continue
+            if rail_members and v.get("net") not in rail_members:
+                continue
+            x = float(v.get("x_mm", 0.0))
+            y = float(v.get("y_mm", 0.0))
+            key = (x, y)
+            if key in seen:
+                continue
+            seen.add(key)
+            start_phys = id_to_phys.get(ls)
+            end_phys = id_to_phys.get(le)
+            start_rank = self._phys_stackup_rank.get(start_phys, 0)
+            end_rank = self._phys_stackup_rank.get(end_phys, 0)
+            top_n = min(start_rank, end_rank) + 1
+            bot_n = max(start_rank, end_rank) + 1
+            text = f"{top_n}:{bot_n}"
+            diam = self._via_marker_diameter_mm(v)
+            # Height ≈ 55% of the drill barrel — comfortably inside the
+            # marker dot / cylinder cap, with room for a 2-digit:2-digit
+            # label on 10+ layer stacks.
+            height_mm = max(0.05, 0.55 * diam)
+            # Anchor at the via's top cap so a buried via (e.g. L2:L7)
+            # still gets its label sitting on the visible cylinder, not
+            # floating above the topmost copper layer.
+            top_phys = start_phys if start_rank <= end_rank else end_phys
+            z_top = self._layer_z_for(top_phys) if top_phys else 0.0
+            labels.append({
+                "x": x,
+                "y": y,
+                "z": z_top,
+                "text": text,
+                "color": "#ffffff",
+                "height_mm": height_mm,
+                "rotation_deg": 0.0,
+                "center": True,
+                "on_top": True,
+            })
+        return labels
+
     def _collect_via_positions(self, target_layer_id: int | None,
                                rail_members: set[str],
                                ) -> tuple[list[float], list[float],
@@ -10145,7 +10450,6 @@ class PdnViewer(QMainWindow):
             ("Ctrl+Alt+3", self._hotkey_3d_mode_preserving),
             ("0", self._hotkey_reset_3d_view),
             ("O", self._hotkey_toggle_outlines),
-            ("I", self._hotkey_toggle_markers),
             ("R", self._hotkey_toggle_rail_only),
             ("T", self._hotkey_toggle_cursor_tooltip),
             ("A", self._hotkey_toggle_arrows),
@@ -10221,9 +10525,6 @@ class PdnViewer(QMainWindow):
 
     def _hotkey_toggle_outlines(self) -> None:
         self._outlines_btn.toggle()
-
-    def _hotkey_toggle_markers(self) -> None:
-        self.show_markers_box.toggle()
 
     def _hotkey_toggle_rail_only(self) -> None:
         # No-op when the box is hidden — it's only hidden while toggling it
@@ -10484,6 +10785,14 @@ class PdnViewer(QMainWindow):
             self._clear_editor_highlight()
         else:
             self._update_pending_rails()
+            # Warm the connected-copper index now so the first selection
+            # click doesn't pay the one-time STRtree / union-find build
+            # cost — on big boards that's seconds of work the user would
+            # otherwise see as a click-to-highlight delay.
+            try:
+                self._connected_components_data()
+            except Exception:
+                pass
         # Source / sink free-marker buttons live in the viewport overlay
         # and are visible only while editor mode is active.
         for attr in ("_editor_add_source_btn", "_editor_add_sink_btn"):
@@ -10685,16 +10994,30 @@ class PdnViewer(QMainWindow):
         )
 
     def _editor_dim_rgb(self, rgb: tuple[float, float, float],
-                        net: str | None) -> tuple[float, float, float]:
+                        net: str | None,
+                        layer_id: int | None = None,
+                        poly: dict | None = None,
+                        ) -> tuple[float, float, float]:
         """Dim an all-copper overlay colour for editor-mode connectivity
         focus. With a selection highlight active, copper whose ``net`` is
         not in the highlight is blended toward the editor background — the
         same recede the heatmap mesh gets from :meth:`_editor_alpha_array`.
         Highlighted copper, and any time no highlight is active, is
-        returned unchanged."""
-        if not self._editor_mode or not self._editor_highlight_nets:
+        returned unchanged.
+
+        ``layer_id`` and ``poly``: when supplied, the polygon-identity
+        highlight set is consulted too. This is what keeps a single
+        unnamed-copper rail lit while disjoint unnamed pieces dim — the
+        net name alone (``"(none)"``) can't tell them apart."""
+        if not self._editor_mode:
             return rgb
-        if net in self._editor_highlight_nets:
+        if (not self._editor_highlight_nets
+                and not self._editor_highlight_polys):
+            return rgb
+        if net and net in self._editor_highlight_nets:
+            return rgb
+        if (poly is not None and layer_id is not None
+                and (int(layer_id), id(poly)) in self._editor_highlight_polys):
             return rgb
         f = _EDITOR_OVERLAY_DIM_ALPHA
         bg = _EDITOR_OVERLAY_DIM_BG
@@ -10785,47 +11108,245 @@ class PdnViewer(QMainWindow):
                     best, best_area = rec, area
         return best
 
+    def _all_copper_bridges(self) -> list[tuple[float, float, list[int]]]:
+        """Cached list of ``(x_mm, y_mm, span_layer_ids)`` for every via
+        and through-hole pad in the metadata. Used by the connected-copper
+        index — each entry is a candidate inter-layer bridge whose centre
+        may lie inside an ``all_copper`` polygon on multiple layers and
+        electrically couple them."""
+        cached = getattr(self, "_all_copper_bridges_cache", None)
+        if cached is not None:
+            return cached
+        md = self.metadata or {}
+        enabled_ids = sorted(self._phys_name_to_layer_id.values())
+        bridges: list[tuple[float, float, list[int]]] = []
+        for bucket in (md.get("vias") or [], md.get("pths") or []):
+            for rec in bucket:
+                ls = rec.get("layer_start")
+                le = rec.get("layer_end")
+                if ls is None or le is None:
+                    continue
+                lo, hi = (ls, le) if ls <= le else (le, ls)
+                span = [lid for lid in enabled_ids if lo <= lid <= hi]
+                if len(span) <= 1:
+                    continue
+                cx = rec.get("x_mm")
+                cy = rec.get("y_mm")
+                if cx is None or cy is None:
+                    continue
+                bridges.append((float(cx), float(cy), span))
+        self._all_copper_bridges_cache = bridges
+        return bridges
+
+    def _layer_strtrees(self) -> dict[int, dict]:
+        """Cached per-layer Shapely ``STRtree`` + parallel ``shapes`` and
+        ``polys`` lists for fast point-in-polygon lookup against the
+        ``all_copper`` overlay. Building a Polygon and an STRtree once
+        per layer collapses the O(polys × queries) point tests the flood
+        and click handlers used to do into ``O(log polys)`` candidate
+        prefilters."""
+        cached = getattr(self, "_layer_strtrees_cache", None)
+        if cached is not None:
+            return cached
+        import shapely.strtree as _st
+        md = self.metadata or {}
+        buckets: dict[int, dict] = {}
+        for rec in md.get("all_copper") or []:
+            lid = rec.get("layer_id")
+            if lid is None:
+                continue
+            b = buckets.setdefault(
+                int(lid), {"shapes": [], "polys": []})
+            for poly in rec.get("polygons", []):
+                ext = poly.get("exterior")
+                if ext is None or (hasattr(ext, "size") and ext.size == 0):
+                    continue
+                try:
+                    shp = _sg.Polygon(ext, poly.get("holes") or [])
+                except Exception:
+                    continue
+                if shp.is_empty:
+                    continue
+                b["shapes"].append(shp)
+                b["polys"].append(poly)
+        out: dict[int, dict] = {}
+        for lid, b in buckets.items():
+            if not b["shapes"]:
+                continue
+            out[lid] = {
+                "tree": _st.STRtree(b["shapes"]),
+                "shapes": b["shapes"],
+                "polys": b["polys"],
+            }
+        self._layer_strtrees_cache = out
+        return out
+
+    def _connected_components_data(self) -> dict:
+        """Cached connected-components decomposition of every
+        ``all_copper`` polygon, with vias and through-hole pads coupling
+        polygons across layers. Returns ``{component_of, members_of}``:
+        ``component_of[(layer, id(poly))]`` is the polygon's root key,
+        and ``members_of[root]`` is the set of polygons in that root's
+        component. Built once per viewer instance — every per-click
+        flood-fill collapses to a dict lookup against this index.
+
+        Polygons are coupled iff some via / THP centre lies inside both
+        of them on their respective layers. The boundary is treated as
+        inside (``intersects``, not ``contains``), so a via that drops
+        exactly on the edge of a pour still bridges the two layers."""
+        cached = getattr(self, "_cc_cache", None)
+        if cached is not None:
+            return cached
+        indexed = self._layer_strtrees()
+        bridges = self._all_copper_bridges()
+
+        parent: dict[tuple[int, int], tuple[int, int]] = {}
+        for lid, data in indexed.items():
+            for poly in data["polys"]:
+                key = (lid, id(poly))
+                parent[key] = key
+
+        def find(x):
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for cx, cy, span in bridges:
+            pt = _sg.Point(cx, cy)
+            hits: list[tuple[int, int]] = []
+            for lid in span:
+                data = indexed.get(lid)
+                if data is None:
+                    continue
+                try:
+                    cand = data["tree"].query(pt)
+                except Exception:
+                    continue
+                shapes = data["shapes"]
+                polys = data["polys"]
+                for j in cand:
+                    try:
+                        idx = int(j)
+                    except Exception:
+                        continue
+                    try:
+                        if shapes[idx].intersects(pt):
+                            hits.append((lid, id(polys[idx])))
+                            break
+                    except Exception:
+                        continue
+            for h in hits[1:]:
+                union(hits[0], h)
+
+        component_of: dict[tuple[int, int], tuple[int, int]] = {}
+        members_of: dict[tuple[int, int], set[tuple[int, int]]] = {}
+        for key in parent:
+            root = find(key)
+            component_of[key] = root
+            members_of.setdefault(root, set()).add(key)
+
+        cache = {"component_of": component_of, "members_of": members_of}
+        self._cc_cache = cache
+        return cache
+
+    def _connected_copper_polys(self, seed_layer_id: int, seed_poly: dict
+                                ) -> set[tuple[int, int]]:
+        """Every ``all_copper`` polygon electrically connected to
+        ``seed_poly`` on ``seed_layer_id`` — same component in the
+        cached union-find. Returns ``{(layer_id, id(poly_dict))}``,
+        always including the seed key itself."""
+        cc = self._connected_components_data()
+        seed_key = (int(seed_layer_id), id(seed_poly))
+        root = cc["component_of"].get(seed_key)
+        if root is None:
+            return {seed_key}
+        return set(cc["members_of"].get(root, {seed_key}))
+
+    def _copper_poly_under_point(self, world_x: float, world_y: float,
+                                  layer_id: int) -> dict | None:
+        """The ``all_copper`` polygon dict on ``layer_id`` containing the
+        point, or ``None``. STRtree-prefiltered so the cost is
+        ``O(log polys)`` per call rather than scanning every polygon on
+        the layer. Works for both ``"(none)"`` and named copper."""
+        indexed = self._layer_strtrees()
+        data = indexed.get(int(layer_id))
+        if data is None:
+            return None
+        pt = _sg.Point(float(world_x), float(world_y))
+        try:
+            cand = data["tree"].query(pt)
+        except Exception:
+            return None
+        shapes = data["shapes"]
+        polys = data["polys"]
+        for j in cand:
+            try:
+                idx = int(j)
+            except Exception:
+                continue
+            try:
+                if shapes[idx].intersects(pt):
+                    return polys[idx]
+            except Exception:
+                continue
+        return None
+
     def _copper_name_at(self, world_x: float, world_y: float,
                         layer_id: int | None):
         """The :class:`~fypa.project_file.CopperName` whose anchor sits
-        on the same ``"(none)"`` polygon as (``world_x``, ``world_y``,
+        on copper electrically connected to (``world_x``, ``world_y``,
         ``layer_id``), or ``None`` when none of the project's renames
-        apply here. Polygon match is by shapely containment of BOTH
-        points in the same ``all_copper`` polygon — disjoint unnamed
-        pieces with independent renames stay independent."""
+        apply here. "Connected" means the click polygon and the anchor
+        polygon are in the same via-coupled component — so a rename
+        placed on top-layer copper is also found when the user clicks
+        the same rail's bottom-layer piece."""
         if self._project is None or not self._project.copper_names:
             return None
         if layer_id is None:
             return None
-        md = self.metadata or {}
-        candidates = [c for c in self._project.copper_names
-                      if int(c.layer_id) == int(layer_id)]
-        if not candidates:
+        click_poly = self._copper_poly_under_point(world_x, world_y, layer_id)
+        if click_poly is None:
             return None
-        click = _sg.Point(float(world_x), float(world_y))
-        for rec in md.get("all_copper") or []:
-            if rec.get("layer_id") != int(layer_id):
+        cc = self._connected_components_data()
+        seed_key = (int(layer_id), id(click_poly))
+        root = cc["component_of"].get(seed_key)
+        if root is None:
+            return None
+        members = cc["members_of"].get(root)
+        if not members:
+            return None
+        indexed = self._layer_strtrees()
+        for c in self._project.copper_names:
+            clid = int(c.layer_id)
+            data = indexed.get(clid)
+            if data is None:
                 continue
-            if rec.get("net") != "(none)":
+            anchor = _sg.Point(float(c.anchor_xy[0]), float(c.anchor_xy[1]))
+            try:
+                cand = data["tree"].query(anchor)
+            except Exception:
                 continue
-            for poly in rec.get("polygons", []):
-                prepped = self._copper_poly_prepared(poly)
-                if prepped is None:
-                    continue
+            shapes = data["shapes"]
+            polys = data["polys"]
+            for j in cand:
                 try:
-                    if not prepped.contains(click):
-                        continue
+                    idx = int(j)
                 except Exception:
                     continue
-                for c in candidates:
-                    anchor = _sg.Point(float(c.anchor_xy[0]),
-                                       float(c.anchor_xy[1]))
-                    try:
-                        if prepped.contains(anchor):
+                try:
+                    if shapes[idx].intersects(anchor):
+                        if (clid, id(polys[idx])) in members:
                             return c
-                    except Exception:
-                        continue
-                return None
+                except Exception:
+                    continue
         return None
 
     def _copper_name_override(self, world_x: float, world_y: float,
@@ -11591,7 +12112,8 @@ class PdnViewer(QMainWindow):
         pick = self._visible_editor_copper_pick(world_x, world_y)
         if pick is not None and pick.get("net"):
             self._select_copper(pick["net"],
-                                anchor_xy=(world_x, world_y))
+                                anchor_xy=(world_x, world_y),
+                                layer_id=pick.get("layer_id"))
             return
         # Copper exists here but only on a hidden layer — mention it so
         # the user knows why nothing got selected, then fall through to
@@ -11639,9 +12161,26 @@ class PdnViewer(QMainWindow):
         edited (see :meth:`_populate_editor_form`)."""
         self._editor_selection = {"kind": "free", "id": directive.id}
         self._gl_viewer.set_primitive_selection_outline(None)
+        # An unnamed-copper marker carries ``p_net == "(none)"`` until the
+        # user runs Apply on the copper-name form. Use the polygon-identity
+        # highlight (computed from the anchor) instead of net-name dim so
+        # disjoint unnamed pieces don't all light up because they share
+        # the same sentinel name.
+        is_real_net = bool(directive.p_net) and directive.p_net != "(none)"
         highlight = (self._connected_nets(directive.p_net)
-                     if directive.p_net else set())
-        self._apply_editor_highlight(highlight)
+                     if is_real_net else set())
+        highlight_polys: set[tuple[int, int]] = set()
+        if (directive.anchor_xy is not None
+                and directive.layer_id is not None):
+            seed_poly = self._copper_poly_under_point(
+                float(directive.anchor_xy[0]),
+                float(directive.anchor_xy[1]),
+                int(directive.layer_id),
+            )
+            if seed_poly is not None:
+                highlight_polys = self._connected_copper_polys(
+                    int(directive.layer_id), seed_poly)
+        self._apply_editor_highlight(highlight, polys=highlight_polys)
         self._populate_editor_form()
 
     def _select_component(self, comp: dict) -> None:
@@ -11665,37 +12204,67 @@ class PdnViewer(QMainWindow):
         self._populate_editor_form()
 
     def _select_copper(self, net: str, hit: dict | None = None,
-                       anchor_xy: tuple[float, float] | None = None) -> None:
+                       anchor_xy: tuple[float, float] | None = None,
+                       layer_id: int | None = None) -> None:
         """Select a copper net for PDN editing and highlight every net
         connected to it. When ``hit`` is the primitive picker's result
         for the click, its outline is pushed to the GL viewer as the
         same dashed-yellow polygon used by viewer-mode copper selection.
         ``anchor_xy`` records the click point so the right-hand panel's
         copper-name form (shown only when ``net == "(none)"``) can pin
-        the rename to THIS polygon — its layer comes from the hit."""
+        the rename to THIS polygon — its layer comes from ``hit`` when
+        present, else from the explicit ``layer_id`` kwarg (callers that
+        resolved the click through the visibility-aware picker get a
+        layer but no primitive record).
+
+        Highlight = the connected ``all_copper`` polygons reached from
+        the click via the cached union-find. For named nets the existing
+        whole-net dim mask is also applied; for ``"(none)"`` we leave
+        the net set empty so disjoint unnamed pieces dim instead of all
+        lighting up because they share the same sentinel name."""
         sel: dict = {"kind": "copper", "net": net}
         if anchor_xy is not None:
             sel["anchor_xy"] = (float(anchor_xy[0]), float(anchor_xy[1]))
         if hit is not None and hit.get("layer_id") is not None:
-            sel["layer_id"] = int(hit["layer_id"])
+            layer_id = int(hit["layer_id"])
+        if layer_id is not None:
+            sel["layer_id"] = int(layer_id)
         self._editor_selection = sel
         rings = self._primitive_outline_rings(hit) if hit else None
         self._gl_viewer.set_primitive_selection_outline(rings)
-        self._apply_editor_highlight(self._connected_nets(net))
+        highlight_polys: set[tuple[int, int]] = set()
+        if layer_id is not None and anchor_xy is not None:
+            seed_poly = self._copper_poly_under_point(
+                anchor_xy[0], anchor_xy[1], int(layer_id))
+            if seed_poly is not None:
+                highlight_polys = self._connected_copper_polys(
+                    int(layer_id), seed_poly)
+        nets_hi = (set() if net == "(none)"
+                   else self._connected_nets(net))
+        self._apply_editor_highlight(nets_hi, polys=highlight_polys)
         self._populate_editor_form()
 
-    def _apply_editor_highlight(self, nets: set[str]) -> None:
+    def _apply_editor_highlight(self, nets: set[str],
+                                polys: set[tuple[int, int]] | None = None,
+                                ) -> None:
         """Set the connectivity highlight and re-render — non-connected
-        copper dims to 10%."""
+        copper dims to 10%. ``polys`` is an optional per-polygon highlight
+        set (``{(layer_id, id(poly_dict))}``) used to light up exactly the
+        connected pieces when the click landed on copper whose net name
+        alone can't pin them down (e.g. ``"(none)"``)."""
         self._editor_highlight_nets = set(nets)
+        self._editor_highlight_polys = set(polys or ())
         self._render()
         self._update_editor_panel()
 
     def _clear_editor_highlight(self) -> None:
         """Drop the connectivity highlight; copper returns to full opacity.
         Also clears the dashed-yellow outline set by a copper selection."""
-        if self._editor_highlight_nets:
-            self._editor_highlight_nets = set()
+        changed = bool(self._editor_highlight_nets
+                       or self._editor_highlight_polys)
+        self._editor_highlight_nets = set()
+        self._editor_highlight_polys = set()
+        if changed:
             self._render()
         self._gl_viewer.set_primitive_selection_outline(None)
 
@@ -12168,9 +12737,16 @@ class PdnViewer(QMainWindow):
         # highlight tracks it. Keep the form widgets in place (don't call
         # _populate_editor_form) — that preserves the user's text in the
         # field and keeps the success status visible until the next
-        # interaction.
+        # interaction. The metadata still holds the renamed pieces as
+        # ``"(none)"`` until the next solve, so we keep the polygon-based
+        # highlight set to light them up.
         sel["net"] = raw
-        self._apply_editor_highlight(self._connected_nets(raw))
+        highlight_polys: set[tuple[int, int]] = set()
+        seed_poly = self._copper_poly_under_point(anchor[0], anchor[1], layer_id)
+        if seed_poly is not None:
+            highlight_polys = self._connected_copper_polys(layer_id, seed_poly)
+        self._apply_editor_highlight(
+            self._connected_nets(raw), polys=highlight_polys)
         msg = f"Named — this copper is now <b>{_esc(raw)}</b>."
         if updated:
             msg += (f" Updated {updated} existing marker"
@@ -14305,8 +14881,6 @@ class PdnViewer(QMainWindow):
         idx = getattr(self, "_marker_hover_index_cache", None)
         if idx is None:
             return None
-        if not self.show_markers_box.isChecked():
-            return None
         mpp = self._mm_per_pixel
         if mpp <= 0.0:
             return None
@@ -15839,42 +16413,111 @@ class PdnViewer(QMainWindow):
         PdnViewer doesn't share LauncherWindow's ``_open_viewer_and_close``
         helper, so we open the new viewer directly and retire this one
         (the same pattern ``_on_solve_finished`` / ``_on_resolve_finished``
-        use)."""
-        result = _perform_gerber_import(self)
-        if result is None:
+        use). The heavy work runs on a :class:`_GerberImportWorker` with
+        a modal progress dialog so the existing viewer stays responsive
+        while the import is running."""
+        picked = _pick_gerber_inputs(self)
+        if picked is None:
             return
-        stub_solution, metadata, loaded, pf = result
+        result, pseudo = picked
         log = logging.getLogger(__name__)
-        prev_geometry = self.geometry()
-        prev_maximized = self.isMaximized()
-        prev_fullscreen = self.isFullScreen()
-        try:
-            new_win = PdnViewer(
-                stub_solution,
-                metadata=metadata,
-                loaded_project=loaded,
-                project=pf,
-            )
-            _register_viewer(new_win)
-            new_win.setGeometry(prev_geometry)
-            if prev_fullscreen:
-                new_win.showFullScreen()
-            elif prev_maximized:
-                new_win.showMaximized()
-            else:
-                new_win._pending_maximize = False
-                new_win.show()
-            _force_native_window_icon(new_win)
-            _set_window_aumid(new_win)
-        except Exception as e:
-            log.exception("Failed to open viewer after Gerber import")
+
+        dlg = QProgressDialog(
+            "Starting Gerber import…", "Cancel", 0, 0, self,
+        )
+        dlg.setWindowTitle("Importing Gerber files")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.show()
+        QApplication.processEvents()
+        _sz = dlg.size()
+        # 2.5x Qt's default width — Gerber import stage labels are longer
+        # than the solve dialog's ("Rendering 16 Gerber layers…", etc.)
+        # and Qt's auto-sized width clips them.
+        dlg.setFixedSize(int(_sz.width() * 2.5), _sz.height())
+
+        worker = _GerberImportWorker(result, pseudo, parent=self)
+        updater = _SolveProgressUpdater(dlg, worker, self)
+        self._gerber_worker = worker
+        self._gerber_dlg = dlg
+        self._gerber_updater = updater
+
+        def _cleanup() -> None:
+            try:
+                updater.stop()
+                updater.deleteLater()
+            except Exception:
+                pass
+            try:
+                dlg.canceled.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            dlg.close()
+            worker.deleteLater()
+            self._gerber_worker = None
+            self._gerber_dlg = None
+            self._gerber_updater = None
+
+        def _on_ok(res) -> None:
+            stub_solution, metadata, loaded, pf = res
+            _cleanup()
+            prev_geometry = self.geometry()
+            prev_maximized = self.isMaximized()
+            prev_fullscreen = self.isFullScreen()
+            try:
+                new_win = PdnViewer(
+                    stub_solution,
+                    metadata=metadata,
+                    loaded_project=loaded,
+                    project=pf,
+                )
+                _register_viewer(new_win)
+                new_win.setGeometry(prev_geometry)
+                if prev_fullscreen:
+                    new_win.showFullScreen()
+                elif prev_maximized:
+                    new_win.showMaximized()
+                else:
+                    new_win._pending_maximize = False
+                    new_win.show()
+                _force_native_window_icon(new_win)
+                _set_window_aumid(new_win)
+            except Exception as e:
+                log.exception("Failed to open viewer after Gerber import")
+                QMessageBox.critical(
+                    self, "Couldn't open viewer",
+                    "Gerber import succeeded but the viewer failed to "
+                    f"open:\n\n{type(e).__name__}: {e}",
+                )
+                return
+            QTimer.singleShot(0, lambda: _retire_viewer(self))
+
+        def _on_fail(msg: str) -> None:
+            _cleanup()
             QMessageBox.critical(
-                self, "Couldn't open viewer",
-                "Gerber import succeeded but the viewer failed to open:\n\n"
-                f"{type(e).__name__}: {e}",
+                self, "Gerber import failed",
+                f"Could not finish the Gerber import:\n\n{msg}",
             )
-            return
-        QTimer.singleShot(0, lambda: _retire_viewer(self))
+
+        def _on_cancel() -> None:
+            # ProcessPoolExecutor + Shapely don't honour cooperative
+            # cancellation. Drop the worker's signals so its result is
+            # discarded; let the work run to completion in the background.
+            if self._gerber_worker is not None:
+                try:
+                    self._gerber_worker.finished_ok.disconnect(_on_ok)
+                    self._gerber_worker.failed.disconnect(_on_fail)
+                except (RuntimeError, TypeError):
+                    pass
+            _cleanup()
+
+        worker.finished_ok.connect(_on_ok)
+        worker.failed.connect(_on_fail)
+        dlg.canceled.connect(_on_cancel)
+        worker.start()
 
     def _on_menu_open_project(self, *, clean: bool = False) -> None:
         """File > Import Altium Design[ (Clean)]  →  pick a .PrjPcb and open
@@ -18274,7 +18917,6 @@ _HELP_TAB_BODY = """
   <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>3</kbd></td><td>Switch to 3D <i>keeping the current view</i> (top-down entry)</td></tr>
   <tr><td><kbd>0</kbd></td><td>Reset the 3D view (top-down, refit to data) <span class='muted'>— 3D mode only</span></td></tr>
   <tr><td><kbd>O</kbd></td><td>Toggle <i>Show layer outlines</i></td></tr>
-  <tr><td><kbd>I</kbd></td><td>Toggle <i>Show pin markers</i></td></tr>
   <tr><td><kbd>R</kbd></td><td>Toggle <i>Show only rail net</i></td></tr>
   <tr><td><kbd>T</kbd></td><td>Toggle <i>Show cursor tooltip</i></td></tr>
   <tr><td><kbd>A</kbd></td><td>Toggle <i>Show current arrows</i></td></tr>
@@ -18330,8 +18972,6 @@ when one of those has focus.</p>
     Power Density.</li>
   <li><b>Show only rail net</b> &mdash; hide bridged sibling nets so
     you see just each selected rail's primary net.</li>
-  <li><b>Show pin markers</b> &mdash; SOURCE / SINK / SERIES /
-    REGULATOR / VIA overlays.</li>
   <li><b>Layer outlines</b> &mdash; the contour button on the
     <i>All Rails</i> row (hotkey <kbd>O</kbd>) traces each visible rail's
     copper polygons in the owning layer's swatch colour.</li>
@@ -18667,19 +19307,40 @@ def _triangulate_polygon_for_stub(poly):
     )
 
 
+def _triangulate_layer_for_stub_worker(polys):
+    """ProcessPool worker: triangulate every polygon in one layer.
+
+    Top-level (not a closure / method) so ``ProcessPoolExecutor`` can
+    pickle it on Windows-spawn. Skips empty results so the caller's
+    parallel arrays stay aligned.
+    """
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    for p in polys:
+        verts, tris = _triangulate_polygon_for_stub(p)
+        if verts.size == 0 or tris.size == 0:
+            continue
+        out.append((verts, tris))
+    return out
+
+
 def _build_stub_lean_solution_from_loaded(loaded):
     """Create a minimal :class:`LeanSolution` from a Gerber-derived
     LoadedProject so the viewer can open BEFORE the user has added any
     editor directives or pressed Resolve.
 
     The stub carries one :class:`LeanLayer` per copper layer with the
-    real geometry + conductance, plus a coarse constrained-Delaunay
-    triangulation per connected copper component so the renderer has
-    real triangles to push to the GPU. All per-vertex potentials are
-    zero — the heatmap is uniform until the user runs Resolve, at
-    which point the real solution replaces this stub. Visually the
-    user sees their copper, can pan / zoom, and use editor mode to
-    drop sources / sinks.
+    real geometry + conductance, and empty per-layer solution arrays.
+    Pre-solve there is no potentials field to interpolate, so we don't
+    pay for constrained-Delaunay triangulation here — the viewer
+    renders copper from ``metadata['all_copper']`` outline rings (the
+    same overlay the per-layer eye icon drives) until the user adds
+    directives and runs Resolve, at which point the FEM solver does
+    its own seeded triangulation.
+
+    ``solver_info`` carries the ``"stub": True`` sentinel so the viewer
+    can pick the right pre-solve messaging and overlay defaults; legacy
+    "all zeroes" fields are preserved for any code that still checks
+    them.
     """
     from fypa.lean_solution import (
         LeanLayer,
@@ -18687,9 +19348,13 @@ def _build_stub_lean_solution_from_loaded(loaded):
         LeanProblem,
         LeanSolution,
     )
+    log = logging.getLogger(__name__)
     lean_layers: list[LeanLayer] = []
-    lean_solutions: list[LeanLayerSolution] = []
-    for L in loaded.geometry:
+    t_geom0 = time.monotonic()
+    geom = loaded.geometry
+    log.info("Gerber stub: loaded.geometry access took %.2fs (%d layer(s))",
+             time.monotonic() - t_geom0, len(geom))
+    for L in geom:
         lean_layers.append(LeanLayer(
             name=f"{L.name}|(none)",
             conductance=L.conductance,
@@ -18698,51 +19363,88 @@ def _build_stub_lean_solution_from_loaded(loaded):
             is_plane=L.is_plane,
             plane_net_name=None,
         ))
-        polys = (list(L.shape.geoms)
-                 if hasattr(L.shape, "geoms")
-                 else [L.shape])
-        vertex_xys: list[np.ndarray] = []
-        triangles: list[np.ndarray] = []
-        potentials: list[np.ndarray] = []
-        power_densities: list = []
-        for p in polys:
-            verts, tris = _triangulate_polygon_for_stub(p)
-            if verts.size == 0 or tris.size == 0:
-                continue
-            vertex_xys.append(verts)
-            triangles.append(tris)
-            potentials.append(np.zeros(verts.shape[0], dtype=np.float64))
-            power_densities.append(None)
-        lean_solutions.append(LeanLayerSolution(
-            vertex_xys=vertex_xys,
-            triangles=triangles,
-            potentials=potentials,
-            power_densities=power_densities,
-        ))
+    lean_solutions = [
+        LeanLayerSolution(
+            vertex_xys=[], triangles=[], potentials=[], power_densities=[],
+        )
+        for _ in geom
+    ]
     return LeanSolution(
         problem=LeanProblem(
             layers=lean_layers,
             project_name=loaded.project_name,
         ),
         layer_solutions=lean_solutions,
-        solver_info={"ground_node_current": 0.0, "residual_norm": 0.0},
+        solver_info={
+            "stub": True,
+            "ground_node_current": 0.0,
+            "residual_norm": 0.0,
+        },
     )
 
 
-def _perform_gerber_import(parent_window) -> tuple | None:
-    """Run the Gerber file picker → dialog flow → extract → load chain.
+class _GerberImportWorker(QThread):
+    """Background worker that runs :func:`_finish_gerber_import` off the
+    GUI thread so a fresh-import doesn't freeze the application.
 
-    Returns ``(stub_solution, metadata, loaded_project, project_file)``
-    on success, ``None`` if the user cancelled at any point.
-
-    The caller is expected to feed the result through
-    :meth:`LauncherWindow._open_viewer_and_close` (or the equivalent
-    PdnViewer path), which constructs the ``PdnViewer`` and registers it.
+    The picker + layer-mapping dialogs must run on the main thread (Qt
+    modal widgets can't live on a worker), so the caller fans those out
+    first and only hands the chosen inputs to the worker. The worker
+    emits ``stage_changed`` / ``substage_changed`` to drive the progress
+    dialog, then ``finished_ok`` with the import result tuple or
+    ``failed`` with an error message.
     """
-    from fypa.gerber.extract import extract_gerber_project
+
+    stage_changed = Signal(str)
+    substage_changed = Signal(str)
+    total_stages = Signal(int)     # see _SolveWorker.total_stages
+    finished_ok = Signal(object)   # the (stub_sol, metadata, loaded, pf) tuple
+    failed = Signal(str)
+
+    # The Gerber import always emits the same nine stages — four from
+    # extract_gerber_project (render layers, build SBR records, read drills,
+    # build outline) and five from _finish_gerber_import (load project,
+    # build geometry, build all-copper records, build primitives index,
+    # opening viewer).
+    _EXPECTED_STAGES = 9
+
+    def __init__(self, picked_result, pseudo, parent=None) -> None:
+        super().__init__(parent)
+        self._picked_result = picked_result
+        self._pseudo = pseudo
+
+    def run(self) -> None:  # type: ignore[override]
+        # Match _SolveWorker's scheduler bias so the GUI thread keeps its
+        # ticks even while the import pool is hammering all cores.
+        self.setPriority(QThread.LowPriority)
+        self.total_stages.emit(self._EXPECTED_STAGES)
+        try:
+            def _cb(stage, substage):
+                if stage is not None:
+                    self.stage_changed.emit(stage)
+                if substage is not None:
+                    self.substage_changed.emit(substage)
+            result = _finish_gerber_import(
+                self._picked_result, self._pseudo, progress_cb=_cb,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).exception(
+                "Gerber import worker failed",
+            )
+            self.failed.emit(f"{type(e).__name__}: {e}")
+            return
+        self.finished_ok.emit(result)
+
+
+def _pick_gerber_inputs(parent_window):
+    """Run the Gerber file picker + layer/stackup dialogs on the main
+    GUI thread (modal Qt widgets cannot run on a worker thread).
+
+    Returns ``(result, pseudo_prjpcb_path)`` on success, ``None`` if the
+    user cancelled at any point. The caller then hands ``result`` to a
+    :class:`_GerberImportWorker` for the heavy off-thread work.
+    """
     from fypa.gerber.import_ui import run_gerber_import_dialogs
-    from fypa.gerber.loader import load_gerber_project
-    from fypa.project_file import ProjectFile
 
     paths_str, _ = QFileDialog.getOpenFileNames(
         parent_window,
@@ -18761,25 +19463,59 @@ def _perform_gerber_import(parent_window) -> tuple | None:
     result = run_gerber_import_dialogs(picked, parent=parent_window)
     if result is None:
         return None
-
     # Synthesise a pseudo-PrjPcb path next to the gerbers — the cache
     # key + project identity rely on having a stable Path, but no file
     # of that name needs to exist on disk.
     folder = picked[0].parent.resolve()
     pseudo = folder / f"{folder.name}.fypa-gerber"
+    return result, pseudo
 
+
+def _finish_gerber_import(result, pseudo, progress_cb=None) -> tuple:
+    """Heavy-lifting half of the Gerber import, safe to run on a worker
+    thread. Takes the result of :func:`_pick_gerber_inputs` plus an
+    optional ``progress_cb(stage, substage)`` that receives stage label
+    updates the GUI can show in a progress dialog.
+
+    Returns ``(stub_solution, metadata, loaded_project, project_file)``.
+    """
+    from fypa.gerber.extract import extract_gerber_project
+    from fypa.gerber.loader import load_gerber_project
+    from fypa.project_file import ProjectFile
+
+    def _progress(stage=None, substage=None):
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(stage, substage)
+        except Exception:
+            pass
+
+    _imp_log = logging.getLogger(__name__)
+    _imp_t0 = time.monotonic()
     extracted, warns = extract_gerber_project(
         copper_files=result.copper_files,
         drill_files=result.drill_files,
         outline_file=result.outline_file,
         stackup=result.stackup,
         pseudo_prjpcb_path=pseudo,
+        progress_cb=progress_cb,
     )
+    _imp_log.info("Gerber import: extract_gerber_project took %.2fs",
+                  time.monotonic() - _imp_t0)
     for w in warns:
-        logging.getLogger(__name__).warning("Gerber import: %s", w)
+        _imp_log.warning("Gerber import: %s", w)
 
+    _progress(stage="Loading project structure…", substage="")
+    _t = time.monotonic()
     loaded = load_gerber_project(extracted)
+    _imp_log.info("Gerber import: load_gerber_project took %.2fs",
+                  time.monotonic() - _t)
+    _progress(stage="Building per-layer geometry…", substage="")
+    _t = time.monotonic()
     stub_solution = _build_stub_lean_solution_from_loaded(loaded)
+    _imp_log.info("Gerber import: build_stub_lean_solution took %.2fs",
+                  time.monotonic() - _t)
 
     # all_copper records — the per-layer "all copper" overlay (second eye
     # icon on each physical layer in the side panel) is driven by this
@@ -18788,6 +19524,8 @@ def _perform_gerber_import(parent_window) -> tuple | None:
     # becomes one record with the NO_NET sentinel as the net name —
     # exactly the format build_solve_metadata produces for the Altium
     # path.
+    _progress(stage="Building all-copper outline records…", substage="")
+    _t = time.monotonic()
     all_copper: list[dict] = []
     for L in loaded.geometry:
         if L.shape is None or L.shape.is_empty:
@@ -18796,6 +19534,7 @@ def _perform_gerber_import(parent_window) -> tuple | None:
                  if L.shape.geom_type == "MultiPolygon"
                  else [L.shape])
         ring_polys: list[dict] = []
+        layer_hole_count = 0
         for poly in polys:
             ext = getattr(poly, "exterior", None)
             if ext is None or ext.is_empty:
@@ -18810,7 +19549,10 @@ def _perform_gerber_import(parent_window) -> tuple | None:
                 h_arr = np.asarray(list(hole.coords), dtype=np.float32)
                 if h_arr.shape[0] >= 2:
                     holes_arr.append(h_arr)
+            layer_hole_count += len(holes_arr)
             ring_polys.append({"exterior": ext_arr, "holes": holes_arr})
+        _imp_log.info("Gerber all_copper: layer %d → %d polygon(s), %d hole-ring(s)",
+                      int(L.layer_id), len(ring_polys), layer_hole_count)
         if not ring_polys:
             continue
         all_copper.append({
@@ -18818,6 +19560,8 @@ def _perform_gerber_import(parent_window) -> tuple | None:
             "net": "(none)",
             "polygons": ring_polys,
         })
+    _imp_log.info("Gerber import: all_copper records built in %.2fs (%d layer(s))",
+                  time.monotonic() - _t, len(all_copper))
 
     # Stackup rows — the viewer reads ``layer_id`` + ``name`` to map
     # physical-layer display names to the layer ids used by all_copper /
@@ -18853,6 +19597,8 @@ def _perform_gerber_import(parent_window) -> tuple | None:
     # reaches us). Format matches what altium.loader.build_solve_metadata
     # produces for the Altium path so _primitives_index walks them the
     # same way.
+    _progress(stage="Building primitives index…", substage="")
+    _t = time.monotonic()
     sbr_records: list[dict] = []
     for i, rg in enumerate(extracted.shape_based_regions):
         outline_pts = [[float(v.pos.x), float(v.pos.y)] for v in rg.outline]
@@ -18874,6 +19620,30 @@ def _perform_gerber_import(parent_window) -> tuple | None:
         "tracks": [], "arcs": [], "regions": [],
         "shape_based_regions": sbr_records, "fills": [],
     }
+    _imp_log.info("Gerber import: sbr_records built in %.2fs (%d record(s))",
+                  time.monotonic() - _t, len(sbr_records))
+
+    # Via records — what the 2D overlay (Board Features → Vias) and the 3D
+    # via-cylinder pass both iterate. Mirrors the shape build_solve_metadata
+    # emits for the Altium path (loader.py), minus solve-only fields like
+    # ``segments`` (no FEM has run yet). Empty ``segments`` is fine — the
+    # rendering paths gate per-segment styling on the list being non-empty.
+    vias_records: list[dict] = []
+    for v in extracted.vias:
+        vias_records.append({
+            "x_mm": float(v.center.x),
+            "y_mm": float(v.center.y),
+            "net": "(none)",
+            "diameter_mm": float(v.diameter_mm),
+            "hole_diameter_mm": float(v.hole_diameter_mm),
+            "layer_start": int(v.layer_start),
+            "layer_end": int(v.layer_end),
+            "segments": [],
+            "ipc4761_via_type": 0,
+            "ipc4761_label": "—",
+            "fill_material": "",
+            "is_conductive_fill": False,
+        })
 
     metadata: dict = {
         "source_kind": "gerber",
@@ -18883,11 +19653,19 @@ def _perform_gerber_import(parent_window) -> tuple | None:
         "all_copper": all_copper,
         "stackup": stackup_rows,
         "primitives": primitives,
+        "vias": vias_records,
+        # Gerber imports have no through-hole pad records (the extract
+        # docstring leaves pads/components empty); keep the key present so
+        # viewer code that iterates ``metadata['pths']`` doesn't have to
+        # special-case the source kind.
+        "pths": [],
         # Help the Setup tab show something meaningful.
         "gerber_files": [str(p) for p in result.copper_files.values()],
         "drill_files": [str(p) for p in result.drill_files],
         "outline_file": (str(result.outline_file)
                          if result.outline_file else None),
+        "board_outline": [[float(p.x), float(p.y)]
+                          for p in extracted.board_outline],
     }
 
     pf = ProjectFile(
@@ -18910,7 +19688,22 @@ def _perform_gerber_import(parent_window) -> tuple | None:
             for s in result.stackup
         ],
     )
+    _progress(stage="Opening viewer…", substage="")
+    _imp_log.info("Gerber import: total _finish_gerber_import took %.2fs",
+                  time.monotonic() - _imp_t0)
     return stub_solution, metadata, loaded, pf
+
+
+def _perform_gerber_import(parent_window) -> tuple | None:
+    """Legacy synchronous helper kept for callers that still expect a
+    blocking import. New code should use :func:`_pick_gerber_inputs`
+    plus a :class:`_GerberImportWorker` so the GUI doesn't freeze.
+    """
+    picked = _pick_gerber_inputs(parent_window)
+    if picked is None:
+        return None
+    result, pseudo = picked
+    return _finish_gerber_import(result, pseudo)
 
 
 def main(solution, warnings_list=None, metadata=None,

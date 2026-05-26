@@ -250,7 +250,7 @@ _EDITOR_BG_HEX = "#272735"
 # marker's edge thickness (altium_viewer._EDITOR_MARKER_EDGE_W ×
 # _EDITOR_MARKER_SELECT_SCALE) so the two selection cues read as one
 # consistent style.
-_EDITOR_SELECTION_BOX_PX = 3.6
+_EDITOR_SELECTION_BOX_PX = 2.0 #3.6
 
 # Width (device px) of the layer / pad / stub outline overlay. glLineWidth
 # past 1.0 raises GL_INVALID_VALUE on Core profile drivers, so the width
@@ -2507,8 +2507,11 @@ class GLMeshViewer(QOpenGLWidget):
         self._draw_editor_grid(painter)
         self._draw_editor_selection(painter)
         self._draw_primitive_selection(painter)
-        self._draw_overlay_labels(painter)
+        self._draw_overlay_labels(painter, on_top=False)
         self._draw_markers(painter)
+        # Second label pass: ``on_top`` labels (e.g. via-span text) sit
+        # above the marker dots so they stay legible inside the via.
+        self._draw_overlay_labels(painter, on_top=True)
         self._draw_measurement_line(painter)
         self._draw_overlay_chip(
             painter, self._overlay_top_left_html, anchor_right=False
@@ -2658,12 +2661,20 @@ class GLMeshViewer(QOpenGLWidget):
         painter.drawEllipse(QPointF(x0_px, y0_px), 3.0, 3.0)
         painter.restore()
 
-    def _draw_overlay_labels(self, painter: QPainter) -> None:
+    def _draw_overlay_labels(self, painter: QPainter,
+                              on_top: bool = False) -> None:
         """Draw the overlay text labels (reference designators) as world-
         anchored text that tracks pan / zoom. The font size follows each
         label's world-mm height; labels too small to read at the current
         zoom are skipped (keeps the canvas uncluttered and the painter
-        cheap on dense boards)."""
+        cheap on dense boards).
+
+        ``on_top`` selects which pass to draw: ``False`` for labels that
+        sit beneath the marker dots (silkscreen designators), ``True``
+        for labels that need to sit above them (via-span text inside the
+        via). Labels opt in to the top pass with ``on_top: True`` in the
+        label dict; everything else defaults to the under pass.
+        """
         if not self._overlay_labels:
             return
         mpp = max(float(self._mm_per_pixel), 1e-9)
@@ -2671,6 +2682,8 @@ class GLMeshViewer(QOpenGLWidget):
         painter.save()
         font = QFont(painter.font())
         for lab in self._overlay_labels:
+            if bool(lab.get("on_top", False)) != on_top:
+                continue
             text = lab.get("text") or ""
             if not text:
                 continue
@@ -2688,14 +2701,27 @@ class GLMeshViewer(QOpenGLWidget):
             painter.setFont(font)
             painter.setPen(QPen(QColor(lab.get("color", "#d0d0d0"))))
             rot = float(lab.get("rotation_deg", 0.0) or 0.0) % 360.0
+            centered = bool(lab.get("center", False))
+            if centered:
+                fm = QFontMetricsF(font)
+                tw = fm.horizontalAdvance(text)
+                # Cap-height-based vertical centre — keeps the glyph body
+                # visually centred on the anchor instead of dropping the
+                # baseline onto it.
+                th = fm.capHeight() if fm.capHeight() > 0 else fm.ascent()
+                dx = -tw * 0.5
+                dy = th * 0.5
+            else:
+                dx = 0.0
+                dy = 0.0
             if rot != 0.0:
                 painter.save()
                 painter.translate(px, py)
                 painter.rotate(-rot)  # screen y is down; Altium rotates CCW
-                painter.drawText(QPointF(0.0, 0.0), text)
+                painter.drawText(QPointF(dx, dy), text)
                 painter.restore()
             else:
-                painter.drawText(QPointF(px, py), text)
+                painter.drawText(QPointF(px + dx, py + dy), text)
         painter.restore()
 
     def _draw_markers(self, painter: QPainter) -> None:

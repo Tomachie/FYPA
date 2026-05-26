@@ -34,8 +34,11 @@ Layer IDs follow the Altium convention used everywhere else in FYPA:
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,6 +120,16 @@ _CLASSIFIER_RULES: list[tuple[re.Pattern[str], int, int | None]] = [
     (_re(r"\.xln$"), LAYER_ID_DRILL, None),
     (_re(r"\.tap$"), LAYER_ID_DRILL, None),
     (_re(r"\.nc$"), LAYER_ID_DRILL, None),
+    # Drill — Gerber X2 (Altium emits .GBR<n> with %TF.FileFunction,…,Drill*%
+    # for PTH / NPTH / blind / buried / microvia drill data — these carry the
+    # actual drill coordinates AND the layer span per file).
+    (_re(r"\.gbr\d+$"), LAYER_ID_DRILL, None),
+    # Drill *drawing* (.GD<n>) / *guide* (.GG<n>): graphical fab sheets only —
+    # NonConductor symbols at hole positions, NOT machine-readable drill data.
+    # The fallthrough would already ignore them; rules are explicit so a
+    # future inner-layer regex can't accidentally pick them up as copper.
+    (_re(r"\.gd\d+$"), LAYER_ID_IGNORE, None),
+    (_re(r"\.gg\d+$"), LAYER_ID_IGNORE, None),
     # Silk
     (_re(r"\.gto$"), LAYER_ID_SILK_TOP, None),
     (_re(r"\.gbo$"), LAYER_ID_SILK_BOT, None),
@@ -207,12 +220,19 @@ def _circle_to_polygon(x: float, y: float, r: float) -> shapely.geometry.Polygon
 
 def _rectangle_to_polygon(x: float, y: float, w: float, h: float,
                           rotation: float = 0.0) -> shapely.geometry.Polygon:
-    # gerbonara Rectangle's (x,y) is the CENTRE; rotation is degrees about it.
+    # gerbonara Rectangle's (x,y) is the CENTRE; ``rotation`` is in
+    # **radians** (per gerbonara.graphic_primitives.Rectangle's source —
+    # "rotation around center in radians"). shapely.affinity.rotate
+    # needs us to opt in via ``use_radians=True``; treating the value as
+    # degrees would silently turn a 90° rotation (π/2 ≈ 1.57 rad) into
+    # 1.57°, leaving the rectangle effectively un-rotated. That manifests
+    # as side-of-chip pads drawn in their pre-rotation (horizontal)
+    # orientation, overlapping into a solid blob.
     poly = shapely.geometry.box(x - w / 2.0, y - h / 2.0,
                                 x + w / 2.0, y + h / 2.0)
     if rotation:
         poly = shapely.affinity.rotate(poly, rotation, origin=(x, y),
-                                       use_radians=False)
+                                       use_radians=True)
     return poly
 
 
@@ -410,6 +430,185 @@ def render_outline_to_shapely(gerber_path: Path
     return render_gerber_to_shapely(gerber_path)
 
 
+def _discretise_arc_to_points(x1: float, y1: float, x2: float, y2: float,
+                              cx: float, cy: float,
+                              clockwise: bool) -> list[tuple[float, float]]:
+    """Sample an arc to chord points at ARC_CHORD_TOLERANCE_MM. Returns
+    points from (x1,y1) → (x2,y2) inclusive, with intermediate vertices.
+    Empty list if radius is zero.
+    """
+    import math
+    r = math.hypot(x1 - cx, y1 - cy)
+    if r <= 0:
+        return []
+    epsilon = max(1e-6, r * 1e-9)
+    is_full = (abs(x2 - x1) < epsilon and abs(y2 - y1) < epsilon)
+    a0 = math.atan2(y1 - cy, x1 - cx)
+    if is_full:
+        a1 = a0 - 2.0 * math.pi if clockwise else a0 + 2.0 * math.pi
+    else:
+        a1 = math.atan2(y2 - cy, x2 - cx)
+        if clockwise:
+            if a1 > a0:
+                a1 -= 2 * math.pi
+        else:
+            if a1 < a0:
+                a1 += 2 * math.pi
+    err_ratio = max(min(ARC_CHORD_TOLERANCE_MM / r, 0.99), 1e-6)
+    dtheta_max = 2.0 * math.acos(1.0 - err_ratio)
+    sweep = abs(a1 - a0)
+    n = max(2, int(math.ceil(sweep / dtheta_max)) + 1)
+    return [(cx + r * math.cos(a0 + (a1 - a0) * (i / (n - 1))),
+             cy + r * math.sin(a0 + (a1 - a0) * (i / (n - 1))))
+            for i in range(n)]
+
+
+def render_outline_to_polyline(gerber_path: Path) -> tuple[Pt2D, ...]:
+    """Fast path for board-outline gerbers.
+
+    Skips the polygon-buffer-and-union pipeline used by
+    :func:`render_gerber_to_shapely` (which can take ~10s on a stroked
+    outline because every line gets a thick round-capped buffer and
+    every flash gets unioned). Walks gerbonara primitives, collects
+    segment endpoints (discretising arcs), and stitches them into
+    closed rings by endpoint matching. Returns the largest-area closed
+    ring as a ``Pt2D`` tuple matching the format
+    :meth:`ExtractedProject.board_outline` expects.
+
+    Falls back to ``render_outline_to_shapely`` + ``_outline_points`` if
+    no closed ring can be stitched from the segments.
+    """
+    from gerbonara import GerberFile
+    from gerbonara.utils import MM
+    import gerbonara.graphic_primitives as gp
+
+    gf = GerberFile.open(str(gerber_path))
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    arcpoly_ring: list[tuple[float, float]] | None = None
+    for obj in gf.objects:
+        for prim in obj.to_primitives(MM):
+            if isinstance(prim, gp.Line):
+                segments.append(((prim.x1, prim.y1), (prim.x2, prim.y2)))
+            elif isinstance(prim, gp.Arc):
+                pts = _discretise_arc_to_points(
+                    prim.x1, prim.y1, prim.x2, prim.y2,
+                    prim.cx, prim.cy, prim.clockwise,
+                )
+                for i in range(len(pts) - 1):
+                    segments.append((pts[i], pts[i + 1]))
+            elif isinstance(prim, gp.ArcPoly):
+                # Already a closed region — discretise its arc segments
+                # and return immediately (most outline files use either
+                # ArcPoly OR Line/Arc strokes, not a mix).
+                import math
+                outline_pts: list[tuple[float, float]] = []
+                n = len(prim.outline)
+                for i in range(n):
+                    x0, y0 = prim.outline[i]
+                    x1, y1 = prim.outline[(i + 1) % n]
+                    outline_pts.append((x0, y0))
+                    ac = (prim.arc_centers[i]
+                          if prim.arc_centers and i < len(prim.arc_centers)
+                          else None)
+                    if ac is None or ac[0] is None or ac[1] is None:
+                        continue
+                    cx, cy = ac
+                    r = math.hypot(x0 - cx, y0 - cy)
+                    if r <= 0:
+                        continue
+                    a0 = math.atan2(y0 - cy, x0 - cx)
+                    a1 = math.atan2(y1 - cy, x1 - cx)
+                    delta = a1 - a0
+                    while delta > math.pi:
+                        delta -= 2 * math.pi
+                    while delta < -math.pi:
+                        delta += 2 * math.pi
+                    err_ratio = max(min(ARC_CHORD_TOLERANCE_MM / r, 0.99), 1e-6)
+                    dtheta_max = 2.0 * math.acos(1.0 - err_ratio)
+                    steps = max(2, int(math.ceil(abs(delta) / dtheta_max)))
+                    for k in range(1, steps):
+                        t = a0 + delta * (k / steps)
+                        outline_pts.append(
+                            (cx + r * math.cos(t), cy + r * math.sin(t))
+                        )
+                arcpoly_ring = outline_pts
+                break
+            # Circles / rectangles on an outline layer are typically pad
+            # flashes for fiducials etc; not part of the board boundary.
+        if arcpoly_ring is not None:
+            break
+
+    if arcpoly_ring is not None and len(arcpoly_ring) >= 3:
+        return tuple(Pt2D(float(x), float(y)) for x, y in arcpoly_ring)
+
+    if not segments:
+        return ()
+
+    # Stitch segments into rings by endpoint hashing. Greedy walk: from
+    # each unused segment, follow connected endpoints (with float
+    # tolerance) until the ring closes or no candidate remains.
+    from collections import defaultdict
+
+    def key(p: tuple[float, float]) -> tuple[int, int]:
+        # 1e-6 mm quantisation tolerates the float noise gerbonara emits
+        # when it converts inch/imperial coordinates.
+        return (int(round(p[0] * 1e6)), int(round(p[1] * 1e6)))
+
+    endpoint_map: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for i, (a, b) in enumerate(segments):
+        endpoint_map[key(a)].append((i, 0))
+        endpoint_map[key(b)].append((i, 1))
+
+    used = [False] * len(segments)
+    rings: list[list[tuple[float, float]]] = []
+    for start in range(len(segments)):
+        if used[start]:
+            continue
+        a, b = segments[start]
+        ring: list[tuple[float, float]] = [a, b]
+        used[start] = True
+        start_key = key(a)
+        while True:
+            tail_key = key(ring[-1])
+            if tail_key == start_key and len(ring) >= 4:
+                break
+            next_pick: tuple[int, tuple[float, float]] | None = None
+            for cand_i, which_end in endpoint_map[tail_key]:
+                if used[cand_i]:
+                    continue
+                cand_a, cand_b = segments[cand_i]
+                next_pick = (cand_i, cand_b if which_end == 0 else cand_a)
+                break
+            if next_pick is None:
+                break
+            used[next_pick[0]] = True
+            ring.append(next_pick[1])
+        if len(ring) >= 4 and key(ring[0]) == key(ring[-1]):
+            rings.append(ring)
+
+    if not rings:
+        # Couldn't stitch a closed loop — fall back to the slow path so
+        # we still get *some* outline (convex-hull-ish via the buffered
+        # union pipeline).
+        outline_geom = render_outline_to_shapely(gerber_path)
+        return _outline_points(outline_geom)
+
+    # Pick the largest-area ring.
+    def shoelace(pts: list[tuple[float, float]]) -> float:
+        s = 0.0
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            s += x0 * y1 - x1 * y0
+        return 0.5 * abs(s)
+
+    biggest = max(rings, key=shoelace)
+    # Drop the duplicated closing vertex to match _outline_points convention.
+    if len(biggest) >= 2 and key(biggest[0]) == key(biggest[-1]):
+        biggest = biggest[:-1]
+    return tuple(Pt2D(float(x), float(y)) for x, y in biggest)
+
+
 # --- copper layer → RawShapeBasedRegion list ---------------------------------
 
 def _polygons_in(geom: shapely.geometry.base.BaseGeometry
@@ -457,19 +656,155 @@ def _polygon_to_shape_based_region(
     )
 
 
-# --- drill (Excellon) → RawVia ----------------------------------------------
+# --- drill (Excellon + Gerber X2) → RawVia ----------------------------------
 
-def _excellon_to_vias(drill_paths: list[Path],
-                      top_layer_id: int, bottom_layer_id: int
-                      ) -> tuple[tuple[RawVia, ...], list[str]]:
-    """Parse every drill file → one ``RawVia`` per plated drill hit.
+def _is_gerber_x2_drill(path: Path) -> bool:
+    """Sniff the first ~30 lines for a Gerber X2 ``%TF.FileFunction,…,Drill``
+    (or ``…,Route`` / ``…,Mixed``) attribute. Gerber starts with ``%``;
+    Excellon starts with ``M48`` / a comment / coordinates, so this is a safe
+    discriminator regardless of the file extension the user picked.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            head = "".join(f.readline() for _ in range(30))
+    except OSError:
+        return False
+    m = re.search(r"%TF\.FileFunction,([^*]+)\*%", head)
+    if not m:
+        return False
+    last = m.group(1).rsplit(",", 1)[-1].strip().lower()
+    return last in {"drill", "route", "mixed"}
 
-    Returns ``(vias, warnings)``; warnings describe files we couldn't open.
+
+def _x2_drill_span_to_layer_ids(
+    file_function: tuple[str, ...] | None,
+    ordered_layer_ids: list[int],
+) -> tuple[int, int]:
+    """Translate the X2 ``%TF.FileFunction`` span into FYPA layer ids.
+
+    FileFunction is e.g. ``('Plated', '1', '16', 'PTH', 'Drill')`` — the two
+    integers are **1-based physical layer positions** (1 = top, N = bottom)
+    in the originating CAD. We map position k → ``ordered_layer_ids[k-1]``;
+    out-of-range positions clamp to the nearest end of the imported stack so
+    a drill file describing a 16-layer board still produces sensible vias
+    when the user only imports a subset.
+    """
+    if not ordered_layer_ids:
+        return (LAYER_ID_TOP, LAYER_ID_BOTTOM)
+    n = len(ordered_layer_ids)
+    start_pos = end_pos = None
+    if file_function is not None:
+        for token in file_function:
+            try:
+                v = int(token)
+            except (TypeError, ValueError):
+                continue
+            if start_pos is None:
+                start_pos = v
+            else:
+                end_pos = v
+                break
+    if start_pos is None or end_pos is None:
+        return (ordered_layer_ids[0], ordered_layer_ids[-1])
+    lo, hi = sorted((start_pos, end_pos))
+    lo_idx = max(0, min(n - 1, lo - 1))
+    hi_idx = max(0, min(n - 1, hi - 1))
+    return (ordered_layer_ids[lo_idx], ordered_layer_ids[hi_idx])
+
+
+def _gerber_drill_to_vias(
+    path: Path,
+    ordered_layer_ids: list[int],
+) -> tuple[list[RawVia], list[str]]:
+    """Parse one Gerber X2 drill file → ``RawVia`` records.
+
+    Round flashes (``gp.Circle`` primitives) become single vias. Routed slots
+    (``gp.Line`` primitives — common for oval component-lead holes) get
+    discretised into a chain of overlapping circular via stamps so they
+    bridge the layer pair across the slot's full length in the FEM mesh.
+    """
+    import math
+    import gerbonara.graphic_primitives as gp
+    from gerbonara import GerberFile
+    from gerbonara.utils import MM
+
+    vias: list[RawVia] = []
+    warnings: list[str] = []
+    try:
+        gf = GerberFile.open(str(path))
+    except Exception as e:
+        warnings.append(
+            f"Couldn't parse Gerber drill file {path.name} "
+            f"({type(e).__name__}: {e}); skipping."
+        )
+        return vias, warnings
+
+    file_function = gf.file_attrs.get(".FileFunction") if gf.file_attrs else None
+    # NonPlated = mechanical mounting holes, no electrical role — skip.
+    if file_function and file_function[0].strip().lower() == "nonplated":
+        return vias, warnings
+
+    layer_start, layer_end = _x2_drill_span_to_layer_ids(
+        file_function, ordered_layer_ids,
+    )
+
+    for obj in gf.objects:
+        for prim in obj.to_primitives(MM):
+            if isinstance(prim, gp.Circle):
+                diam = 2.0 * float(prim.r)
+                if diam <= 0:
+                    continue
+                vias.append(RawVia(
+                    center=Pt2D(float(prim.x), float(prim.y)),
+                    diameter_mm=diam + VIA_ANNULAR_RING_HEURISTIC_MM,
+                    hole_diameter_mm=diam,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    net_index=NO_NET,
+                ))
+            elif isinstance(prim, gp.Line):
+                # Routed slot (oblong hole): stamp circular vias along the
+                # path so the bridge between layers spans the full slot.
+                w = float(prim.width)
+                if w <= 0:
+                    continue
+                dx = float(prim.x2) - float(prim.x1)
+                dy = float(prim.y2) - float(prim.y1)
+                length = math.hypot(dx, dy)
+                step = max(w / 2.0, 1e-3)
+                n_stamps = max(2, int(math.ceil(length / step)) + 1)
+                for i in range(n_stamps):
+                    t = i / (n_stamps - 1) if n_stamps > 1 else 0.0
+                    cx = float(prim.x1) + dx * t
+                    cy = float(prim.y1) + dy * t
+                    vias.append(RawVia(
+                        center=Pt2D(cx, cy),
+                        diameter_mm=w + VIA_ANNULAR_RING_HEURISTIC_MM,
+                        hole_diameter_mm=w,
+                        layer_start=layer_start,
+                        layer_end=layer_end,
+                        net_index=NO_NET,
+                    ))
+            # Arcs / regions in a drill file are uncommon; ignore quietly.
+    return vias, warnings
+
+
+def _excellon_to_vias(
+    drill_paths: list[Path],
+    ordered_layer_ids: list[int],
+) -> tuple[list[RawVia], list[str]]:
+    """Parse every Excellon drill file → ``RawVia`` records (one per plated
+    hit). Excellon carries no layer-span info, so every via spans the top↔
+    bottom of the imported stack.
     """
     from gerbonara import ExcellonFile
 
     vias: list[RawVia] = []
     warnings: list[str] = []
+    top_layer_id = ordered_layer_ids[0] if ordered_layer_ids else LAYER_ID_TOP
+    bottom_layer_id = (
+        ordered_layer_ids[-1] if ordered_layer_ids else LAYER_ID_BOTTOM
+    )
     for path in drill_paths:
         try:
             ef = ExcellonFile.open(str(path))
@@ -479,13 +814,8 @@ def _excellon_to_vias(drill_paths: list[Path],
                 f"{e}); skipping."
             )
             continue
-        # gerbonara's ExcellonFile.objects is a flat list of drill hits.
         for d in ef.objects:
             try:
-                # gerbonara reports each ExcellonDrill in its native unit; we
-                # need mm. ``unit`` is "mm" or "inch"; convert ``diameter``
-                # accordingly via the .converted() method on the wrapper.
-                # For simplicity we read the resolved fields directly.
                 x = float(d.x)
                 y = float(d.y)
                 if str(d.unit) == "inch":
@@ -503,19 +833,39 @@ def _excellon_to_vias(drill_paths: list[Path],
                 continue
             if diam_mm <= 0:
                 continue
-            # Skip explicitly non-plated drills (mechanical mounting holes,
-            # etc.) — they have no electrical role.
             if hasattr(tool, "plated") and tool.plated is False:
                 continue
-            outer_mm = diam_mm + VIA_ANNULAR_RING_HEURISTIC_MM
             vias.append(RawVia(
                 center=Pt2D(x, y),
-                diameter_mm=outer_mm,
+                diameter_mm=diam_mm + VIA_ANNULAR_RING_HEURISTIC_MM,
                 hole_diameter_mm=diam_mm,
                 layer_start=top_layer_id,
                 layer_end=bottom_layer_id,
                 net_index=NO_NET,
             ))
+    return vias, warnings
+
+
+def _drill_files_to_vias(
+    drill_paths: list[Path],
+    ordered_layer_ids: list[int],
+) -> tuple[tuple[RawVia, ...], list[str]]:
+    """Dispatch each drill file to the Gerber X2 or Excellon parser based on
+    its actual content (filename is a hint, not authoritative)."""
+    vias: list[RawVia] = []
+    warnings: list[str] = []
+    excellon_batch: list[Path] = []
+    for path in drill_paths:
+        if _is_gerber_x2_drill(path):
+            v, w = _gerber_drill_to_vias(path, ordered_layer_ids)
+            vias.extend(v)
+            warnings.extend(w)
+        else:
+            excellon_batch.append(path)
+    if excellon_batch:
+        v, w = _excellon_to_vias(excellon_batch, ordered_layer_ids)
+        vias.extend(v)
+        warnings.extend(w)
     return tuple(vias), warnings
 
 
@@ -595,6 +945,7 @@ def extract_gerber_project(
     outline_file: Path | None,
     stackup: list[GerberStackupLayer],
     pseudo_prjpcb_path: Path,
+    progress_cb=None,
 ) -> tuple[ExtractedProject, list[str]]:
     """Build an :class:`ExtractedProject` from a set of Gerber + Excellon files.
 
@@ -627,19 +978,78 @@ def extract_gerber_project(
     """
     warnings: list[str] = []
 
+    def _progress(stage=None, substage=None):
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(stage, substage)
+        except Exception:
+            # Never let a UI callback failure abort the import.
+            pass
+
     # 1. Rasterise each copper layer → list of connected-component
-    #    RawShapeBasedRegions.
+    #    RawShapeBasedRegions. The per-layer render_gerber_to_shapely
+    #    call is pure-CPU (gerbonara parse + Shapely/GEOS booleans) and
+    #    each layer is independent, so for >1 layer we fan out to a
+    #    ProcessPoolExecutor and gather (Multi)Polygon results back.
+    #    Windows uses spawn — keep the worker function module-level
+    #    (render_gerber_to_shapely is) and pass plain Paths.
     sbr_records: list[RawShapeBasedRegion] = []
     all_copper: list[shapely.geometry.base.BaseGeometry] = []
-    for layer_id, path in copper_files.items():
-        log.info("Gerber: rendering layer %d (%s)", layer_id, path.name)
-        try:
-            geom = render_gerber_to_shapely(path)
-        except Exception as e:
-            warnings.append(
-                f"Couldn't render Gerber {path.name} for layer {layer_id} "
-                f"({type(e).__name__}: {e}); skipping this layer."
-            )
+    items = list(copper_files.items())
+    # Cap workers: too many spawned Python processes on Windows just
+    # thrash memory + I/O without speeding anything up.
+    n_workers = min(os.cpu_count() or 1, len(items), 8)
+    geom_by_layer: dict[int, shapely.geometry.base.BaseGeometry] = {}
+    t_render0 = time.monotonic()
+    _progress(stage=f"Rendering {len(items)} Gerber layers…",
+              substage=f"0 / {len(items)} done")
+    if n_workers > 1 and len(items) > 1:
+        log.info("Gerber: rendering %d layers in parallel (workers=%d)",
+                 len(items), n_workers)
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            fut_to_meta = {
+                pool.submit(render_gerber_to_shapely, path): (layer_id, path)
+                for layer_id, path in items
+            }
+            from concurrent.futures import as_completed
+            done = 0
+            for fut in as_completed(fut_to_meta):
+                layer_id, path = fut_to_meta[fut]
+                try:
+                    geom_by_layer[layer_id] = fut.result()
+                    log.info("Gerber: rendered layer %d (%s)",
+                             layer_id, path.name)
+                except Exception as e:
+                    warnings.append(
+                        f"Couldn't render Gerber {path.name} for layer "
+                        f"{layer_id} ({type(e).__name__}: {e}); "
+                        "skipping this layer."
+                    )
+                done += 1
+                _progress(substage=f"{done} / {len(items)} done "
+                                   f"(latest: {path.name})")
+    else:
+        for idx, (layer_id, path) in enumerate(items, start=1):
+            log.info("Gerber: rendering layer %d (%s)", layer_id, path.name)
+            try:
+                geom_by_layer[layer_id] = render_gerber_to_shapely(path)
+            except Exception as e:
+                warnings.append(
+                    f"Couldn't render Gerber {path.name} for layer "
+                    f"{layer_id} ({type(e).__name__}: {e}); "
+                    "skipping this layer."
+                )
+            _progress(substage=f"{idx} / {len(items)} done "
+                               f"(latest: {path.name})")
+    log.info("Gerber: per-layer render total %.2fs (%d layer(s))",
+             time.monotonic() - t_render0, len(geom_by_layer))
+    # Iterate input order so sbr_records / all_copper are deterministic.
+    _progress(stage="Building shape-based region records…", substage="")
+    t_sbr0 = time.monotonic()
+    for layer_id, _path in items:
+        geom = geom_by_layer.get(layer_id)
+        if geom is None:
             continue
         for poly in _polygons_in(geom):
             if poly.area <= 0:
@@ -647,52 +1057,71 @@ def extract_gerber_project(
             sbr_records.append(_polygon_to_shape_based_region(poly, layer_id))
         if not geom.is_empty:
             all_copper.append(geom)
+    log.info("Gerber: SBR assembly took %.2fs (%d records)",
+             time.monotonic() - t_sbr0, len(sbr_records))
 
-    # 2. Drill → Vias. Layer span = top..bottom of the stackup the user
-    #    actually provided; if they only imported one layer we use the same
-    #    id for both ends (the loader will treat it as a non-bridging via,
-    #    which is the right behaviour for that case).
+    # 2. Drill → Vias. Excellon has no span info so its hits span the full
+    #    top↔bottom of the imported stack; Gerber X2 drill files (.GBR<n>)
+    #    carry per-file span in %TF.FileFunction so microvias / blind /
+    #    buried vias come out with the correct layer pair.
+    _progress(stage="Reading drill files…", substage="")
+    t_drill0 = time.monotonic()
     ordered_ids = sorted(copper_files.keys(), key=lambda i: (i == LAYER_ID_BOTTOM, i))
     # Sort so Top=1 first, inner ids next ascending, Bottom=32 last.
-    # The composite key puts Bottom last; the inner ids sort naturally.
-    if ordered_ids:
-        top_id = ordered_ids[0]
-        bot_id = ordered_ids[-1]
-    else:
-        top_id = LAYER_ID_TOP
-        bot_id = LAYER_ID_BOTTOM
+    if not ordered_ids:
+        ordered_ids = [LAYER_ID_TOP, LAYER_ID_BOTTOM]
     if drill_files:
-        vias, drill_warnings = _excellon_to_vias(drill_files, top_id, bot_id)
+        vias, drill_warnings = _drill_files_to_vias(drill_files, ordered_ids)
         warnings.extend(drill_warnings)
+        if not vias:
+            warnings.append(
+                "Drill file(s) supplied but produced no via records "
+                f"({', '.join(p.name for p in drill_files)}). Multi-layer "
+                "rails will need editor directives or copper names to "
+                "bridge layers."
+            )
     else:
         vias = ()
         warnings.append(
-            "No drill (Excellon) file provided. Vias / through-hole pads "
-            "won't be reconstructed; multi-layer rails will need editor "
-            "directives or copper names to bridge layers."
+            "No drill file provided (Excellon .drl/.xln/.tap/.nc or Gerber X2 "
+            ".GBR<n>). Vias / through-hole pads won't be reconstructed; "
+            "multi-layer rails will need editor directives or copper names "
+            "to bridge layers."
         )
+    log.info("Gerber: drill/vias took %.2fs (%d via(s))",
+             time.monotonic() - t_drill0, len(vias))
 
     # 3. Board outline. Prefer an explicit outline file; fall back to
     #    bounding box of unioned copper.
+    _progress(stage="Building board outline…", substage="")
+    t_outline0 = time.monotonic()
     board_outline: tuple[Pt2D, ...] = ()
     if outline_file is not None:
         try:
-            outline_geom = render_outline_to_shapely(outline_file)
-            board_outline = _outline_points(outline_geom)
+            board_outline = render_outline_to_polyline(outline_file)
         except Exception as e:
             warnings.append(
                 f"Couldn't render outline {outline_file.name} "
                 f"({type(e).__name__}: {e}); using copper bounding box."
             )
     if not board_outline and all_copper:
-        union = shapely.ops.unary_union(all_copper)
-        if not union.is_empty:
-            minx, miny, maxx, maxy = union.bounds
+        # bbox(union(A,B,...)) == bbox of bbox-union, so skip the (very
+        # expensive on big boards) unary_union call and just min/max
+        # over each layer geometry's bounds.
+        bounds = [g.bounds for g in all_copper if not g.is_empty]
+        if bounds:
+            minx = min(b[0] for b in bounds)
+            miny = min(b[1] for b in bounds)
+            maxx = max(b[2] for b in bounds)
+            maxy = max(b[3] for b in bounds)
             board_outline = (
                 Pt2D(minx, miny), Pt2D(maxx, miny),
                 Pt2D(maxx, maxy), Pt2D(minx, maxy),
-                Pt2D(minx, miny),
             )
+    log.info("Gerber: board outline took %.2fs (%s, %d pts)",
+             time.monotonic() - t_outline0,
+             "from outline file" if outline_file is not None else "from copper bbox",
+             len(board_outline))
 
     # 4. Stackup, chained Top → Bottom in the order the user imported.
     if not stackup:

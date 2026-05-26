@@ -41,9 +41,8 @@ def check(name, ok, detail=""):
     results.append((name, ok, detail))
     say(("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail)).rstrip())
 
-# --- enter editor mode + show markers ----------------------------------
+# --- enter editor mode -------------------------------------------------
 viewer._editor_toggle_btn.setChecked(True)
-viewer.show_markers_box.setChecked(True)
 for _ in range(10):
     app.processEvents()
 check("editor mode active", viewer._editor_mode)
