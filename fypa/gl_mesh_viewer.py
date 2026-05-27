@@ -609,6 +609,10 @@ class GLMeshViewer(QOpenGLWidget):
         # hidden-state slash). When non-empty, replaces the plain-HTML
         # top-right chip. Filled by :meth:`set_overlay_top_right_legend`.
         self._overlay_top_right_legend: list[LegendRow] = []
+        # Extra horizontal inset (px) for the top-right chip so the host
+        # can push the legend left when a floating side panel overlays
+        # the right edge. Set via :meth:`set_legend_right_inset`.
+        self._legend_right_inset: float = 0.0
         # Hit-test rects for the structured legend, rebuilt each paint by
         # :meth:`_draw_legend_chip`. Each entry: (widget-pixel rect, key).
         self._legend_row_rects: list[tuple[QRectF, str]] = []
@@ -1419,6 +1423,17 @@ class GLMeshViewer(QOpenGLWidget):
         """
         self._overlay_top_right_legend = list(rows)
         self._overlay_top_right_html = ""
+        self.update()
+
+    def set_legend_right_inset(self, px: float) -> None:
+        """Shift the top-right chip (legend or plain HTML) left by ``px``
+        pixels. The host calls this when a floating right-edge panel is
+        shown so the legend doesn't disappear behind it. Zero restores
+        the default flush-to-right placement."""
+        inset = max(0.0, float(px))
+        if inset == self._legend_right_inset:
+            return
+        self._legend_right_inset = inset
         self.update()
 
     def set_markers(self, groups: list[MarkerGroup]) -> None:
@@ -2867,7 +2882,7 @@ class GLMeshViewer(QOpenGLWidget):
         chip_w = size.width() + 12
         chip_h = size.height() + 6
         if anchor_right:
-            x = self.width() - chip_w - margin
+            x = self.width() - chip_w - margin - self._legend_right_inset
         else:
             x = margin
         y = margin
@@ -2914,7 +2929,8 @@ class GLMeshViewer(QOpenGLWidget):
                      + label_w)
         chip_w = content_w + 2 * self._LEGEND_PAD_X
         chip_h = row_h * len(rows) + 2 * self._LEGEND_PAD_Y
-        x = self.width() - chip_w - self._LEGEND_MARGIN
+        x = (self.width() - chip_w - self._LEGEND_MARGIN
+             - self._legend_right_inset)
         y = self._LEGEND_MARGIN
 
         painter.save()

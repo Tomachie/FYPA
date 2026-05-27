@@ -1274,10 +1274,12 @@ class OverlayColorButton(QToolButton):
 
 
 # Overlay layers shown in the Heatmap tab's "Board Features" control, in
-# top-to-bottom row order. Each is (key, label, has_sides). ``has_sides``
-# rows (everything but vias) carry a split button that breaks the row into
-# separate Top / Bottom rows. This list drives only the UI row order — the
-# draw order is fixed independently in _refresh_overlay_geometry.
+# top-to-bottom row order. Each is (key, label, has_sides). A ``has_sides``
+# row carries a split button that breaks the row into separate Top / Bottom
+# rows. This list drives only the UI row order — the draw order is fixed
+# independently in _refresh_overlay_geometry. Vias are handled by the
+# layer-based via cylinder / marker path (see :meth:`_push_via_cylinders`)
+# rather than as a Board Features overlay row.
 _OVERLAY_LAYERS: list[tuple[str, str, bool]] = [
     ("components", "Components", True),
     ("pads", "Pads", True),
@@ -1285,7 +1287,6 @@ _OVERLAY_LAYERS: list[tuple[str, str, bool]] = [
     # Altium's layer name (splits into Top Overlay / Bottom Overlay).
     ("silkscreen", "Overlay", True),
     ("designators", "Designators", True),
-    ("vias", "Vias", False),
     # The mechanical board outline. It has no per-net association, so its
     # row carries only the "show everywhere" eye (no rails-only eye) and
     # no fill toggle — see _build_overlay_row_widget.
@@ -1321,7 +1322,6 @@ def _overlay_default_solid(key: str) -> bool:
 _OVERLAY_DEFAULT_COLORS: dict[str, tuple[float, float, float]] = {
     "silkscreen":    (1.00, 1.00, 0.00),   # yellow (#ffff00)
     "pads":          (1.00, 0.82, 0.29),   # amber
-    "vias":          (1.00, 0.55, 0.23),   # orange (matches via cylinders)
     "components":    (0.00, 0.50, 0.00),   # green (#008000)
     "designators":   (1.00, 1.00, 0.00),   # yellow (#ffff00)
     "board_outline": (0.50, 0.00, 0.00),   # dark red / maroon (#800000)
@@ -5939,11 +5939,14 @@ class PdnViewer(QMainWindow):
 
     def _on_layer_eye2_toggled(self, _on: bool) -> None:
         """A layer's 'all copper' eye was clicked. The all-copper view is
-        independent of the FEM heatmap, so only the overlay geometry needs
-        rebuilding — no full re-render."""
+        independent of the FEM heatmap, so only the overlay geometry +
+        via overlays need rebuilding — no full re-render. Via markers
+        (2D) and via cylinders (3D) gate on the second eye too (see
+        :meth:`_push_via_cylinders`), so they refresh here as well."""
         self._sync_all_layers_eye2()
         rails = self._visible_rails()
-        self._run_with_busy_popup(lambda: self._refresh_overlay_geometry(rails))
+        self._run_with_busy_popup(
+            lambda: self._refresh_after_copper_eye(rails))
 
     def _on_all_layers_eye2_toggled(self, on: bool) -> None:
         """The "All Layers" all-copper eye — show/hide all copper on every
@@ -5951,7 +5954,19 @@ class PdnViewer(QMainWindow):
         for _name, eye2 in self._layer_eye2_buttons:
             eye2.setVisibleState(on, emit=False)
         rails = self._visible_rails()
-        self._run_with_busy_popup(lambda: self._refresh_overlay_geometry(rails))
+        self._run_with_busy_popup(
+            lambda: self._refresh_after_copper_eye(rails))
+
+    def _refresh_after_copper_eye(self, rails) -> None:
+        """Refresh the overlays plus the via markers / cylinders that
+        depend on second-eye visibility. Keeps the FEM heatmap untouched
+        (the all-copper eye doesn't change which solution is solved)."""
+        self._refresh_overlay_geometry(rails)
+        phys_list = self._visible_layers()
+        self._update_markers_and_legend(phys_list, rails)
+        if self.view_3d_box.isChecked():
+            mode = self.mode_combo.currentText()
+            self._push_via_cylinders(phys_list, rails, mode=mode)
 
     def _sync_all_layers_eye2(self) -> None:
         """Reflect "any layer's all-copper shown" in the All Layers eye."""
@@ -6569,27 +6584,6 @@ class PdnViewer(QMainWindow):
                 _emit(_overlay_ribbon_outline_tris(
                     poly, half, _OVERLAY_WIRE_HALF_MM, closed=False),
                     z, rgb, alpha=a, **bucket)
-
-        self._pump_busy_ui()
-        # Vias — one circle per via (the Vias row has no top/bottom split).
-        vsub = self._overlay_state["vias"]["both"]
-        if vsub["vis"] is not None:
-            rgb = self._overlay_colors["vias"]
-            solid = vsub["solid"]
-            via_alpha = _transparency_alpha(vsub.get("alpha_step", 0))
-            rails_only = vsub["vis"] == "rails"
-            if via_alpha > 0.0:
-                for rec in md.get("vias", []):
-                    self._pump_busy_ui()
-                    if rails_only and not _net_match([rec.get("net")]):
-                        continue
-                    r = 0.5 * float(rec.get("diameter_mm", 0.0) or 0.0)
-                    if r <= 0.0:
-                        continue
-                    ring = _overlay_circle_ring(float(rec["x_mm"]),
-                                                float(rec["y_mm"]), r)
-                    _emit(_shape_tris(ring, solid), side_z["top"], rgb,
-                          alpha=via_alpha)
 
         self._pump_busy_ui()
         # Components — axis-aligned bounding box per component.
@@ -7560,8 +7554,8 @@ class PdnViewer(QMainWindow):
         label, unit, derive_fn = self._mode_derive_fn(mode)
         is_via_current = (mode == _VIA_CURRENT_MODE)
 
-        # Overlays (silkscreen / pads / vias / components / designators)
-        # are independent of the FEM heatmap. Refresh them up-front so a
+        # Overlays (silkscreen / pads / components / designators) are
+        # independent of the FEM heatmap. Refresh them up-front so a
         # rail or 2D/3D change keeps them in sync — and so they still draw
         # when the early-outs below fire (no layer / rail selected).
         self._refresh_overlay_geometry(rails)
@@ -9396,17 +9390,23 @@ class PdnViewer(QMainWindow):
     def _push_via_cylinders(self, phys_list: list[str],
                             rail_names: list[str] | str,
                             *, mode: str | None = None) -> None:
-        """Build cylinder triangle geometry for every via that touches
-        the visible physical layers + the selected rail groups, and push
-        it as one batch to the GLMeshViewer. Empty input clears the
+        """Build cylinder triangle geometry for every visible via and
+        push it as one batch to the GLMeshViewer. Empty input clears the
         cylinders.
+
+        A via is visible if any layer it crosses (full span, not just
+        the endpoint pair) is visible — either via the primary eye on
+        the selected rail (the via must then be on a rail-member net),
+        or via the second eye (all-copper), which shows every net on
+        the layer and so bypasses the rail filter.
 
         When the "Heatmap vias" toggle is on, each via is split into one
         cylinder per inter-layer segment, coloured by the active mode's
         heatmap (voltage / drop interpolate top↔bottom along the via;
-        current and power are constant per segment). Otherwise vias are
-        drawn solid orange to match the 2D marker."""
-        if self.metadata is None or not phys_list:
+        current and power are constant per segment). Vias shown only via
+        all-copper have no rail-mode data and fall back to solid orange.
+        Otherwise vias are drawn solid orange to match the 2D marker."""
+        if self.metadata is None:
             self._gl_viewer.clear_cylinders()
             return
         # Map layer_id → physical name → rank → z. Use the same rank-
@@ -9415,6 +9415,15 @@ class PdnViewer(QMainWindow):
         visible_ids = {self._phys_name_to_layer_id.get(p)
                        for p in phys_list}
         visible_ids.discard(None)
+        # All-copper (second eye) gives a via an independent visibility
+        # path: a via is shown if its span touches a copper-eye layer
+        # even when no rail/heatmap eye on its span is open. This branch
+        # bypasses the rail filter since all-copper itself shows every
+        # net on the layer, not just rail members.
+        copper_visible_ids = set(self._visible_all_copper_layer_ids().keys())
+        if not visible_ids and not copper_visible_ids:
+            self._gl_viewer.clear_cylinders()
+            return
         rail_members = set(self._effective_rail_members(rail_names))
 
         # Via Current mode supersedes the "Heatmap vias" toggle — the
@@ -9452,21 +9461,29 @@ class PdnViewer(QMainWindow):
 
         pos_chunks: list[np.ndarray] = []
         col_chunks: list[np.ndarray] = []
-        for v in self.metadata.get("vias", []):
+        # The 2D legend's VIA row also gates the 3D cylinders, so the
+        # user can hide vias from the 3D view by clicking the legend
+        # entry the same way they do in 2D. PTHs aren't affected.
+        vias_hidden = "VIA" in self._hidden_legend_keys
+        for v in (self.metadata.get("vias", []) if not vias_hidden else []):
             ls_id = v.get("layer_start")
             le_id = v.get("layer_end")
             if ls_id is None or le_id is None:
                 continue
-            # Skip vias that don't touch any visible layer.
             lo_id = min(ls_id, le_id)
             hi_id = max(ls_id, le_id)
-            spanned = [lid for lid in (lo_id, hi_id) if lid in id_to_phys]
-            if not spanned:
-                continue
-            if not any(visible_ids & set(spanned)):
-                continue
-            # Skip vias not on the rail (when a rail is selected).
-            if rail_members and v.get("net") not in rail_members:
+            # Visibility: any layer the via crosses (full span, not just
+            # endpoints) being visible via either eye lets the via show.
+            # Primary eye (rail/heatmap) requires the via to be on a rail
+            # member; second eye (all-copper) bypasses that filter.
+            net = v.get("net", "")
+            rail_ok = (
+                (not rail_members or net in rail_members)
+                and any(lo_id <= lid <= hi_id for lid in visible_ids)
+            )
+            copper_ok = any(lo_id <= lid <= hi_id
+                            for lid in copper_visible_ids)
+            if not (rail_ok or copper_ok):
                 continue
             phys_top = id_to_phys.get(lo_id)
             phys_bot = id_to_phys.get(hi_id)
@@ -9969,8 +9986,14 @@ class PdnViewer(QMainWindow):
         mode = self.mode_combo.currentText()
         is_via_current = (mode == _VIA_CURRENT_MODE)
 
+        # All-copper layers are an independent visibility source for via
+        # markers (see :meth:`_push_via_cylinders`); we still want to
+        # enter the block when only copper eyes are on so those vias get
+        # emitted. The pin walk naturally produces nothing in that case
+        # because every pin's layer_id falls outside ``target_layer_ids``.
+        copper_layer_ids = set(self._visible_all_copper_layer_ids().keys())
         if (self.metadata is not None
-                and phys_list and target_layer_ids):
+                and (target_layer_ids or copper_layer_ids)):
             rail_members = set(self._effective_rail_members(rail_names))
 
             # Keyed (role, is_n_side): the P side and N side of a
@@ -10074,12 +10097,15 @@ class PdnViewer(QMainWindow):
                     edge_width=1.6,
                 ))
 
-            # Via *markers* (orange dots) — skipped in 3D where the via
-            # *cylinders* (drawn natively in GL) take over the same role.
-            # Also skipped in Via Current mode — those vias come in via
+            # Via *markers* (orange dots) — the MarkerGroup is 2D-only
+            # (in 3D the cylinders drawn natively in GL take over the
+            # same role), but the VIA legend row is registered in both
+            # modes so the user can hide vias from the 3D view too.
+            # :meth:`_push_via_cylinders` gates on the same hidden key.
+            # Skipped entirely in Via Current mode — those vias come via
             # the per-bucket coloured marker batch below so the 2D view
             # shows the same heatmap the cylinders show in 3D.
-            if not in_3d and not is_via_current:
+            if not is_via_current:
                 # (x, y) -> diameter_mm: dedup across visible layers while
                 # keeping each via's physical diameter so the orange dot
                 # is sized to the real footprint. The GL viewer floors the
@@ -10091,9 +10117,17 @@ class PdnViewer(QMainWindow):
                         lid, rail_members)
                     for vx, vy, vd in zip(vxs, vys, vds):
                         via_pts[(vx, vy)] = vd
+                # All-copper (second eye) layers add their own vias
+                # without the rail filter — same rule as the 3D cylinder
+                # path in :meth:`_push_via_cylinders`.
+                for lid in copper_layer_ids:
+                    vxs, vys, vds = self._collect_via_positions(lid, set())
+                    for vx, vy, vd in zip(vxs, vys, vds):
+                        via_pts[(vx, vy)] = vd
                 if via_pts:
                     _add_legend("VIA", "o", "#ff8c00")
-                    if "VIA" not in self._hidden_legend_keys:
+                    if (not in_3d
+                            and "VIA" not in self._hidden_legend_keys):
                         n_via = len(via_pts)
                         via_xs = np.fromiter((p[0] for p in via_pts),
                                              dtype=np.float64, count=n_via)
@@ -10113,15 +10147,16 @@ class PdnViewer(QMainWindow):
                             min_pixel_diameter=self._VIA_MARKER_MIN_PX,
                         ))
 
-                # PTH (plated through-hole) markers — same gating, light
-                # grey so they don't compete with the orange via dots.
-                # 3D path uses the cylinder batch instead.
+                # PTH (plated through-hole) markers — 2D only; the 3D
+                # path uses the cylinder batch instead and has no legend
+                # toggle for PTHs.
                 pth_pts: dict[tuple[float, float], float] = {}
-                for lid in target_layer_ids:
-                    pxs, pys, pds = self._collect_pth_positions(
-                        lid, rail_members)
-                    for px, py, pd in zip(pxs, pys, pds):
-                        pth_pts[(px, py)] = pd
+                if not in_3d:
+                    for lid in target_layer_ids:
+                        pxs, pys, pds = self._collect_pth_positions(
+                            lid, rail_members)
+                        for px, py, pd in zip(pxs, pys, pds):
+                            pth_pts[(px, py)] = pd
                 if pth_pts:
                     _add_legend("PTH", "o", self._PTH_COLOR_HEX)
                     if "PTH" not in self._hidden_legend_keys:
@@ -10292,7 +10327,8 @@ class PdnViewer(QMainWindow):
             (self._phys_name_to_layer_id.get(p) for p in visible_phys)
             if lid is not None
         }
-        if not target_layer_ids:
+        copper_layer_ids = set(self._visible_all_copper_layer_ids().keys())
+        if not target_layer_ids and not copper_layer_ids:
             return []
         id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
         labels: list[dict] = []
@@ -10303,9 +10339,16 @@ class PdnViewer(QMainWindow):
             if ls is None or le is None:
                 continue
             lo, hi = (ls, le) if ls <= le else (le, ls)
-            if not any(lo <= lid <= hi for lid in target_layer_ids):
-                continue
-            if rail_members and v.get("net") not in rail_members:
+            # Match the marker / cylinder rule: primary-eye visibility
+            # requires the rail filter; all-copper (second eye) visibility
+            # bypasses it. See :meth:`_push_via_cylinders`.
+            net = v.get("net", "")
+            rail_ok = (
+                (not rail_members or net in rail_members)
+                and any(lo <= lid <= hi for lid in target_layer_ids)
+            )
+            copper_ok = any(lo <= lid <= hi for lid in copper_layer_ids)
+            if not (rail_ok or copper_ok):
                 continue
             x = float(v.get("x_mm", 0.0))
             y = float(v.get("y_mm", 0.0))
@@ -10937,8 +10980,10 @@ class PdnViewer(QMainWindow):
             self._show_pdn_editor_layout()  # safe; visibility checked below
         self._editor_panel.setVisible(
             self._editor_mode or self._copper_selection is not None)
-        if self._editor_panel.isVisible():
-            self._position_editor_panel()
+        # Always re-position so the legend inset gets cleared when the
+        # panel becomes hidden (the position-helper is a no-op aside
+        # from the inset when the panel is invisible).
+        self._position_editor_panel()
         # Keep the toggle button in sync when entered via the E hotkey.
         if self._editor_toggle_btn.isChecked() != self._editor_mode:
             self._editor_toggle_btn.blockSignals(True)
@@ -11021,19 +11066,67 @@ class PdnViewer(QMainWindow):
             self._editor_hint.setText(self._EDITOR_DEFAULT_HINT)
         self._sync_marker_buttons()
 
+    _MARKER_TIPS: dict = {
+        "SOURCE": "Drop a free SOURCE — click, then click copper",
+        "SINK": "Drop a free SINK — click, then click copper",
+    }
+    _MARKER_TIP_DISABLED = (
+        "At least one piece of copper needs a net name in the project "
+        "before a free marker can be placed."
+    )
+
+    def _design_has_named_copper(self) -> bool:
+        """True iff the board carries at least one piece of copper with
+        a real net name — either named at extract time (Altium nets,
+        Gerber pours with apertures resolved to a net) or via a user
+        :class:`~fypa.project_file.CopperName` rename. Free markers
+        anchor to a net, so the SOURCE / SINK overlay buttons stay
+        disabled until this holds."""
+        md = self.metadata
+        if md:
+            for rec in md.get("all_copper") or []:
+                n = rec.get("net")
+                if n and n != "(none)":
+                    return True
+        if self._project is not None:
+            for c in self._project.copper_names:
+                if c.name and c.name != "(none)":
+                    return True
+        return False
+
     def _sync_marker_buttons(self) -> None:
         """Reflect the armed free-marker role on the viewport source / sink
-        buttons' checked state."""
+        buttons' checked state, and gate the buttons on whether the design
+        has any named copper to anchor a marker to. A board with no named
+        copper has nowhere a free marker can resolve, so the buttons
+        disable with an explanatory tooltip; clearing a pending pick that
+        gets stranded mid-state."""
         pend = self._editor_pending_marker
+        has_named = self._design_has_named_copper()
         for role, attr in (("SOURCE", "_editor_add_source_btn"),
                            ("SINK", "_editor_add_sink_btn")):
             b = getattr(self, attr, None)
-            if b is not None and b.isChecked() != (pend == role):
-                b.setChecked(pend == role)
+            if b is None:
+                continue
+            if b.isEnabled() != has_named:
+                b.setEnabled(has_named)
+            b.setToolTip(self._MARKER_TIPS[role] if has_named
+                         else self._MARKER_TIP_DISABLED)
+            if b.isChecked() != (pend == role and has_named):
+                b.setChecked(pend == role and has_named)
+        if not has_named and self._editor_pending_marker is not None:
+            self._editor_pending_marker = None
 
     def _on_editor_add_marker(self, role: str) -> None:
         """Arm 'drop a free <role> marker on the next viewport click'.
         Clicking the same button again disarms it."""
+        if not self._design_has_named_copper():
+            # Defensive — the button is disabled in this state, but a
+            # programmatic call still shouldn't arm a placement that
+            # can't succeed.
+            self._editor_pending_marker = None
+            self._sync_marker_buttons()
+            return
         self._editor_pending_marker = (
             None if self._editor_pending_marker == role else role
         )
@@ -12217,8 +12310,10 @@ class PdnViewer(QMainWindow):
         self._gl_viewer.set_primitive_selection_outline(rings)
         self._populate_copper_props_form(hit)
         self._show_copper_props_layout()
-        self._position_editor_panel()
+        # Show before positioning so :meth:`_position_editor_panel`'s
+        # ``panel.isVisible()`` check correctly pushes the legend inset.
         self._editor_panel.show()
+        self._position_editor_panel()
 
     def _clear_copper_selection(self) -> None:
         """Drop any viewer-mode copper selection — clears the dashed-yellow
@@ -12239,6 +12334,9 @@ class PdnViewer(QMainWindow):
             panel = getattr(self, "_editor_panel", None)
             if panel is not None:
                 panel.hide()
+                # Clear the legend's right-side inset now that the panel
+                # is gone (see :meth:`_position_editor_panel`).
+                self._position_editor_panel()
 
     def _on_editor_click(self, world_x: float, world_y: float) -> None:
         """Editor-mode left-click: drop a pending free marker if one is
@@ -12919,6 +13017,11 @@ class PdnViewer(QMainWindow):
                     f"{'s' if updated != 1 else ''}.")
         if status is not None:
             status.setText(f"<span style='color:{t['ok']};'>{msg}</span>")
+        # Naming the first piece of copper enables the SOURCE / SINK
+        # free-marker buttons — without this refresh they'd stay greyed
+        # out (and tooltipped as "no named copper") until the next event
+        # nudged a marker-button sync.
+        self._sync_marker_buttons()
 
     def _populate_editor_form(self) -> None:
         """(Re)build the form for the current selection: the PDN-role
@@ -13268,7 +13371,8 @@ class PdnViewer(QMainWindow):
         if role is None:
             return
         pick = self._visible_editor_copper_pick(world_x, world_y)
-        if pick is None or not pick.get("net"):
+        net = pick.get("net") if pick else None
+        if pick is None or not net:
             hidden = self._editor_copper_pick(world_x, world_y)
             if hidden is not None and hidden.get("net"):
                 phys = hidden.get("physical") or "a hidden layer"
@@ -13279,7 +13383,15 @@ class PdnViewer(QMainWindow):
                 self.statusBar().showMessage(
                     "No copper there — click on a copper region.", 4000)
             return
-        net = pick["net"]
+        if net == "(none)":
+            # Free markers anchor to a net; unnamed copper has none. The
+            # downstream resolve has no rail to attach the marker to, so
+            # block the placement and prompt the user to name the copper
+            # first (click the polygon to surface the copper-name form).
+            self.statusBar().showMessage(
+                "This copper has no net name — name it first, then drop "
+                "the free marker on it.", 5000)
+            return
         layer = pick.get("physical")
         layer_id = pick.get("layer_id")
         d = EditorDirective(
@@ -13329,18 +13441,28 @@ class PdnViewer(QMainWindow):
         return None
 
     def _copper_on_layer_at(self, world_x: float, world_y: float,
-                            layer_id: int | None) -> dict | None:
+                            layer_id: int | None,
+                            net_name: str | None = None) -> dict | None:
         """Netted copper of the given layer under the point, or ``None``.
         Unlike :meth:`_copper_at_point` this never crosses to another
         layer — a free marker's layer is fixed, so its move must stay on
         it. Net-less copper is skipped so a moved marker always re-derives
-        a real net, exactly as placement requires."""
+        a real net, exactly as placement requires.
+
+        With ``net_name`` set the test additionally requires the copper to
+        carry that exact net — used by the marker-drag constraint so a
+        free marker can only ride copper of its own net. Two disjoint
+        polygons of the same net on this layer both qualify, so the
+        marker can "jump" across the gap between them while the cursor
+        passes over them in turn."""
         md = self.metadata
         if not md or layer_id is None:
             return None
         pt = _sg.Point(world_x, world_y)
         for rec in md.get("all_copper") or []:
             if rec.get("layer_id") != layer_id or not rec.get("net"):
+                continue
+            if net_name is not None and rec.get("net") != net_name:
                 continue
             for poly in rec.get("polygons", []):
                 prepped = self._copper_poly_prepared(poly)
@@ -13356,12 +13478,21 @@ class PdnViewer(QMainWindow):
     def _point_on_marker_layer(self, directive,
                                world_x: float, world_y: float) -> bool:
         """Whether ``(world_x, world_y)`` lands on copper of the free
-        marker's fixed layer. Falls back to 'any copper' only when the
+        marker's fixed layer AND its current net. A free marker can only
+        be dragged across copper carrying the same net name as its anchor
+        — disjoint copper of that net on the marker's layer still
+        qualifies, so the marker hops across the gap if the user drags
+        across it, but copper of a different net (or bare substrate)
+        rejects the move and the marker pins at its last valid spot.
+        Falls back to 'any copper on this layer' if the marker has no
+        recorded net (legacy data), and to 'any copper' only when the
         marker's layer can't be determined."""
         layer_id = self._free_marker_layer_id(directive)
+        net = getattr(directive, "p_net", None) or None
         if layer_id is None:
             return self._copper_at_point(world_x, world_y) is not None
-        return self._copper_on_layer_at(world_x, world_y, layer_id) is not None
+        return self._copper_on_layer_at(
+            world_x, world_y, layer_id, net_name=net) is not None
 
     def _marker_drag_hit_test(self, world_x: float,
                               world_y: float) -> bool:
@@ -13623,12 +13754,15 @@ class PdnViewer(QMainWindow):
         if abs(nx - old_xy[0]) < 1e-7 and abs(ny - old_xy[1]) < 1e-7:
             return   # no real change
         if not self._point_on_marker_layer(d, nx, ny):
+            net_label = d.p_net or "?"
             self._suppress_coord_check = True
             try:
                 QMessageBox.warning(
-                    self, "Location not on copper",
-                    f"({nx:g}, {ny:g}) mm is not on copper of layer "
-                    f"{d.layer or '?'}.\n\n"
+                    self, "Location not on same-net copper",
+                    f"({nx:g}, {ny:g}) mm is not on copper of net "
+                    f"{net_label!s} on layer {d.layer or '?'}.\n\n"
+                    "A free marker can only be moved to copper of the "
+                    "same net (disjoint copper of that net is fine).\n\n"
                     "The free marker location is being reverted back to "
                     f"({old_xy[0]:g}, {old_xy[1]:g}) mm.",
                 )
@@ -14106,7 +14240,11 @@ class PdnViewer(QMainWindow):
         child of the GL viewer so it floats over the viewport rather than
         consuming layout space — that keeps the visible copper from
         shifting sideways when the panel appears / disappears. Wired to
-        every GL-viewer resize via :meth:`eventFilter`."""
+        every GL-viewer resize via :meth:`eventFilter`.
+
+        Also pushes a matching inset to the GL viewer's top-right legend
+        chip so it slides left while the panel is visible (otherwise the
+        panel would sit on top of it and hide the via / PTH toggles)."""
         panel = getattr(self, "_editor_panel", None)
         gl = getattr(self, "_gl_viewer", None)
         if panel is None or gl is None:
@@ -14117,6 +14255,7 @@ class PdnViewer(QMainWindow):
         panel.setFixedHeight(max(h, 50))
         panel.move(gl.width() - w - margin, margin)
         panel.raise_()
+        gl.set_legend_right_inset(float(w) if panel.isVisible() else 0.0)
 
     def closeEvent(self, event) -> None:
         """Uninstall the application-wide Shift filter on window close
@@ -19789,8 +19928,8 @@ def _finish_gerber_import(result, pseudo, progress_cb=None) -> tuple:
     _imp_log.info("Gerber import: sbr_records built in %.2fs (%d record(s))",
                   time.monotonic() - _t, len(sbr_records))
 
-    # Via records — what the 2D overlay (Board Features → Vias) and the 3D
-    # via-cylinder pass both iterate. Mirrors the shape build_solve_metadata
+    # Via records — what the 2D via markers and the 3D via-cylinder pass
+    # both iterate. Mirrors the shape build_solve_metadata
     # emits for the Altium path (loader.py), minus solve-only fields like
     # ``segments`` (no FEM has run yet). Empty ``segments`` is fine — the
     # rendering paths gate per-segment styling on the list being non-empty.
