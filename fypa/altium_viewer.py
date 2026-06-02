@@ -1334,7 +1334,9 @@ _OVERLAY_DEFAULT_COLORS: dict[str, tuple[float, float, float]] = {
 # side simply follows the primary colour above. The colour-swatch button
 # overrides this per project.
 _OVERLAY_DEFAULT_BOTTOM_COLORS: dict[str, tuple[float, float, float]] = {
-    "silkscreen": (0.50, 0.50, 0.00),   # olive (#808000)
+    "silkscreen": (0.50, 0.50, 0.00),               # olive (#808000)
+    "components": (0.0, 0x57 / 255, 0.0),           # dark green (#005700)
+    "pads":       (0xb0 / 255, 0x89 / 255, 0x16 / 255),  # brass (#b08916)
 }
 
 # World-space half-width (mm) of an overlay wire-mesh outline ribbon. The
@@ -3559,6 +3561,57 @@ class _SolveWorker(QThread):
                     _log.error("Project is not solveable:\n%s", _summary)
                 except Exception as _exc:
                     _log.error("Project is not solveable (diagnostic failed: %s)", _exc)
+
+                # Recoverable case: the project has copper and the annotation
+                # parse is clean — the *only* missing piece is a SOURCE /
+                # REGULATOR directive (see LoadedProject.is_solveable). Rather
+                # than refuse to load, open the viewer in editor mode with a
+                # stub solution — exactly how a Gerber import opens — so the
+                # user can place a SOURCE marker by hand and then Resolve.
+                # Restricted to a plain initial load: overrides / editor
+                # directives mean the user explicitly asked for a re-solve, so
+                # a missing source there is still a hard failure.
+                recoverable = (
+                    bool(loaded.extracted.enabled_copper_layer_ids())
+                    and not loaded.annotations.errors
+                    and not self._editor_directives
+                    and not self._stackup_overrides
+                    and not self._sink_overrides
+                )
+                if recoverable:
+                    _log.info(
+                        "No SOURCE/REGULATOR directive — opening in editor "
+                        "mode (stub solution) for manual setup."
+                    )
+                    self.stage_changed.emit(
+                        "No PDN settings found — opening in editor mode…"
+                    )
+                    stub_solution = _build_stub_lean_solution_from_loaded(loaded)
+                    # Distinguish this Altium "needs setup" stub from a Gerber
+                    # stub so the GUI can pop the right one-time warning.
+                    stub_solution.solver_info["needs_directives"] = True
+                    # all_copper is built from per_net_layers. With no FEM
+                    # problem to supply them, build the full per-(layer, net)
+                    # geometry ourselves — the same set the solved path passes
+                    # — so every net's copper draws under its real net name.
+                    # (loaded.geometry would only give the per-layer merged
+                    # union, leaving every piece labelled "(none)".)
+                    from fypa.altium_geometry import (
+                        build_per_net_geometry_layers,
+                    )
+                    with _timer.stage("Build stub metadata"):
+                        per_net_layers = build_per_net_geometry_layers(
+                            loaded.extracted,
+                        )
+                        metadata = build_solve_metadata(
+                            loaded, None,
+                            settings=self._settings,
+                            per_net_layers=per_net_layers,
+                        )
+                    _timer.log_breakdown()
+                    self.finished_ok.emit(stub_solution, metadata, pristine_loaded)
+                    return
+
                 self.failed.emit(
                     f"Project is not solveable.\n\n"
                     f"See the log file for details:\n{_log_file}"
@@ -4392,9 +4445,15 @@ class LauncherWindow(QMainWindow):
 
     def _on_solve_finished(self, new_solution, metadata: dict,
                            loaded_project, new_settings) -> None:
-        self._open_viewer_and_close(new_solution, metadata,
-                                    initial_settings=new_settings,
-                                    loaded_project=loaded_project)
+        new_win = self._open_viewer_and_close(
+            new_solution, metadata,
+            initial_settings=new_settings,
+            loaded_project=loaded_project,
+        )
+        # An Altium project with no SOURCE/REGULATOR loads as an editor-mode
+        # stub instead of failing — let the user know it's set up for manual
+        # marker placement rather than a finished solve.
+        _maybe_warn_needs_directives(new_win or self, new_solution)
 
     def _on_menu_open_solution(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
@@ -4494,7 +4553,7 @@ class LauncherWindow(QMainWindow):
                 f"Solution loaded but the viewer failed to open:\n\n"
                 f"{type(e).__name__}: {e}",
             )
-            return
+            return None
         if project is not None and getattr(project, "editor_directives", None):
             new_win._set_solve_stale(True)
         _register_viewer(new_win)
@@ -4514,6 +4573,7 @@ class LauncherWindow(QMainWindow):
         QTimer.singleShot(
             0, lambda: app.setQuitOnLastWindowClosed(prev_quit)
         )
+        return new_win
 
 
 class _ProjectSaveDialog(QDialog):
@@ -10793,6 +10853,22 @@ class PdnViewer(QMainWindow):
             "border": t["border"], "bg": t["bg"],
             "hover": t["bg_hover"], "accent": t["accent"],
         }
+        # Click-absorbing backdrop behind the edit toggle + free-marker
+        # buttons. Created first so it sits below them in the GL viewer's
+        # child stacking order. It extends a few px past the buttons so a
+        # click that lands just outside a button's hit area is swallowed
+        # here instead of falling through to the viewport and selecting /
+        # deselecting copper. Shown only in editor mode (see
+        # _position_editor_overlays).
+        bg = _ClickAbsorbingPanel(self._gl_viewer)
+        bg.setStyleSheet(
+            f"background-color: {t['bg']};"
+            f" border: 1px solid {t['border']};"
+            f" border-radius: 8px;"
+        )
+        bg.hide()
+        self._editor_overlay_bg = bg
+
         btn = QToolButton(self._gl_viewer)
         btn.setCheckable(True)
         btn.setCursor(Qt.PointingHandCursor)
@@ -10879,6 +10955,30 @@ class PdnViewer(QMainWindow):
             rbtn.adjustSize()
             rbtn.move(x + 2, margin)
             rbtn.raise_()
+
+        # Size the click-absorbing backdrop to wrap the edit toggle + the two
+        # free-marker buttons (not the Resolve button, which sits apart), with
+        # a few px of slop so a near-miss click is caught. Only shown in
+        # editor mode, when the free-marker buttons are visible.
+        bg = getattr(self, "_editor_overlay_bg", None)
+        if bg is not None:
+            rects = [
+                b.geometry()
+                for b in (btn,
+                          getattr(self, "_editor_add_source_btn", None),
+                          getattr(self, "_editor_add_sink_btn", None))
+                if b is not None and not b.isHidden()
+            ]
+            if getattr(self, "_editor_mode", False) and rects:
+                union = rects[0]
+                for r in rects[1:]:
+                    union = union.united(r)
+                pad = 6
+                bg.setGeometry(union.adjusted(-pad, -pad, pad, pad))
+                bg.lower()   # keep it behind the buttons it wraps
+                bg.show()
+            else:
+                bg.hide()
 
     def _build_editor_panel(self) -> QWidget:
         """Right-hand panel — multi-purpose. In editor mode it hosts the
@@ -11958,14 +12058,46 @@ class PdnViewer(QMainWindow):
         prim["_shape"] = shp
         return prepped
 
-    def _via_or_pad_at_point(self, world_x: float, world_y: float
+    def _pad_overlay_visible(self, rec: dict) -> bool:
+        """True if pad ``rec`` is currently shown by the Pads overlay on at
+        least one board side. Mirrors the visibility test in the pad loop of
+        :meth:`_refresh_overlay_geometry` so editor-mode selection can't pick
+        a pad the user can't actually see."""
+        md = self.metadata or {}
+        enabled = md.get("enabled_copper_layer_ids") or []
+        if not enabled:
+            return False
+        lids = rec.get("layer_ids") or []
+        sides = self._overlay_side_states("pads")
+        alphas = self._overlay_side_alpha("pads")
+        rail_members = set(self._effective_rail_members(self._visible_rails()))
+        for side, lid in (("top", enabled[0]), ("bottom", enabled[-1])):
+            if lid is None or lid not in lids:
+                continue
+            vis, _solid = sides[side]
+            if vis is None:
+                continue
+            if vis == "rails" and not (
+                    rail_members and {rec.get("net")} & rail_members):
+                continue
+            if alphas.get(side, 1.0) <= 0.0:
+                continue
+            return True
+        return False
+
+    def _via_or_pad_at_point(self, world_x: float, world_y: float,
+                              require_pad_visible: bool = False
                               ) -> dict | None:
         """Fast path for via / through-hole-pad / SMT-pad clicks. These
         sit on top of copper polygons, so they need to be tested before
         the per-polygon all-copper hit-test would shadow them.
 
         Returns a primitive-shaped dict ``{"kind", "record", "layer_id",
-        "net"}`` for the topmost visible hit, or ``None``."""
+        "net"}`` for the topmost visible hit, or ``None``.
+
+        When ``require_pad_visible`` is set, SMT pads hidden by the Pads
+        overlay are skipped (editor mode — you can only select what you
+        can see)."""
         md = self.metadata or {}
         visible = self._visible_all_copper_layer_ids()
         if not visible:
@@ -12012,6 +12144,8 @@ class PdnViewer(QMainWindow):
                 outline = rec.get("outline") or []
                 if len(outline) < 3:
                     continue
+                if require_pad_visible and not self._pad_overlay_visible(rec):
+                    continue
                 try:
                     poly = _sg.Polygon(outline)
                     if poly.is_empty or not poly.contains(pt):
@@ -12021,7 +12155,8 @@ class PdnViewer(QMainWindow):
                 _take("pad", rec, list(rec.get("layer_ids") or []))
         return best
 
-    def _primitive_at_point(self, world_x: float, world_y: float
+    def _primitive_at_point(self, world_x: float, world_y: float,
+                             require_pad_visible: bool = False
                              ) -> dict | None:
         """Topmost visible copper primitive containing the world-mm point.
         Returns a dict ``{"kind", "record", "layer_id", "net"}`` or
@@ -12030,8 +12165,12 @@ class PdnViewer(QMainWindow):
         Probe order: vias / pads first (they sit on top of pours), then
         ``_all_copper_at_point`` narrows the topmost-visible (layer, net),
         then walks the per-(layer, net) primitive list for the
-        track / arc / fill / region whose shape contains the point."""
-        hit = self._via_or_pad_at_point(world_x, world_y)
+        track / arc / fill / region whose shape contains the point.
+
+        ``require_pad_visible`` is forwarded to :meth:`_via_or_pad_at_point`
+        so editor-mode picks ignore pads hidden by the Pads overlay."""
+        hit = self._via_or_pad_at_point(
+            world_x, world_y, require_pad_visible=require_pad_visible)
         if hit is not None:
             return hit
         cover = self._all_copper_at_point(world_x, world_y)
@@ -12366,7 +12505,8 @@ class PdnViewer(QMainWindow):
         if marker is not None:
             self._select_free_marker(marker)
             return
-        hit = self._primitive_at_point(world_x, world_y)
+        hit = self._primitive_at_point(world_x, world_y,
+                                       require_pad_visible=True)
         if hit is not None and hit.get("net"):
             self._select_copper(hit["net"], hit,
                                 anchor_xy=(world_x, world_y))
@@ -12807,21 +12947,51 @@ class PdnViewer(QMainWindow):
             self._populate_editor_form()
 
     def _build_free_marker_location(self, lay, directive) -> None:
-        """Location block for a selected free marker: the fixed layer plus
+        """Location block for a selected free marker: a layer picker plus
         editable X / Y boxes and marker-edit undo / redo buttons (covering
-        both moves and deletes). The layer is shown read-only — a free
-        marker's layer is fixed once it has been placed."""
+        both moves and deletes). The layer is offered as a drop-down listing
+        only the copper layers that carry the marker's net at its current
+        X / Y — so the marker can be re-pinned to another layer of the same
+        rail at the same spot (a stacked plane / pour). When the net exists on
+        just one layer there, the picker collapses to a read-only label."""
         t = _T()
         lay.addWidget(QLabel("Location"))
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
 
-        layer_lbl = QLabel(_esc(directive.layer or "?"))
-        layer_lbl.setToolTip("A free marker's layer is fixed once placed.")
-        layer_lbl.setStyleSheet(f"color: {t['fg_muted']};")
-        form.addRow("Layer", layer_lbl)
-
         ax, ay = directive.anchor_xy or (0.0, 0.0)
+        net = getattr(directive, "p_net", None) or None
+        cur_lid = self._free_marker_layer_id(directive)
+        options = self._layers_with_net_at(float(ax), float(ay), net)
+        # Guarantee the marker's current layer is always selectable, even if a
+        # boundary-point containment test happened to miss it.
+        if cur_lid is not None and not any(lid == cur_lid for lid, _ in options):
+            options.insert(0, (cur_lid, directive.layer or "?"))
+
+        self._ef_layer_combo = None
+        if len(options) > 1:
+            combo = QComboBox()
+            for lid, phys in options:
+                combo.addItem(phys, lid)
+            sel_idx = next(
+                (i for i, (lid, _) in enumerate(options) if lid == cur_lid),
+                0,
+            )
+            combo.setCurrentIndex(sel_idx)
+            combo.setToolTip(
+                "Move this marker to another copper layer that carries the "
+                "same net at this X / Y (e.g. a stacked plane or pour).")
+            combo.currentIndexChanged.connect(
+                self._on_free_marker_layer_changed)
+            self._ef_layer_combo = combo
+            form.addRow("Layer", combo)
+        else:
+            layer_lbl = QLabel(_esc(directive.layer or "?"))
+            layer_lbl.setToolTip(
+                "This net only exists on one copper layer at this location.")
+            layer_lbl.setStyleSheet(f"color: {t['fg_muted']};")
+            form.addRow("Layer", layer_lbl)
+
         self._ef_loc_x = QLineEdit(f"{float(ax):.4f}")
         self._ef_loc_x.setValidator(QDoubleValidator(-1e9, 1e9, 4))
         self._ef_loc_x.setToolTip("X position (mm) — must stay on copper")
@@ -13057,6 +13227,7 @@ class PdnViewer(QMainWindow):
         self._ef_loc_y = None
         self._ef_undo_move = None
         self._ef_redo_move = None
+        self._ef_layer_combo = None
         if sel["kind"] == "free" and existing is not None:
             self._build_free_marker_location(lay, existing)
 
@@ -13475,6 +13646,43 @@ class PdnViewer(QMainWindow):
                     continue
         return None
 
+    def _layers_with_net_at(self, world_x: float, world_y: float,
+                            net_name: str | None
+                            ) -> list[tuple[int, str]]:
+        """Every copper layer whose ``net_name`` copper covers ``(world_x,
+        world_y)``, as ``(layer_id, physical_name)`` pairs sorted top-to-
+        bottom by stackup rank. Drives the free-marker layer picker: a marker
+        sitting where a rail's copper is stacked on several layers can be
+        moved between them. Empty list when ``net_name`` is unset or the point
+        lies on that net's copper on only zero/one layer."""
+        md = self.metadata
+        if not md or not net_name:
+            return []
+        pt = _sg.Point(world_x, world_y)
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        out: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for rec in md.get("all_copper") or []:
+            lid = rec.get("layer_id")
+            if lid in seen or rec.get("net") != net_name:
+                continue
+            phys = id_to_phys.get(lid)
+            if phys is None:
+                continue
+            for poly in rec.get("polygons", []):
+                prepped = self._copper_poly_prepared(poly)
+                if prepped is None:
+                    continue
+                try:
+                    if prepped.contains(pt):
+                        out.append((lid, phys))
+                        seen.add(lid)
+                        break
+                except Exception:
+                    continue
+        out.sort(key=lambda lp: self._phys_stackup_rank.get(lp[1], 1 << 30))
+        return out
+
     def _point_on_marker_layer(self, directive,
                                world_x: float, world_y: float) -> bool:
         """Whether ``(world_x, world_y)`` lands on copper of the free
@@ -13777,6 +13985,7 @@ class PdnViewer(QMainWindow):
         self._sync_free_marker_coord_fields(
             float(d.anchor_xy[0]), float(d.anchor_xy[1]))
         self._refresh_free_marker_net_combo()
+        self._refresh_free_marker_layer_combo()
 
     def _refresh_free_marker_net_combo(self) -> None:
         """Resync the form's net picker to the selected free marker's
@@ -13793,6 +14002,57 @@ class PdnViewer(QMainWindow):
             combo.addItems(self._form_p_nets(self._editor_selection))
             if d.p_net:
                 self._set_combo(combo, d.p_net)
+            combo.blockSignals(False)
+        except RuntimeError:
+            pass   # form rebuilt out from under us — harmless
+
+    def _on_free_marker_layer_changed(self, _idx: int) -> None:
+        """Re-pin the selected free marker to the layer chosen in the layer
+        picker. The anchor X / Y and net are unchanged — the picker only ever
+        offers layers carrying the same net at this point — so this is just a
+        layer swap. Selecting the current layer is a no-op."""
+        combo = getattr(self, "_ef_layer_combo", None)
+        sel = self._editor_selection
+        if combo is None or not sel or sel.get("kind") != "free":
+            return
+        new_lid = combo.currentData()
+        if new_lid is None:
+            return
+        d = self._directive_for_selection()
+        if d is None or d.layer_id == int(new_lid):
+            return
+        d.layer = combo.currentText()
+        d.layer_id = int(new_lid)
+        self._mark_project_dirty()
+        # 3D z + the layer-scoped move constraint both key off layer_id, so a
+        # full re-render is needed (markers, highlight, depth).
+        self._render()
+
+    def _refresh_free_marker_layer_combo(self) -> None:
+        """Rebuild the free-marker layer picker's option list against the
+        marker's current X / Y — used after an X / Y text edit moved it
+        (which doesn't rebuild the whole form). A no-op when the picker isn't
+        currently shown (the net exists on only one layer there)."""
+        combo = getattr(self, "_ef_layer_combo", None)
+        d = self._directive_for_selection()
+        if combo is None or d is None or d.anchor_xy is None:
+            return
+        net = getattr(d, "p_net", None) or None
+        options = self._layers_with_net_at(
+            float(d.anchor_xy[0]), float(d.anchor_xy[1]), net)
+        cur_lid = self._free_marker_layer_id(d)
+        if cur_lid is not None and not any(lid == cur_lid for lid, _ in options):
+            options.insert(0, (cur_lid, d.layer or "?"))
+        try:
+            combo.blockSignals(True)
+            combo.clear()
+            for lid, phys in options:
+                combo.addItem(phys, lid)
+            sel_idx = next(
+                (i for i, (lid, _) in enumerate(options) if lid == cur_lid),
+                0,
+            )
+            combo.setCurrentIndex(sel_idx)
             combo.blockSignals(False)
         except RuntimeError:
             pass   # form rebuilt out from under us — harmless
@@ -17541,6 +17801,10 @@ class PdnViewer(QMainWindow):
             # the point of re-running is to inspect the updated heatmap.
             heatmap_idx = getattr(new_win, "_heatmap_tab_index", 0)
             new_win.tabs.setCurrentIndex(heatmap_idx)
+            # A re-run on a project still lacking a SOURCE/REGULATOR comes
+            # back as an editor-mode stub — flag it the same way the initial
+            # load does instead of silently showing an empty heatmap.
+            _maybe_warn_needs_directives(new_win, new_solution)
         except Exception as e:
             log.exception("Failed to open new viewer after re-solve")
             _t = _T()
@@ -19626,6 +19890,26 @@ def _triangulate_layer_for_stub_worker(polys):
             continue
         out.append((verts, tris))
     return out
+
+
+def _maybe_warn_needs_directives(parent_win, solution) -> None:
+    """Pop a one-time notice when ``solution`` is the editor-mode stub built
+    for an Altium project that loaded without any SOURCE / REGULATOR
+    directive. No-op for ordinary solved solutions and for Gerber stubs
+    (which never carry the ``needs_directives`` sentinel).
+    """
+    si = getattr(solution, "solver_info", None)
+    if not isinstance(si, dict) or not si.get("needs_directives"):
+        return
+    QMessageBox.information(
+        parent_win,
+        "No PDN settings found",
+        "This design has no predefined SOURCE or REGULATOR directive, so "
+        "there's nothing to solve yet.\n\n"
+        "It's been opened in editor mode — switch on Edit, place a SOURCE "
+        "marker (plus any SINK / REGULATOR) on the copper, then press "
+        "Resolve. This is the same manual setup a Gerber import uses.",
+    )
 
 
 def _build_stub_lean_solution_from_loaded(loaded):

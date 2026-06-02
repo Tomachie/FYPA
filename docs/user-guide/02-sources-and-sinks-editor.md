@@ -262,7 +262,7 @@ re-running the FEM.
 | `P net '+5V' not found on the board; skipped`                                | The chosen net name does not exist in the current PCB extraction.            | Re-check the net name against the dropdown options — only nets present on the PCB are listed. |
 | Form opens read-only with an Unlock button even though I want a fresh directive | The component already has a schematic `PDN_*` directive.                   | Click **Unlock** — see 2.5.                                                  |
 | `SERIES` option missing from the role dropdown                                | A free marker is selected (SERIES is component-bound only).                  | Click the component instead, or pick a different role.                       |
-| Marker dropped on the wrong layer                                             | Free markers are placed on the currently active layer.                       | Remove the marker, switch the active layer in the side panel, and drop a new one. |
+| Marker dropped on the wrong layer                                             | Free markers are placed on the currently active layer.                       | Select the marker and use the **Layer** drop-down in its Location block to move it to another layer carrying the same net at that spot. If the net only exists on one layer there, remove the marker, switch the active layer in the side panel, and drop a new one. |
 
 ## Next steps
 

@@ -1298,7 +1298,7 @@ def _gil_yield(i: int, every: int = 256) -> None:
 
 def build_solve_metadata(
     loaded: LoadedProject,
-    problem: _pp.Problem,
+    problem: _pp.Problem | None = None,
     mesher_config=None,
     solver_info=None,
     via_segment_records: list[dict] | None = None,
@@ -1658,11 +1658,15 @@ def build_solve_metadata(
             "is_keepout": bool(f.is_keepout),
         })
 
+    # ``problem`` is None on the editor-mode stub path (an Altium project
+    # loaded without any SOURCE/REGULATOR directive, opened for manual setup
+    # like a Gerber import) — no FEM was assembled, so the network-derived
+    # counts are simply zero.
     via_coupling_count = sum(
         1 for n in problem.networks
         # Heuristic: coupling networks have exactly 2 connections + 1 Resistor.
         if len(n.connections) == 2 and len(n.elements) == 1
-    )
+    ) if problem is not None else 0
 
     # Stub copper — pieces the FEM stub filter dropped. Each entry carries
     # the layer_id, net name, and the polygon's exterior ring (and any
@@ -1787,8 +1791,10 @@ def build_solve_metadata(
         "annotation_warnings": list(loaded.annotations.warnings),
         "annotation_errors": list(loaded.annotations.errors),
         "fem_stats": {
-            "padne_layer_count": len(problem.layers),
-            "padne_network_count": len(problem.networks),
+            "padne_layer_count": len(problem.layers) if problem is not None else 0,
+            "padne_network_count": (
+                len(problem.networks) if problem is not None else 0
+            ),
             "via_coupling_network_count": via_coupling_count,
         },
         "mesher_config": (
