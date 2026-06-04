@@ -315,6 +315,13 @@ class MarkerGroup:
     min_pixel_diameter: float = 0.0
     ring_colors: list[str | None] | None = None
     ring_width: float = 0.0
+    # Per-marker slot override: when set, entry ``i`` is the marker's
+    # ``(length_mm, width_mm, rotation_deg, rounded)`` capsule (a slotted
+    # drill) — ``rounded`` picks an obround vs a square-cornered rectangle —
+    # or ``None`` to fall back to the normal symbol. The short axis (width)
+    # is still floored at ``min_pixel_diameter`` so a tiny slot stays visible.
+    world_obrounds: (list[tuple[float, float, float, bool] | None]
+                     | None) = None
 
 
 def _install_default_surface_format() -> None:
@@ -2776,6 +2783,7 @@ class GLMeshViewer(QOpenGLWidget):
             default_size = float(group.size)
             zs = group.zs
             wdiams = group.world_diameters_mm
+            obrounds = group.world_obrounds
             min_px = float(group.min_pixel_diameter)
             # Per-marker layer-colour ring (drawn as an enlarged glyph
             # behind the marker so the colour peeks out as a band around
@@ -2803,6 +2811,25 @@ class GLMeshViewer(QOpenGLWidget):
                 if (px < -size or px > self.width() + size
                         or py < -size or py > self.height() + size):
                     continue
+                # Slotted-drill marker: draw a capsule sized + oriented to the
+                # slot. The long-axis endpoints are projected through the same
+                # world→screen transform as the centre, so the on-screen length
+                # and angle stay correct under any pan / zoom / y-flip; the
+                # short axis (width) scales with zoom, floored at min_px.
+                ob = obrounds[i] if obrounds is not None else None
+                if ob is not None:
+                    length_mm, width_mm, rot_deg, rounded = ob
+                    th = math.radians(rot_deg)
+                    hx = 0.5 * length_mm * math.cos(th)
+                    hy = 0.5 * length_mm * math.sin(th)
+                    sx1, sy1 = self.world_to_screen(wx + hx, wy + hy, wz)
+                    sx2, sy2 = self.world_to_screen(wx - hx, wy - hy, wz)
+                    length_px = math.hypot(sx1 - sx2, sy1 - sy2)
+                    width_px = max(float(width_mm) / mpp, min_px)
+                    ang = math.atan2(sy1 - sy2, sx1 - sx2)
+                    self._draw_obround(painter, px, py, length_px,
+                                       width_px, ang, rounded)
+                    continue
                 rc = ring_colors[i] if rings_on else None
                 if rc:
                     # Stroke the SAME-size glyph with a thick layer-colour
@@ -2821,6 +2848,27 @@ class GLMeshViewer(QOpenGLWidget):
                     painter.setBrush(fill)
                     painter.setPen(pen)
                 self._draw_symbol(painter, px, py, group.symbol, size)
+
+    @staticmethod
+    def _draw_obround(painter: QPainter, px: float, py: float,
+                      length_px: float, width_px: float,
+                      angle_rad: float, rounded: bool = True) -> None:
+        """Draw a slot marker centred at ``(px, py)`` with the given
+        screen-space length, width and orientation. ``rounded`` selects an
+        obround / stadium (radius = width / 2, matching Altium's rounded slot
+        and the filled overlay) versus a square-cornered rectangle (Altium's
+        "Rectangular" hole). Used for slotted drill markers."""
+        r = 0.5 * max(width_px, 0.0)
+        length_px = max(length_px, width_px)  # never shorter than a circle
+        painter.save()
+        painter.translate(px, py)
+        painter.rotate(math.degrees(angle_rad))
+        rect = QRectF(-0.5 * length_px, -r, length_px, 2.0 * r)
+        if rounded:
+            painter.drawRoundedRect(rect, r, r)
+        else:
+            painter.drawRect(rect)
+        painter.restore()
 
     @staticmethod
     def _draw_symbol(painter: QPainter, px: float, py: float,

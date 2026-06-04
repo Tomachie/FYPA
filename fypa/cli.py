@@ -406,7 +406,7 @@ def _load_solution_pickle(path, *, lean_ify: bool = True
 # Bump when the cache pickle format changes in an incompatible way so old
 # caches are invalidated automatically (a load with a different version
 # treats it as a miss).
-_CACHE_SCHEMA_VERSION: int = 6
+_CACHE_SCHEMA_VERSION: int = 7
 
 # Bump when a solver/loader/geometry change alters numerical output — even
 # whitespace edits to the tool sources used to invalidate the cache because

@@ -441,10 +441,10 @@ def _resolve_terminal(
     pins = tuple(
         TerminalPin(
             pad_designator=p.designator,
-            layer_id=_terminal_layer_for_pad(p, enabled_layers),
+            layer_id=(_tl := _terminal_layer_for_pad(p, enabled_layers)),
             net_index=p.net_index,
             point=p.center,
-            pad_polygon=_pad_polygon(p),
+            pad_polygon=_pad_polygon(p, _tl),
         )
         for p in matched
     )

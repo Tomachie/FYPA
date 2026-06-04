@@ -40,6 +40,7 @@ from fypa.altium.extract import (
     ExtractedProject,
     NO_NET,
     extract_project,
+    slot_hole_geometry,
 )
 import dataclasses
 from fypa.altium_geometry import (
@@ -89,6 +90,19 @@ FALLBACK_VIA_RESISTANCE_OHM: float = 1.0e-3
 # modelled as a copper-coloured rod inside the plated barrel and combined
 # with the wall via the standard parallel-resistor formula.
 CONDUCTIVE_FILL_RESISTIVITY_OHM_MM: float = 5.0e-3
+
+# How to decide whether a via's centre void is modelled as a conductive
+# fill-rod in parallel with the plated wall. One of:
+#   "auto" — per-via, from the Altium IPC-4761 FILLING material string
+#            (see :func:`_is_conductive_fill`); the default.
+#   "all"  — force every coupled via/through-hole to be treated as
+#            conductively filled (use the fab's fill spec when Altium's
+#            IPC-4761 metadata is absent or unreliable).
+#   "none" — force no via to be treated as filled — the plated barrel is
+#            the sole DC path regardless of the design's IPC-4761 rows.
+# Overridable from the viewer's Settings tab; "all"/"none" use the
+# CONDUCTIVE_FILL_RESISTIVITY_OHM_MM value above for the fill-rod.
+CONDUCTIVE_FILL_MODE: str = "auto"
 
 # Multi-pin terminal coupling. Padne requires each terminal pin to have its
 # own NodeID; pins belonging to the same terminal are tied together via small
@@ -172,6 +186,9 @@ class SolveSettings:
     coupling_resistance_ohm: float = COUPLING_RESISTANCE_OHM
     fallback_via_resistance_ohm: float = FALLBACK_VIA_RESISTANCE_OHM
     conductive_fill_resistivity_ohm_mm: float = CONDUCTIVE_FILL_RESISTIVITY_OHM_MM
+    # Conductive-fill override: "auto" (per-via from Altium IPC-4761 data),
+    # "all" (force every via filled), or "none" (force none filled).
+    conductive_fill_mode: str = CONDUCTIVE_FILL_MODE
     # Meshing
     mesh_min_angle_deg: float = 20.0
     mesh_max_size_mm: float = 0.6
@@ -213,6 +230,7 @@ class SolveSettings:
         globals()["CONDUCTIVE_FILL_RESISTIVITY_OHM_MM"] = (
             self.conductive_fill_resistivity_ohm_mm
         )
+        globals()["CONDUCTIVE_FILL_MODE"] = self.conductive_fill_mode
 
     @classmethod
     def from_metadata(cls, metadata: dict | None) -> SolveSettings:
@@ -247,6 +265,9 @@ class SolveSettings:
             s.conductive_fill_resistivity_ohm_mm = float(
                 phys["conductive_fill_resistivity_ohm_mm"]
             )
+        mode = phys.get("conductive_fill_mode")
+        if isinstance(mode, str) and mode in ("auto", "all", "none"):
+            s.conductive_fill_mode = mode
         if "temperature_c" in phys:
             s.temperature_c = float(phys["temperature_c"])
         if "copper_temp_coefficient_per_c" in phys:
@@ -756,6 +777,26 @@ def _is_conductive_fill(ipc4761_via_type: int, fill_material: str) -> bool:
     return any(kw in mat for kw in _CONDUCTIVE_MATERIAL_KEYWORDS)
 
 
+def _resolve_conductive_fill(
+    ipc4761_via_type: int, fill_material: str, mode: str | None = None,
+) -> bool:
+    """Decide whether one via is treated as conductively filled, honouring
+    the Settings-tab override ``mode``.
+
+    ``"all"`` / ``"none"`` force the answer regardless of the design's
+    IPC-4761 metadata; ``"auto"`` (the default) falls back to the per-via
+    :func:`_is_conductive_fill` heuristic. ``mode=None`` reads the current
+    module-level :data:`CONDUCTIVE_FILL_MODE` so callers that omit it pick
+    up a monkey-patched Settings-tab value (Re-run Solver path)."""
+    if mode is None:
+        mode = CONDUCTIVE_FILL_MODE
+    if mode == "all":
+        return True
+    if mode == "none":
+        return False
+    return _is_conductive_fill(ipc4761_via_type, fill_material)
+
+
 # Friendly IPC-4761 type labels for display. Falls back to "Type {n}" /
 # "—" for unknown / NONE values. Kept here so the viewer's Vias tab and
 # any other surface can share the exact same strings.
@@ -807,6 +848,7 @@ def _coupling_networks(
     layer_z_mm: dict[int, float],
     plating_thickness_mm: float | None = None,
     conductive_fill_resistivity_ohm_mm: float | None = None,
+    conductive_fill_mode: str | None = None,
 ) -> tuple[list[_pp.Network], list[dict]]:
     """Build small-Resistor networks coupling adjacent enabled copper layers
     at each through-hole / via location.
@@ -833,6 +875,8 @@ def _coupling_networks(
         plating_thickness_mm = PLATING_THICKNESS_MM
     if conductive_fill_resistivity_ohm_mm is None:
         conductive_fill_resistivity_ohm_mm = CONDUCTIVE_FILL_RESISTIVITY_OHM_MM
+    if conductive_fill_mode is None:
+        conductive_fill_mode = CONDUCTIVE_FILL_MODE
     networks: list[_pp.Network] = []
     segment_records: list[dict] = []
     skipped_unknown_net = 0
@@ -876,8 +920,8 @@ def _coupling_networks(
             else:
                 skipped_missing_layer += 1
             continue
-        is_conductive_fill = _is_conductive_fill(
-            site.ipc4761_via_type, site.fill_material,
+        is_conductive_fill = _resolve_conductive_fill(
+            site.ipc4761_via_type, site.fill_material, conductive_fill_mode,
         )
         fill_rho = (
             conductive_fill_resistivity_ohm_mm if is_conductive_fill else None
@@ -1120,11 +1164,18 @@ def _arc_polyline(arc) -> list[list[float]]:
 
 def _stroke_font_tables(kind: int):
     """Return ``(glyphs, advances)`` for one of Altium's three built-in PCB
-    stroke fonts — 0 = Default, 1 = Sans Serif, 2 = Serif."""
+    stroke fonts.
+
+    ``kind`` is the native ``Texts6`` ``stroke_font_type`` value, whose
+    convention is **1 = Default, 2 = Sans Serif, 3 = Serif** (matching
+    altium_monkey's ``canonicalize_stroke_font_type``). ``0`` / unknown
+    values fall back to Default — the same compatibility path Altium's own
+    renderer uses. (An earlier 0-based reading here mapped Default text to
+    Sans Serif, so designators rendered in the wrong face.)"""
     import altium_monkey.altium_stroke_font_data as sfd
-    if kind == 1:
-        return sfd.STROKE_FONT_SANS_SERIF, sfd.STROKE_ADVANCES_SANS_SERIF
     if kind == 2:
+        return sfd.STROKE_FONT_SANS_SERIF, sfd.STROKE_ADVANCES_SANS_SERIF
+    if kind == 3:
         return sfd.STROKE_FONT_SERIF, sfd.STROKE_ADVANCES_SERIF
     return sfd.STROKE_FONT_DEFAULT, sfd.STROKE_ADVANCES_DEFAULT
 
@@ -1277,6 +1328,27 @@ def _build_overlay_records(proj: ExtractedProject, net_name_fn) -> dict:
         "silkscreen": silkscreen,
         "components": components,
         "designators": designators,
+    }
+
+
+def _slot_record_fields(pad) -> dict:
+    """Non-round-drill fields for a viewer metadata record (NPTH / PTH dict).
+
+    Returns ``{}`` for a round bore — the consumer then falls back to its
+    ``diameter_mm`` circle. For a rectangular or obround bore returns the
+    draw parameters (long axis, short axis, absolute rotation) plus
+    ``slot_kind`` (``"rect"`` square-cornered, or ``"obround"`` rounded). See
+    :func:`fypa.altium.extract.slot_hole_geometry`."""
+    geom = slot_hole_geometry(pad)
+    if geom is None:
+        return {}
+    kind, length_mm, width_mm, rot_deg = geom
+    return {
+        "is_slot": True,
+        "slot_kind": kind,
+        "slot_length_mm": length_mm,
+        "slot_width_mm": width_mm,
+        "slot_rotation_deg": rot_deg,
     }
 
 
@@ -1455,7 +1527,7 @@ def build_solve_metadata(
             "ipc4761_via_type": ipc_type,
             "ipc4761_label": ipc4761_label(ipc_type, fill_mat),
             "fill_material": fill_mat,
-            "is_conductive_fill": _is_conductive_fill(ipc_type, fill_mat),
+            "is_conductive_fill": _resolve_conductive_fill(ipc_type, fill_mat),
         })
 
     # Plated through-hole pads — same coupling-site treatment as vias in the
@@ -1484,11 +1556,13 @@ def build_solve_metadata(
                 npth_d = float(p.hole_mm) or max(
                     float(p.width_mm), float(p.height_mm))
                 if npth_d > 0:
-                    npth.append({
+                    rec = {
                         "x_mm": p.center.x,
                         "y_mm": p.center.y,
                         "diameter_mm": npth_d,
-                    })
+                    }
+                    rec.update(_slot_record_fields(p))
+                    npth.append(rec)
                 continue
             site_segments = segments_by_site.get(
                 _site_key(p.center.x, p.center.y, p.net_index), []
@@ -1497,7 +1571,7 @@ def build_solve_metadata(
             comp_des = comp_des_by_idx.get(p.component_index, "")
             designator = (f"{comp_des}-{p.designator}" if comp_des
                           else str(p.designator))
-            pths.append({
+            pth_rec = {
                 "x_mm": p.center.x,
                 "y_mm": p.center.y,
                 "net": _net_name(p.net_index),
@@ -1513,7 +1587,9 @@ def build_solve_metadata(
                 "ipc4761_label": "—",
                 "fill_material": "",
                 "is_conductive_fill": False,
-            })
+            }
+            pth_rec.update(_slot_record_fields(p))
+            pths.append(pth_rec)
 
     # Pad outlines for the viewer's Overlays control (the Pads row) —
     # every SMT or
@@ -1548,11 +1624,27 @@ def build_solve_metadata(
                 layer_ids = [p.layer_id]
             else:
                 continue
+            # Pads with a per-layer pad stack (different shape/size on
+            # different layers) carry a layer_id → ring map so the overlay
+            # draws the correct shape on each board side. Only populated for
+            # layers whose outline differs from the default (top) ``ring``;
+            # the viewer falls back to ``outline`` for any missing layer.
+            outline_by_layer: dict[str, list] = {}
+            if getattr(p, "layer_variations", ()):
+                for lid in layer_ids:
+                    lshape = _pad_outer_shape(p, lid)
+                    lext = getattr(lshape, "exterior", None) if lshape else None
+                    if lext is None or lext.is_empty:
+                        continue
+                    lring = [[float(x), float(y)] for x, y in lext.coords]
+                    if len(lring) >= 3 and lring != ring:
+                        outline_by_layer[str(lid)] = lring
             comp_des = comp_des_by_idx_p.get(p.component_index, "")
             designator = (f"{comp_des}-{p.designator}" if comp_des
                           else str(p.designator))
             pads_outline.append({
                 "outline": ring,
+                "outline_by_layer": outline_by_layer,
                 "layer_ids": layer_ids,
                 "is_through_hole": bool(p.is_through_hole),
                 "is_smt": bool(p.is_smt),
@@ -1775,6 +1867,7 @@ def build_solve_metadata(
             "coupling_resistance_ohm": COUPLING_RESISTANCE_OHM,
             "conductive_fill_resistivity_ohm_mm":
                 CONDUCTIVE_FILL_RESISTIVITY_OHM_MM,
+            "conductive_fill_mode": CONDUCTIVE_FILL_MODE,
             "note_via_resistance": (
                 "Per-via inter-layer resistance is computed from the via's "
                 "drill diameter, the plating thickness above, and the "

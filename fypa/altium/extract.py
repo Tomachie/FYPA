@@ -141,6 +141,62 @@ class RawPad:
     is_smt: bool
     corner_radius_pct: int = 0  # 0-100; percentage of min(w,h)/2 used as corner radius
     is_plated: bool = True      # False for NPTH mounting / mechanical holes
+    # Drill-hole shape. ``hole_shape`` is Altium's raw code (0=round, 1=square,
+    # 2=slot). For a slot the drill is an obround: width = ``hole_mm`` (the
+    # short axis), length = ``slot_length_mm`` (long axis), rotated by
+    # ``slot_rotation_deg`` *relative to* the pad's own ``rotation_deg``.
+    # A slot is only "real" when ``hole_shape == 2`` and the slot is longer
+    # than the bore (``slot_length_mm > hole_mm``) — see :func:`is_slot_hole`.
+    hole_shape: int = 0
+    slot_length_mm: float = 0.0
+    slot_rotation_deg: float = 0.0
+    # Per-copper-layer pad-stack variations, for pads whose shape/size differs
+    # across layers (Altium "Top-Middle-Bottom" or "Full Stack" pad modes).
+    # Each entry is ``(layer_id, shape, width_mm, height_mm, corner_radius_pct)``
+    # and lists only copper layers that differ from the top-level
+    # ``shape`` / ``width_mm`` / ``height_mm`` / ``corner_radius_pct`` values.
+    # Empty for ordinary uniform pads (the top-level fields then apply on every
+    # copper layer the pad touches).
+    layer_variations: tuple[tuple[int, int, float, float, int], ...] = ()
+
+
+def slot_hole_geometry(pad) -> tuple[str, float, float, float] | None:
+    """Non-round drill geometry of a pad, or ``None`` for a plain round bore.
+
+    Returns ``(kind, length_mm, width_mm, rotation_deg)`` where ``width_mm``
+    is the drilled bore (short axis), ``length_mm`` the long axis and
+    ``rotation_deg`` is absolute (the slot rotation composed with the pad's
+    own rotation). ``kind`` is:
+
+    * ``"rect"`` — Altium ``hole_shape == 1``: a rectangular / square-cornered
+      hole (a rectangular slot when ``slot_size`` adds length, a plain square
+      when it does not).
+    * ``"obround"`` — Altium ``hole_shape == 2``: a rounded-end slot. Only
+      counts when genuinely longer than the bore; a zero-length obround is
+      just a round hole, so this returns ``None`` (matching altium_monkey).
+
+    Accepts any object exposing ``hole_shape`` / ``hole_mm`` /
+    ``slot_length_mm`` / ``slot_rotation_deg`` / ``rotation_deg`` (a
+    :class:`RawPad`, or a metadata dict via ``types.SimpleNamespace``)."""
+    hole_shape = int(getattr(pad, "hole_shape", 0) or 0)
+    if hole_shape not in (1, 2):
+        return None
+    width = float(getattr(pad, "hole_mm", 0.0) or 0.0)
+    if width <= 0.0:
+        return None
+    length = float(getattr(pad, "slot_length_mm", 0.0) or 0.0)
+    if hole_shape == 2:
+        # Rounded slot: needs real extra length, else it's a round hole.
+        if length <= width + 1e-9:
+            return None
+        kind = "obround"
+    else:
+        # Rectangular hole: a square when no slot length is set.
+        length = max(length, width)
+        kind = "rect"
+    rot = (float(getattr(pad, "slot_rotation_deg", 0.0) or 0.0)
+           + float(getattr(pad, "rotation_deg", 0.0) or 0.0))
+    return (kind, length, width, rot)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,10 +315,11 @@ class RawText:
     is_mirrored: bool         # placed on a bottom-side layer (reads mirrored)
     # Font: Altium PCB text is drawn either with one of three built-in
     # single-stroke vector fonts or a TrueType face. ``is_stroke`` is True
-    # for the stroke fonts; ``stroke_kind`` then selects which (0 = Default,
-    # 1 = Sans Serif, 2 = Serif). ``stroke_width_mm`` is the stroke pen
-    # width. ``font_name`` / ``is_bold`` / ``is_italic`` describe the
-    # TrueType case.
+    # for the stroke fonts; ``stroke_kind`` then selects which, using
+    # Altium's native ``stroke_font_type`` convention (1 = Default,
+    # 2 = Sans Serif, 3 = Serif; 0 / unknown fall back to Default).
+    # ``stroke_width_mm`` is the stroke pen width. ``font_name`` /
+    # ``is_bold`` / ``is_italic`` describe the TrueType case.
     is_stroke: bool = True
     stroke_kind: int = 0
     stroke_width_mm: float = 0.0
@@ -462,7 +519,8 @@ def _extract_texts(pcb, ox_mm: float, oy_mm: float) -> tuple[RawText, ...]:
         if not content:
             content = str(getattr(t, "text_content", "") or "")
         # Font: ``font_type`` 0 == one of Altium's built-in stroke fonts;
-        # ``stroke_font_type`` then picks Default / Sans Serif / Serif.
+        # ``stroke_font_type`` then picks the face (1 = Default,
+        # 2 = Sans Serif, 3 = Serif).
         font_type = int(getattr(t, "font_type", 0) or 0)
         out.append(RawText(
             text=content,
@@ -530,15 +588,64 @@ def _via_fill_material(v) -> str:
     return str(getattr(feature, "material", "") or "")
 
 
+# Copper layer ids that a pad stack can vary over: 1 = TOP, 2..31 =
+# MID1..MID30, 32 = BOTTOM (the PcbLayer enum's signal-layer values).
+_PAD_COPPER_LAYER_IDS: tuple[int, ...] = tuple(range(1, 33))
+
+
+def _pad_layer_variations(
+    p, shape: int, width_mm: float, height_mm: float, corner_pct: int,
+) -> tuple[tuple[int, int, float, float, int], ...]:
+    """Per-copper-layer ``(layer_id, shape, width_mm, height_mm, corner_pct)``
+    for a pad whose stack varies across layers (Altium top-mid-bot / full-stack
+    pad modes). Returns ``()`` for uniform pads so ordinary pads carry no extra
+    payload. Only layers that differ from the supplied top-level values are
+    emitted; the geometry side falls back to those for any missing layer.
+
+    Uses altium_monkey's per-layer resolvers (``_layer_shape`` / ``_layer_size``
+    / per-layer ``corner_radius``), which already collapse simple / top-mid-bot
+    / full-stack modes into a single per-layer answer."""
+    if not getattr(p, "pad_mode", 0):
+        return ()
+    try:
+        from altium_monkey.altium_pcb_enums import PcbLayer
+    except Exception:
+        return ()
+    to_iu = getattr(p, "_from_internal_units", None)
+    corner_list = list(getattr(p, "corner_radius", None) or [])
+    out: list[tuple[int, int, float, float, int]] = []
+    for lid in _PAD_COPPER_LAYER_IDS:
+        try:
+            layer = PcbLayer(lid)
+            l_shape = int(p._layer_shape(layer))
+            sx_iu, sy_iu = p._layer_size(layer)
+            l_w = mils_to_mm(to_iu(sx_iu)) if to_iu else mils_to_mm(sx_iu)
+            l_h = mils_to_mm(to_iu(sy_iu)) if to_iu else mils_to_mm(sy_iu)
+        except Exception:
+            continue
+        l_cr = int(corner_list[lid - 1]) if lid - 1 < len(corner_list) else corner_pct
+        # Skip layers identical to the top-level (uniform) values — the
+        # geometry builder falls back to those, so storing them is redundant.
+        if (l_shape == shape and l_cr == corner_pct
+                and abs(l_w - width_mm) < 1e-6 and abs(l_h - height_mm) < 1e-6):
+            continue
+        out.append((lid, l_shape, l_w, l_h, l_cr))
+    return tuple(out)
+
+
 def _extract_pads(pcb, ox_mm: float, oy_mm: float) -> tuple[RawPad, ...]:
     out: list[RawPad] = []
     for p in pcb.pads:
+        shape = int(getattr(p, 'effective_top_shape', p.shape))
+        width_mm = mils_to_mm(p.width_mils)
+        height_mm = _pad_height_mm(p)
+        corner_pct = int(getattr(p, 'corner_radius_percentage', 0))
         out.append(RawPad(
             center=_pt_from_mils(p.x_mils, p.y_mils, ox_mm, oy_mm),
-            width_mm=mils_to_mm(p.width_mils),
-            height_mm=_pad_height_mm(p),
+            width_mm=width_mm,
+            height_mm=height_mm,
             hole_mm=mils_to_mm(p.hole_size_mils),
-            shape=int(getattr(p, 'effective_top_shape', p.shape)),
+            shape=shape,
             rotation_deg=float(p.rotation),
             layer_id=int(p.layer),
             net_index=_net_index(p.net_index),
@@ -546,8 +653,16 @@ def _extract_pads(pcb, ox_mm: float, oy_mm: float) -> tuple[RawPad, ...]:
             component_index=_component_index(p.component_index),
             is_through_hole=bool(p.is_through_hole),
             is_smt=bool(p.is_smt),
-            corner_radius_pct=int(getattr(p, 'corner_radius_percentage', 0)),
+            corner_radius_pct=corner_pct,
             is_plated=bool(getattr(p, 'is_plated', True)),
+            hole_shape=int(getattr(p, 'hole_shape', 0) or 0),
+            # slot_size is in Altium internal units (10000/mil), like region
+            # vertices — reuse region_raw_to_mm for the conversion.
+            slot_length_mm=region_raw_to_mm(
+                float(getattr(p, 'slot_size', 0) or 0)),
+            slot_rotation_deg=float(getattr(p, 'slot_rotation', 0.0) or 0.0),
+            layer_variations=_pad_layer_variations(
+                p, shape, width_mm, height_mm, corner_pct),
         ))
     return tuple(out)
 

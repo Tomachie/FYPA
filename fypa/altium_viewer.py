@@ -1592,6 +1592,92 @@ def _overlay_box_ring(x0: float, y0: float,
                       dtype=np.float64)
 
 
+def _overlay_obround_ring(cx: float, cy: float,
+                          length: float, width: float,
+                          rotation_deg: float,
+                          n: int = _OVERLAY_CIRCLE_SEGMENTS) -> np.ndarray:
+    """A closed ring tracing an obround (stadium): a ``length`` × ``width``
+    capsule centred at ``(cx, cy)`` and rotated ``rotation_deg`` (CCW).
+
+    ``length`` is the long axis, ``width`` the short axis (= the drilled
+    bore of a slotted hole). The two semicircular end caps have radius
+    ``width / 2``; when ``length <= width`` it degenerates to a circle.
+    Used to draw slotted drill holes the same way Altium renders them."""
+    r = 0.5 * max(width, 0.0)
+    s = max(0.5 * length - r, 0.0)  # half-length of the straight section
+    m = max(2, n // 2)
+    # Right cap sweeps -90°..+90°, left cap +90°..+270°, in local coords.
+    a_right = np.linspace(-0.5 * math.pi, 0.5 * math.pi, m)
+    a_left = np.linspace(0.5 * math.pi, 1.5 * math.pi, m)
+    lx = np.concatenate([s + r * np.cos(a_right), -s + r * np.cos(a_left)])
+    ly = np.concatenate([r * np.sin(a_right), r * np.sin(a_left)])
+    lx = np.append(lx, lx[0])
+    ly = np.append(ly, ly[0])
+    th = math.radians(rotation_deg)
+    c, sn = math.cos(th), math.sin(th)
+    return np.column_stack([cx + lx * c - ly * sn, cy + lx * sn + ly * c])
+
+
+def _overlay_rect_ring(cx: float, cy: float,
+                       length: float, width: float,
+                       rotation_deg: float) -> np.ndarray:
+    """A closed ``(5, 2)`` ring tracing a ``length`` × ``width`` rectangle
+    centred at ``(cx, cy)`` and rotated ``rotation_deg`` (CCW).
+
+    The square-cornered counterpart of :func:`_overlay_obround_ring`, used to
+    draw Altium "Rectangular" slotted / square holes (``hole_shape == 1``)."""
+    hl, hw = 0.5 * length, 0.5 * width
+    lx = np.array([-hl, hl, hl, -hl, -hl])
+    ly = np.array([-hw, -hw, hw, hw, -hw])
+    th = math.radians(rotation_deg)
+    c, sn = math.cos(th), math.sin(th)
+    return np.column_stack([cx + lx * c - ly * sn, cy + lx * sn + ly * c])
+
+
+def _rec_slot_tuple(rec: dict
+                    ) -> tuple[float, float, float, bool] | None:
+    """``(length_mm, width_mm, rotation_deg, rounded)`` non-round drill of a
+    hole record, or ``None`` for a round bore.
+
+    Reads the slot fields a non-round NPTH / PTH record carries (see
+    :func:`fypa.altium.loader._slot_record_fields`): ``slot_length_mm`` is
+    the long axis, ``slot_width_mm`` the drilled bore (short axis),
+    ``slot_rotation_deg`` the absolute rotation and ``slot_kind`` selects the
+    end style — ``rounded`` is ``True`` for an obround slot, ``False`` for a
+    square-cornered rectangle."""
+    if not rec.get("is_slot"):
+        return None
+    length = float(rec.get("slot_length_mm", 0.0) or 0.0)
+    width = float(rec.get("slot_width_mm", 0.0) or 0.0)
+    if width <= 0.0 or length <= 0.0:
+        return None
+    rounded = rec.get("slot_kind", "obround") != "rect"
+    return (length, width, float(rec.get("slot_rotation_deg", 0.0) or 0.0),
+            rounded)
+
+
+def _overlay_hole_ring(rec: dict) -> np.ndarray:
+    """Ring for a drill-hole metadata record (NPTH / PTH / via dict).
+
+    Returns the obround ring when the record carries slot fields
+    (``is_slot``), otherwise a plain circle at ``diameter_mm`` /
+    ``hole_diameter_mm``. Returns an empty ``(0, 2)`` array for a
+    degenerate (zero-size) hole so callers can skip it."""
+    cx = float(rec.get("x_mm", 0.0))
+    cy = float(rec.get("y_mm", 0.0))
+    slot = _rec_slot_tuple(rec)
+    if slot is not None:
+        length, width, rot, rounded = slot
+        if rounded:
+            return _overlay_obround_ring(cx, cy, length, width, rot)
+        return _overlay_rect_ring(cx, cy, length, width, rot)
+    d = float(rec.get("hole_diameter_mm", 0.0) or 0.0) \
+        or float(rec.get("diameter_mm", 0.0) or 0.0)
+    if d <= 0.0:
+        return np.empty((0, 2), dtype=np.float64)
+    return _overlay_circle_ring(cx, cy, 0.5 * d)
+
+
 class SidebarToggleButton(QToolButton):
     """Slim vertical splitter handle that collapses / expands the heatmap
     side panel. Paints a crisp anti-aliased triangle pointing in the
@@ -1739,6 +1825,14 @@ _LOG_SCALE_DECADES: float = 6.0
 # where IPC-2152 derating starts to bite (~30°C rise depending on plating
 # thickness). Tune to taste.
 _VIA_CURRENT_WARN_A: float = 1.0
+
+# Conductive-fill override mode → human-readable phrase for the Physics-
+# constants report (mirrors loader.SolveSettings.conductive_fill_mode).
+_FILL_MODE_REPORT_LABELS: dict[str, str] = {
+    "auto": "auto — per via from the IPC-4761 FILLING material",
+    "all": "override: all vias forced filled",
+    "none": "override: no vias filled",
+}
 
 # Percentile used to clip outliers in the default display range. P99 means
 # the worst 1% of vertices are above the auto-clamp top. Most FEM spikes
@@ -1942,27 +2036,49 @@ _HEATMAP_COLORMAPS: tuple[tuple[str, str], ...] = (
 _DEFAULT_CMAP_NAME: str = _HEATMAP_COLORMAPS[0][1]
 
 
+def _drill_footprint_xy(x: float, y: float, radius: float,
+                        slot: tuple[float, float, float, bool] | None,
+                        n_segments: int) -> np.ndarray:
+    """Open perimeter ring ``(M, 2)`` of a drill footprint centred at
+    ``(x, y)`` — a circle of ``radius``, or a slot when ``slot`` =
+    ``(length_mm, width_mm, rotation_deg, rounded)`` (an obround when
+    ``rounded`` else a square-cornered rectangle).
+
+    The ring is open (last vertex != first) so callers can ``np.roll`` it to
+    pair each vertex with its neighbour. For the circle case the layout is
+    identical to the legacy ``radius * (cos, sin)`` sampling so a plain via /
+    PTH renders bit-for-bit as before."""
+    if slot is not None:
+        length, width, rot, rounded = slot
+        if rounded:
+            ring = _overlay_obround_ring(x, y, length, width, rot,
+                                         n=2 * n_segments)
+        else:
+            ring = _overlay_rect_ring(x, y, length, width, rot)
+        return ring[:-1]  # drop the closing duplicate vertex → open ring
+    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
+    return np.column_stack((x + radius * np.cos(angles),
+                            y + radius * np.sin(angles)))
+
+
 def _generate_disk_cap(
     x: float, y: float, z: float, radius: float,
     color_rgb: tuple[float, float, float],
     n_segments: int = 10,
+    slot: tuple[float, float, float, bool] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Filled circular disk at ``(x, y, z)`` — triangle fan from centre to rim.
+    """Filled drill-footprint cap at ``(x, y, z)`` — triangle fan from centre
+    to rim. A circle by default, or an obround when ``slot`` is given.
 
-    Returns ``(positions, colors)`` as (3*n_segments, 3) float32 arrays
-    ready for GL_TRIANGLES. Used to cap via cylinders at each copper-layer
-    junction so the endpoint colour is visible from any camera angle.
+    Returns ``(positions, colors)`` float32 arrays ready for GL_TRIANGLES.
+    Used to cap via / PTH cylinders at each copper-layer junction so the
+    endpoint colour is visible from any camera angle.
     """
-    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
-    cos_a = np.cos(angles, dtype=np.float64)
-    sin_a = np.sin(angles, dtype=np.float64)
-    cos_b = np.roll(cos_a, -1)
-    sin_b = np.roll(sin_a, -1)
-    rim_a = np.column_stack((x + radius * cos_a, y + radius * sin_a,
-                             np.full(n_segments, z)))
-    rim_b = np.column_stack((x + radius * cos_b, y + radius * sin_b,
-                             np.full(n_segments, z)))
-    out = np.empty((n_segments * 3, 3), dtype=np.float32)
+    fp = _drill_footprint_xy(x, y, radius, slot, n_segments)
+    m = fp.shape[0]
+    rim_a = np.column_stack((fp, np.full(m, z)))
+    rim_b = np.column_stack((np.roll(fp, -1, axis=0), np.full(m, z)))
+    out = np.empty((m * 3, 3), dtype=np.float32)
     out[0::3] = [x, y, z]
     out[1::3] = rim_a
     out[2::3] = rim_b
@@ -1974,33 +2090,30 @@ def _generate_disk_cap(
 def _generate_via_cylinder(x: float, y: float, z_top: float, z_bottom: float,
                             radius: float, color_rgb: tuple[float, float, float],
                             n_segments: int = 10,
+                            slot: tuple[float, float, float, bool] | None = None,
                             ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate the side-wall triangles of an open cylinder centred at
+    """Generate the side-wall triangles of an open drill prism centred at
     ``(x, y)`` extending from ``z_top`` to ``z_bottom``.
 
-    Returns ``(positions, colors)`` as (6*n_segments, 3) float32 arrays
-    suitable for :meth:`gl_mesh_viewer.GLMeshViewer.set_cylinders`. Each
-    side facet contributes two triangles (six vertices) drawn via
-    ``GL_TRIANGLES``. Caps are omitted — the user's view only ever sees
-    the side surface in PDN inspection.
+    A round barrel (cylinder) by default, or an obround barrel (slot) when
+    ``slot`` = ``(length_mm, width_mm, rotation_deg)`` — the 3D counterpart
+    of a slotted plated through-hole. Returns ``(positions, colors)`` float32
+    arrays suitable for :meth:`gl_mesh_viewer.GLMeshViewer.set_cylinders`.
+    Each side facet contributes two triangles (six vertices) drawn via
+    ``GL_TRIANGLES``. Caps are omitted — the user's view only ever sees the
+    side surface in PDN inspection.
     """
-    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
-    cos_a = np.cos(angles, dtype=np.float64)
-    sin_a = np.sin(angles, dtype=np.float64)
-    cos_b = np.roll(cos_a, -1)
-    sin_b = np.roll(sin_a, -1)
+    fp = _drill_footprint_xy(x, y, radius, slot, n_segments)
+    fp_next = np.roll(fp, -1, axis=0)
+    m = fp.shape[0]
     # Per-side-facet quad corners.
-    top1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
-                            np.full(n_segments, z_top)))
-    top2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
-                            np.full(n_segments, z_top)))
-    bot1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
-                            np.full(n_segments, z_bottom)))
-    bot2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
-                            np.full(n_segments, z_bottom)))
+    top1 = np.column_stack((fp, np.full(m, z_top)))
+    top2 = np.column_stack((fp_next, np.full(m, z_top)))
+    bot1 = np.column_stack((fp, np.full(m, z_bottom)))
+    bot2 = np.column_stack((fp_next, np.full(m, z_bottom)))
     # Interleave as triangle pairs per facet:
     #   T1 = top1, bot1, top2     T2 = top2, bot1, bot2
-    out = np.empty((n_segments * 6, 3), dtype=np.float32)
+    out = np.empty((m * 6, 3), dtype=np.float32)
     out[0::6] = top1
     out[1::6] = bot1
     out[2::6] = top2
@@ -2018,25 +2131,20 @@ def _generate_via_cylinder_gradient(
     color_top_rgb: tuple[float, float, float],
     color_bottom_rgb: tuple[float, float, float],
     n_segments: int = 10,
+    slot: tuple[float, float, float, bool] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Same geometry as :func:`_generate_via_cylinder`, but each side facet's
-    top vertices use ``color_top_rgb`` and its bottom vertices use
-    ``color_bottom_rgb`` so the GPU interpolates the colour smoothly along
-    the cylinder's axis."""
-    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
-    cos_a = np.cos(angles, dtype=np.float64)
-    sin_a = np.sin(angles, dtype=np.float64)
-    cos_b = np.roll(cos_a, -1)
-    sin_b = np.roll(sin_a, -1)
-    top1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
-                            np.full(n_segments, z_top)))
-    top2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
-                            np.full(n_segments, z_top)))
-    bot1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
-                            np.full(n_segments, z_bottom)))
-    bot2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
-                            np.full(n_segments, z_bottom)))
-    out = np.empty((n_segments * 6, 3), dtype=np.float32)
+    """Same geometry as :func:`_generate_via_cylinder` (round, or an obround
+    barrel when ``slot`` is given), but each side facet's top vertices use
+    ``color_top_rgb`` and its bottom vertices use ``color_bottom_rgb`` so the
+    GPU interpolates the colour smoothly along the barrel's axis."""
+    fp = _drill_footprint_xy(x, y, radius, slot, n_segments)
+    fp_next = np.roll(fp, -1, axis=0)
+    m = fp.shape[0]
+    top1 = np.column_stack((fp, np.full(m, z_top)))
+    top2 = np.column_stack((fp_next, np.full(m, z_top)))
+    bot1 = np.column_stack((fp, np.full(m, z_bottom)))
+    bot2 = np.column_stack((fp_next, np.full(m, z_bottom)))
+    out = np.empty((m * 6, 3), dtype=np.float32)
     out[0::6] = top1
     out[1::6] = bot1
     out[2::6] = top2
@@ -2045,7 +2153,7 @@ def _generate_via_cylinder_gradient(
     out[5::6] = bot2
     ct = np.asarray(color_top_rgb, dtype=np.float32)
     cb = np.asarray(color_bottom_rgb, dtype=np.float32)
-    col = np.empty((n_segments * 6, 3), dtype=np.float32)
+    col = np.empty((m * 6, 3), dtype=np.float32)
     col[0::6] = ct
     col[1::6] = cb
     col[2::6] = ct
@@ -6742,6 +6850,9 @@ class PdnViewer(QMainWindow):
             if not ring:
                 continue
             lids = rec.get("layer_ids") or []
+            # Pads with a per-layer pad stack carry per-layer outline rings;
+            # draw each side with the shape its copper layer actually has.
+            by_layer = rec.get("outline_by_layer") or {}
             for side, lid in (("top", top_lid), ("bottom", bot_lid)):
                 if lid is None or lid not in lids:
                     continue
@@ -6753,8 +6864,9 @@ class PdnViewer(QMainWindow):
                 a = alphas.get(side, 1.0)
                 if a <= 0.0:
                     continue
+                side_ring = by_layer.get(str(lid), ring)
                 rgb = self._overlay_color_for("pads", side)
-                _emit(_shape_tris(ring, solid), feature_z[side], rgb,
+                _emit(_shape_tris(side_ring, solid), feature_z[side], rgb,
                       alpha=a, **_side_buckets(side))
 
         self._pump_busy_ui()
@@ -6815,12 +6927,11 @@ class PdnViewer(QMainWindow):
                 bucket = _side_buckets(side)
                 for rec in npth_recs:
                     self._pump_busy_ui()
-                    r = 0.5 * float(rec.get("diameter_mm", 0.0) or 0.0)
-                    if r <= 0.0:
+                    # Slot-aware: an obround drill when the record carries
+                    # slot fields, otherwise a plain circle at diameter_mm.
+                    ring = _overlay_hole_ring(rec)
+                    if ring.shape[0] < 3:
                         continue
-                    ring = _overlay_circle_ring(
-                        float(rec.get("x_mm", 0.0)),
-                        float(rec.get("y_mm", 0.0)), r)
                     _emit(_shape_tris(ring, solid), z, rgb, alpha=a, **bucket)
 
         self._pump_busy_ui()
@@ -7029,10 +7140,19 @@ class PdnViewer(QMainWindow):
             if len(pl) < 2:
                 continue
             if solid:
-                chunks.append(_overlay_outline_tris(pl, half, closed=False))
-                for end in (pl[0], pl[-1]):
+                # Circular-pen model: a round nib of radius `half` swept
+                # along the glyph. Each segment is its own straight quad and
+                # every vertex carries a full disc, so joins and ends are
+                # round. A single mitered ribbon along the whole polyline
+                # left whisker spikes at the near-hairpin corners of the
+                # angular Default stroke font; per-segment + per-vertex discs
+                # reproduce exactly how Altium strokes the font.
+                for i in range(len(pl) - 1):
+                    chunks.append(_overlay_outline_tris(
+                        (pl[i], pl[i + 1]), half, closed=False))
+                for vx, vy in pl:
                     chunks.append(_overlay_fan_tris(_overlay_circle_ring(
-                        float(end[0]), float(end[1]), half, 8)))
+                        float(vx), float(vy), half, 8)))
             else:
                 chunks.append(_overlay_ribbon_outline_tris(
                     pl, half, _OVERLAY_WIRE_HALF_MM, closed=False))
@@ -9739,6 +9859,9 @@ class PdnViewer(QMainWindow):
             outer_mm = float(p.get("diameter_mm") or 0.0)
             radius = (drill_mm if drill_mm > 0.0 else outer_mm) * 0.5
             radius = max(radius, self._VIA_CYL_MIN_RADIUS_MM)
+            # Slotted PTH bore → obround barrel (only pads carry slots; vias
+            # never do, so the via loop above passes no slot).
+            slot = _rec_slot_tuple(p)
 
             heatmap_chunks: list[tuple[np.ndarray, np.ndarray]] = []
             if via_current_on:
@@ -9754,6 +9877,7 @@ class PdnViewer(QMainWindow):
                     p, x, y, radius, lo_id, hi_id,
                     stackup_ids, id_to_phys,
                     mode, lut, vmin, vmax, fallback_r_seg, drop_ref,
+                    slot=slot,
                 )
 
             if heatmap_chunks:
@@ -9765,6 +9889,7 @@ class PdnViewer(QMainWindow):
                     x, y, z_top, z_bot, radius,
                     self._PTH_CYL_COLOR_RGB,
                     n_segments=self._VIA_CYL_SEGMENTS,
+                    slot=slot,
                 )
                 pos_chunks.append(pos)
                 col_chunks.append(col)
@@ -9783,6 +9908,7 @@ class PdnViewer(QMainWindow):
         stackup_ids: list[int], id_to_phys: dict[int, str],
         mode: str, lut: np.ndarray, vmin: float, vmax: float,
         fallback_r_seg: float, drop_ref: float,
+        slot: tuple[float, float, float, bool] | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
         """Per-segment cylinder geometry for one via, coloured by mode.
 
@@ -9835,6 +9961,7 @@ class PdnViewer(QMainWindow):
                 pos, col = _generate_via_cylinder(
                     x, y, z_lo, z_hi, radius, c,
                     n_segments=self._VIA_CYL_SEGMENTS,
+                    slot=slot,
                 )
                 # Single cap at the one layer we could sample.
                 _, z_cap, v_cap = sampled[0]
@@ -9842,6 +9969,7 @@ class PdnViewer(QMainWindow):
                 cap_pos, cap_col = _generate_disk_cap(
                     x, y, z_cap, radius, c_cap,
                     n_segments=self._VIA_CYL_SEGMENTS,
+                    slot=slot,
                 )
                 return [(pos, col), (cap_pos, cap_col)]
             return []
@@ -9865,6 +9993,7 @@ class PdnViewer(QMainWindow):
                 pos, col = _generate_via_cylinder_gradient(
                     x, y, z_a, z_b, radius, ct, cb,
                     n_segments=self._VIA_CYL_SEGMENTS,
+                    slot=slot,
                 )
             else:
                 # Current / power are constant along each inter-layer barrel
@@ -9883,6 +10012,7 @@ class PdnViewer(QMainWindow):
                 pos, col = _generate_via_cylinder(
                     x, y, z_a, z_b, radius, c,
                     n_segments=self._VIA_CYL_SEGMENTS,
+                    slot=slot,
                 )
             chunks.append((pos, col))
 
@@ -9902,10 +10032,12 @@ class PdnViewer(QMainWindow):
             pos_t, col_t = _generate_disk_cap(
                 x, y, z_top_cap, radius, ct_cap,
                 n_segments=self._VIA_CYL_SEGMENTS,
+                slot=slot,
             )
             pos_b, col_b = _generate_disk_cap(
                 x, y, z_bot_cap, radius, cb_cap,
                 n_segments=self._VIA_CYL_SEGMENTS,
+                slot=slot,
             )
             chunks = [(pos_t, col_t)] + chunks + [(pos_b, col_b)]
 
@@ -10329,22 +10461,26 @@ class PdnViewer(QMainWindow):
                 # PTH (plated through-hole) markers — 2D only; the 3D
                 # path uses the cylinder batch instead and has no legend
                 # toggle for PTHs.
-                pth_pts: dict[tuple[float, float], float] = {}
+                # (x, y) -> (diameter_mm, slot) so a slotted PTH draws as a
+                # capsule sized to its bore while round PTHs stay dots.
+                pth_pts: dict[tuple[float, float],
+                              tuple[float, tuple[float, float, float, bool]
+                                    | None]] = {}
                 if not in_3d:
                     for lid in target_layer_ids:
-                        pxs, pys, pds = self._collect_pth_positions(
+                        pxs, pys, pds, psl = self._collect_pth_positions(
                             lid, rail_members)
-                        for px, py, pd in zip(pxs, pys, pds):
-                            pth_pts[(px, py)] = pd
+                        for px, py, pd, ps in zip(pxs, pys, pds, psl):
+                            pth_pts[(px, py)] = (pd, ps)
                     # All-copper (second eye) layers add their own PTHs
                     # without the rail filter — same rule as vias above:
                     # a PTH shows whenever any layer within its span has
                     # its copper eye on, regardless of net / rail.
                     for lid in copper_layer_ids:
-                        pxs, pys, pds = self._collect_pth_positions(
+                        pxs, pys, pds, psl = self._collect_pth_positions(
                             lid, set(), rail_scoped=False)
-                        for px, py, pd in zip(pxs, pys, pds):
-                            pth_pts[(px, py)] = pd
+                        for px, py, pd, ps in zip(pxs, pys, pds, psl):
+                            pth_pts[(px, py)] = (pd, ps)
                 if pth_pts:
                     _add_legend("PTH", "o", self._PTH_COLOR_HEX)
                     if "PTH" not in self._hidden_legend_keys:
@@ -10353,8 +10489,17 @@ class PdnViewer(QMainWindow):
                                              dtype=np.float64, count=n_pth)
                         pth_ys = np.fromiter((p[1] for p in pth_pts),
                                              dtype=np.float64, count=n_pth)
-                        pth_ds = np.fromiter(pth_pts.values(),
-                                             dtype=np.float64, count=n_pth)
+                        pth_ds = np.fromiter(
+                            (v[0] for v in pth_pts.values()),
+                            dtype=np.float64, count=n_pth)
+                        pth_slots = [v[1] for v in pth_pts.values()]
+                        # Only attach the obround list when at least one PTH
+                        # is slotted — keeps the common all-round board on the
+                        # plain circular-marker path.
+                        world_obrounds = (pth_slots
+                                          if any(s is not None
+                                                 for s in pth_slots)
+                                          else None)
                         groups.append(MarkerGroup(
                             xs=pth_xs,
                             ys=pth_ys,
@@ -10365,6 +10510,7 @@ class PdnViewer(QMainWindow):
                             edge_width=0.4,
                             world_diameters_mm=pth_ds,
                             min_pixel_diameter=self._VIA_MARKER_MIN_PX,
+                            world_obrounds=world_obrounds,
                         ))
 
         # Via Current mode (2D fallback): emit one MarkerGroup per
@@ -10651,17 +10797,24 @@ class PdnViewer(QMainWindow):
                                rail_members: set[str], *,
                                rail_scoped: bool = True,
                                ) -> tuple[list[float], list[float],
-                                          list[float]]:
+                                          list[float],
+                                          list[tuple[float, float, float, bool]
+                                               | None]]:
         """Plated-through-hole pads whose span includes ``target_layer_id``.
         Mirrors :meth:`_collect_via_positions` (xs/ys + physical diameter mm,
         and the same ``rail_scoped`` first-/second-eye semantics); PTHs span
         the full enabled stack so every visible copper layer hits the same
-        set of pads (the marker-builder dedups across layers)."""
+        set of pads (the marker-builder dedups across layers).
+
+        Also returns a parallel ``slots`` list: each entry is the pad's
+        ``(length_mm, width_mm, rotation_deg)`` obround drill, or ``None`` for
+        a round bore — so the 2D marker can draw a slotted PTH as a capsule."""
         if target_layer_id is None or self.metadata is None:
-            return [], [], []
+            return [], [], [], []
         xs: list[float] = []
         ys: list[float] = []
         diams: list[float] = []
+        slots: list[tuple[float, float, float, bool] | None] = []
         for p in self.metadata.get("pths", []):
             ls = p.get("layer_start")
             le = p.get("layer_end")
@@ -10675,7 +10828,8 @@ class PdnViewer(QMainWindow):
             xs.append(p.get("x_mm", 0.0))
             ys.append(p.get("y_mm", 0.0))
             diams.append(self._via_marker_diameter_mm(p))
-        return xs, ys, diams
+            slots.append(_rec_slot_tuple(p))
+        return xs, ys, diams, slots
 
     def _on_colormap_changed(self, cmap_name: str) -> None:
         """The colour-scale dropdown picked a new scheme. Recolour every
@@ -12077,9 +12231,15 @@ class PdnViewer(QMainWindow):
         visible = self._visible_all_copper_layer_ids()
         if not visible:
             return None
+        # A selected layer is painted on top (2D) and is the layer the user
+        # is focused on, so it wins the pick wherever it has copper under the
+        # point — matching what's drawn above the dimmed others. The stackup
+        # rank still orders everything else, and a selected layer with no
+        # copper here falls back to topmost-stackup exactly as before.
+        sel = self._selected_layer
         pt = _sg.Point(x, y)
         best: dict | None = None
-        best_rank = 1 << 30
+        best_rank = (2, 1 << 30)
         for rec in records:
             layer_id = rec.get("layer_id")
             phys = visible.get(layer_id)
@@ -12088,7 +12248,8 @@ class PdnViewer(QMainWindow):
             net = rec.get("net")
             if not net:
                 continue
-            rank = self._phys_stackup_rank.get(phys, 1 << 30)
+            rank = (0 if (sel is not None and phys == sel) else 1,
+                    self._phys_stackup_rank.get(phys, 1 << 30))
             if best is not None and rank >= best_rank:
                 continue
             for poly in rec.get("polygons", []):
@@ -12125,10 +12286,15 @@ class PdnViewer(QMainWindow):
             lid = rec.get("layer_id")
             if lid in visible:
                 by_layer.setdefault(lid, []).append(rec)
+        # Selected layer wins the pick wherever it carries copper under the
+        # cursor (mirrors the 2D variant), else fall back to topmost-stackup.
+        sel = self._selected_layer
         ordered = sorted(
             by_layer.items(),
-            key=lambda kv: self._phys_stackup_rank.get(
-                visible[kv[0]], 1 << 30),
+            key=lambda kv: (
+                0 if (sel is not None and visible[kv[0]] == sel) else 1,
+                self._phys_stackup_rank.get(visible[kv[0]], 1 << 30),
+            ),
         )
         for layer_id, recs in ordered:
             phys = visible[layer_id]
@@ -16036,6 +16202,10 @@ class PdnViewer(QMainWindow):
             self._SETTINGS_FIELDS,
             source=self._solve_settings,
             attr_prefix="settings_edit_",
+            # The conductive-fill resistivity field is rebuilt in its own
+            # "Conductive via fill" group below (alongside the mode + material
+            # pickers) — keep it out of the generic solve box here.
+            skip_keys={"conductive_fill_resistivity_ohm_mm"},
         )
         # Adaptive-mesh toggle — a boolean, so not part of the QLineEdit-
         # based _SETTINGS_FIELDS schema; add it into the same group box.
@@ -16057,6 +16227,9 @@ class PdnViewer(QMainWindow):
         if _solve_layout is not None:
             _solve_layout.addRow(self._settings_adaptive_check)
         outer.addWidget(solve_box)
+
+        # ----- Conductive via fill group -----
+        outer.addWidget(self._build_conductive_fill_box())
 
         # ----- Stackup copper-thickness group -----
         outer.addWidget(self._build_stackup_settings_box())
@@ -16158,6 +16331,7 @@ class PdnViewer(QMainWindow):
             f"QLineEdit[dirty=\"true\"] {{ border: 1px solid {t['warn_fg']}; }}"
             f"QLineEdit[dirty=\"true\"]:focus {{ border: 1px solid {t['warn_fg']}; }}"
             f"QCheckBox[dirty=\"true\"] {{ color: {t['warn_fg']}; }}"
+            f"QComboBox[dirty=\"true\"] {{ border: 1px solid {t['warn_fg']}; }}"
         )
         return widget
 
@@ -16166,10 +16340,15 @@ class PdnViewer(QMainWindow):
         fields: tuple[tuple[str, str, str, str], ...],
         source: object,
         attr_prefix: str,
+        skip_keys: frozenset[str] | set[str] | None = None,
     ) -> QGroupBox:
         """Build a QGroupBox containing one labelled QLineEdit per field
         in ``fields``. The current value is pulled from ``source`` via
-        ``getattr``; default-value hints come from a fresh SolveSettings."""
+        ``getattr``; default-value hints come from a fresh SolveSettings.
+
+        ``skip_keys`` lets a caller omit specific fields from this box (so
+        they can be rebuilt elsewhere) while keeping them in the shared
+        ``_SETTINGS_FIELDS`` schema that reset / dirty / gather iterate."""
         from fypa.altium.loader import SolveSettings as _SolveSettings
         from dataclasses import fields as _dc_fields
         defaults = _SolveSettings()
@@ -16189,6 +16368,8 @@ class PdnViewer(QMainWindow):
         form.setVerticalSpacing(8)
 
         for key, label, unit, tooltip in fields:
+            if skip_keys and key in skip_keys:
+                continue
             current = getattr(source, key, None)
             if current is None:
                 continue
@@ -16255,6 +16436,160 @@ class PdnViewer(QMainWindow):
             form.addRow(label_widget, row_widget)
 
         return box
+
+    # Fill-material presets for the Conductive via fill picker. Each entry is
+    # (label, resistivity_ohm_mm | None, tooltip). ``None`` marks the Custom
+    # entry, which leaves the resistivity field free for manual entry. Values
+    # are bulk resistivities converted to Ω·mm (1 Ω·cm = 10 Ω·mm):
+    #   silver-loaded epoxy paste ~5e-4 Ω·cm, copper-loaded paste ~5e-3 Ω·cm,
+    #   solid electroplated copper ~ bulk Cu (1.68 µΩ·cm).
+    _FILL_MATERIAL_PRESETS: tuple[tuple[str, float | None, str], ...] = (
+        ("Silver-filled epoxy paste", 5.0e-3,
+         "Silver-loaded thermoset paste — the most common IPC-4761 "
+         "conductive via fill (~5×10⁻⁴ Ω·cm bulk resistivity)."),
+        ("Copper-filled paste / epoxy", 5.0e-2,
+         "Copper-loaded paste/epoxy fill (~5×10⁻³ Ω·cm) — cheaper than "
+         "silver but ~10× more resistive."),
+        ("Solid electroplated copper", 1.7e-5,
+         "Type-VII copper-filled via — the centre void is closed with "
+         "electroplated copper, approaching bulk copper resistivity "
+         "(~1.7×10⁻⁶ Ω·cm). The lowest-resistance fill."),
+        ("Custom (enter value)", None,
+         "Enter the fill resistivity directly in the field below — e.g. "
+         "from the fab's via-fill paste data sheet."),
+    )
+
+    def _build_conductive_fill_box(self) -> QGroupBox:
+        """Build the "Conductive via fill" group: an Auto/All/None override
+        mode, a fill-material preset picker, and the fill-resistivity field.
+
+        The resistivity QLineEdit is built here (instead of in the generic
+        solve box) but keeps its ``settings_edit_conductive_fill_resistivity_
+        ohm_mm`` attribute name, so the shared reset / dirty / gather loops
+        — which walk ``_SETTINGS_FIELDS`` and resolve widgets by attribute —
+        still pick it up unchanged."""
+        fill_fields = tuple(
+            f for f in self._SETTINGS_FIELDS
+            if f[0] == "conductive_fill_resistivity_ohm_mm"
+        )
+        box = self._make_settings_group(
+            "Conductive via fill",
+            fill_fields,
+            source=self._solve_settings,
+            attr_prefix="settings_edit_",
+        )
+        form = box.layout()   # QFormLayout: row 0 is the resistivity field
+        t = _T()
+
+        # ----- Mode combo (Auto / force All / force None) -----
+        self._fill_mode_combo = QComboBox()
+        self._fill_mode_combo.addItem("Auto (from Altium IPC-4761 data)", "auto")
+        self._fill_mode_combo.addItem("Force: treat all vias as filled", "all")
+        self._fill_mode_combo.addItem("Force: treat no vias as filled", "none")
+        self._fill_mode_combo.setToolTip(
+            "Whether a via's centre is modelled as a conductive fill-rod in "
+            "parallel with the plated barrel wall (lowering its resistance).\n"
+            "• Auto — decide per via from the design's IPC-4761 FILLING "
+            "material string (the default).\n"
+            "• Force all — treat every coupled via/through-hole as filled "
+            "(use the fab's fill spec when Altium has no IPC-4761 data).\n"
+            "• Force none — ignore any fill; the plated wall is the only path."
+        )
+        cur_mode = getattr(self._solve_settings, "conductive_fill_mode", "auto")
+        idx = self._fill_mode_combo.findData(cur_mode)
+        if idx >= 0:
+            self._fill_mode_combo.setCurrentIndex(idx)
+        self._fill_mode_combo.setMinimumWidth(220)
+        self._fill_mode_combo.currentIndexChanged.connect(
+            self._on_fill_mode_changed)
+        self._fill_mode_combo.currentIndexChanged.connect(
+            self._on_settings_field_changed)
+        mode_label = QLabel("Fill mode")
+        mode_label.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+
+        # ----- Material preset combo -----
+        self._fill_material_combo = QComboBox()
+        for label, _rho, tip in self._FILL_MATERIAL_PRESETS:
+            self._fill_material_combo.addItem(label)
+            self._fill_material_combo.setItemData(
+                self._fill_material_combo.count() - 1, tip, Qt.ToolTipRole)
+        self._fill_material_combo.setToolTip(
+            "Pick a fill material to populate the resistivity field below "
+            "with a typical value, or choose Custom to type your own."
+        )
+        self._fill_material_combo.setMinimumWidth(220)
+        self._fill_material_combo.currentIndexChanged.connect(
+            self._on_fill_material_changed)
+        mat_label = QLabel("Fill material")
+        mat_label.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+
+        # Insert mode (row 0) and material (row 1) above the resistivity row.
+        form.insertRow(0, mode_label, self._fill_mode_combo)
+        form.insertRow(1, mat_label, self._fill_material_combo)
+
+        # Initialise the material combo from the current resistivity, and
+        # keep the two in sync when the user edits the resistivity directly.
+        edit = getattr(self, "settings_edit_conductive_fill_resistivity_ohm_mm",
+                       None)
+        if edit is not None:
+            edit.textChanged.connect(self._sync_material_combo_from_resistivity)
+        self._sync_material_combo_from_resistivity()
+        self._apply_fill_mode_enabled()
+        return box
+
+    def _apply_fill_mode_enabled(self) -> None:
+        """Grey out the material + resistivity controls when the mode is
+        "Force none" (no fill, so the value is irrelevant)."""
+        mode = self._fill_mode_combo.currentData()
+        enabled = mode != "none"
+        self._fill_material_combo.setEnabled(enabled)
+        edit = getattr(self, "settings_edit_conductive_fill_resistivity_ohm_mm",
+                       None)
+        if edit is not None:
+            edit.setEnabled(enabled)
+
+    def _on_fill_mode_changed(self, _idx: int) -> None:
+        self._apply_fill_mode_enabled()
+
+    def _on_fill_material_changed(self, idx: int) -> None:
+        """Material picker → write the preset resistivity into the field.
+        The Custom entry (resistivity None) leaves the field untouched."""
+        if idx < 0 or idx >= len(self._FILL_MATERIAL_PRESETS):
+            return
+        _label, rho, _tip = self._FILL_MATERIAL_PRESETS[idx]
+        if rho is None:
+            return
+        edit = getattr(self, "settings_edit_conductive_fill_resistivity_ohm_mm",
+                       None)
+        if edit is None:
+            return
+        new_text = self._fmt_settings_value(rho)
+        if edit.text().strip() != new_text:
+            # Guard against the textChanged → _sync → material-combo loop:
+            # setText fires _sync, which would re-select this same preset.
+            edit.setText(new_text)
+
+    def _sync_material_combo_from_resistivity(self, *_args) -> None:
+        """Resistivity field → select the matching material preset, or fall
+        back to Custom when the value matches none of them."""
+        combo = getattr(self, "_fill_material_combo", None)
+        edit = getattr(self, "settings_edit_conductive_fill_resistivity_ohm_mm",
+                       None)
+        if combo is None or edit is None:
+            return
+        try:
+            val = float(edit.text().strip())
+        except ValueError:
+            return
+        target = len(self._FILL_MATERIAL_PRESETS) - 1   # Custom by default
+        for i, (_label, rho, _tip) in enumerate(self._FILL_MATERIAL_PRESETS):
+            if rho is not None and abs(val - rho) <= abs(rho) * 1e-6:
+                target = i
+                break
+        if combo.currentIndex() != target:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(target)
+            combo.blockSignals(False)
 
     def _make_collapsible_section(
         self, title: str, body_widget: QWidget, *,
@@ -16770,6 +17105,12 @@ class PdnViewer(QMainWindow):
         chk = getattr(self, "_settings_adaptive_check", None)
         if chk is not None:
             chk.setChecked(bool(defaults.adaptive_mesh))
+        mode_combo = getattr(self, "_fill_mode_combo", None)
+        if mode_combo is not None:
+            idx = mode_combo.findData(defaults.conductive_fill_mode)
+            if idx >= 0:
+                mode_combo.setCurrentIndex(idx)
+            self._apply_fill_mode_enabled()
         display_defaults = {
             "via_current_warn_a": _VIA_CURRENT_WARN_A,
             "display_percentile_high": _DISPLAY_PERCENTILE_HIGH,
@@ -16829,6 +17170,13 @@ class PdnViewer(QMainWindow):
             dirty = bool(chk.isChecked()) != bool(
                 getattr(self._solve_settings, "adaptive_mesh", False))
             mark(chk, dirty)
+            any_dirty = any_dirty or dirty
+
+        mode_combo = getattr(self, "_fill_mode_combo", None)
+        if mode_combo is not None:
+            dirty = mode_combo.currentData() != getattr(
+                self._solve_settings, "conductive_fill_mode", "auto")
+            mark(mode_combo, dirty)
             any_dirty = any_dirty or dirty
 
         for key, baseline in (
@@ -16986,6 +17334,11 @@ class PdnViewer(QMainWindow):
         chk = getattr(self, "_settings_adaptive_check", None)
         if chk is not None:
             kwargs["adaptive_mesh"] = chk.isChecked()
+        mode_combo = getattr(self, "_fill_mode_combo", None)
+        if mode_combo is not None:
+            data = mode_combo.currentData()
+            if isinstance(data, str):
+                kwargs["conductive_fill_mode"] = data
         new_settings = _SolveSettings(**kwargs)
 
         def _read_display(key: str, label: str) -> float:
@@ -20765,8 +21118,8 @@ def _format_setup_html(solution, metadata: dict | None,
                      f"<tr><th>Conductive fill resistivity</th>"
                      f"<td class='num'>{phys.get('conductive_fill_resistivity_ohm_mm', 0)*1.0e3:.3g} mΩ·mm</td>"
                      f"<td class='muted'>Applied as a parallel rod inside the "
-                     f"plated barrel for vias whose IPC-4761 FILLING material "
-                     f"reads as conductive — "
+                     f"plated barrel for filled vias "
+                     f"({_esc(_FILL_MODE_REPORT_LABELS.get(phys.get('conductive_fill_mode', 'auto'), 'auto'))}) — "
                      f"<b>{cond_fill_count}</b> via(s) on this board.</td></tr>"
                      f"<tr><th>Multi-pin coupling resistance</th>"
                      f"<td class='num'>{phys.get('coupling_resistance_ohm', 0)*1000:.3f} mΩ</td>"

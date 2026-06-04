@@ -468,16 +468,46 @@ def _keep_polygonal(
     return shapely.geometry.Polygon()
 
 
-def _pad_outer_shape(p: RawPad) -> shapely.geometry.Polygon | None:
-    """Return the pad's outer copper outline (no drill subtraction yet)."""
+def _pad_layer_geom(p: RawPad, layer_id: int | None
+                    ) -> tuple[int, float, float, int]:
+    """Resolve ``(shape, width_mm, height_mm, corner_radius_pct)`` for a pad on
+    the requested copper layer. ``layer_id is None`` (or a pad with no per-layer
+    variations) yields the top-level values, so the simple-pad path is
+    unchanged. Pads with an Altium top-mid-bot / full-stack pad stack return the
+    layer-specific entry when one was recorded for ``layer_id``."""
+    variations = getattr(p, "layer_variations", ())
+    if layer_id is not None and variations:
+        for (lid, shape, w, h, cr) in variations:
+            if lid == layer_id:
+                return shape, w, h, cr
+    return p.shape, p.width_mm, p.height_mm, getattr(p, 'corner_radius_pct', 0)
+
+
+def _pad_outer_shape(p: RawPad, layer_id: int | None = None
+                     ) -> shapely.geometry.Polygon | None:
+    """Return the pad's outer copper outline (no drill subtraction yet).
+
+    ``layer_id`` selects the copper layer so pads with a per-layer pad stack
+    (different shape / size on different layers) render correctly; ``None``
+    uses the top-level (top-layer) values."""
     cx, cy = p.center.x, p.center.y
-    w, h = p.width_mm, p.height_mm
-    if p.shape == PAD_SHAPE_CIRCLE:
-        if w <= 0:
+    shape, w, h, corner_pct = _pad_layer_geom(p, layer_id)
+    if shape == PAD_SHAPE_CIRCLE:
+        if w <= 0 or h <= 0:
             return None
-        return shapely.geometry.Point(cx, cy).buffer(w / 2.0,
-                                                     resolution=CIRCLE_RESOLUTION // 4)
-    if p.shape == PAD_SHAPE_RECTANGLE:
+        # Altium's "Round" pad is a circle only when width == height. With
+        # unequal dimensions it is an oblong / obround (a stadium: a rectangle
+        # with fully-rounded semicircular ends of radius min(w, h) / 2). Build
+        # it as the core box buffered by that radius — when w == h the box
+        # collapses to a point and the buffer yields the plain circle.
+        r = min(w, h) / 2.0
+        s = shapely.geometry.box(cx - w / 2.0 + r, cy - h / 2.0 + r,
+                                 cx + w / 2.0 - r, cy + h / 2.0 - r).buffer(
+            r, resolution=CIRCLE_RESOLUTION // 4)
+        if p.rotation_deg:
+            s = shapely.affinity.rotate(s, p.rotation_deg, origin=(cx, cy))
+        return s
+    if shape == PAD_SHAPE_RECTANGLE:
         if w <= 0 or h <= 0:
             return None
         s = shapely.geometry.box(cx - w / 2.0, cy - h / 2.0,
@@ -485,7 +515,7 @@ def _pad_outer_shape(p: RawPad) -> shapely.geometry.Polygon | None:
         if p.rotation_deg:
             s = shapely.affinity.rotate(s, p.rotation_deg, origin=(cx, cy))
         return s
-    if p.shape == PAD_SHAPE_OCTAGONAL:
+    if shape == PAD_SHAPE_OCTAGONAL:
         if w <= 0 or h <= 0:
             return None
         # Regular octagon inscribed in the w×h box.
@@ -501,10 +531,10 @@ def _pad_outer_shape(p: RawPad) -> shapely.geometry.Polygon | None:
         if p.rotation_deg:
             s = shapely.affinity.rotate(s, p.rotation_deg, origin=(cx, cy))
         return s
-    if p.shape == PAD_SHAPE_ROUNDED_RECTANGLE:
+    if shape == PAD_SHAPE_ROUNDED_RECTANGLE:
         if w <= 0 or h <= 0:
             return None
-        pct = getattr(p, 'corner_radius_pct', 0)
+        pct = corner_pct
         if pct > 0:
             r = (pct / 100.0) * min(w, h) / 2.0
         else:
@@ -517,7 +547,7 @@ def _pad_outer_shape(p: RawPad) -> shapely.geometry.Polygon | None:
             s = shapely.affinity.rotate(s, p.rotation_deg, origin=(cx, cy))
         return s
     log.warning("Unhandled pad shape code %d at (%.3f, %.3f) — falling back to rectangle",
-                p.shape, cx, cy)
+                shape, cx, cy)
     if w <= 0 or h <= 0:
         return None
     s = shapely.geometry.box(cx - w / 2.0, cy - h / 2.0,
@@ -527,7 +557,8 @@ def _pad_outer_shape(p: RawPad) -> shapely.geometry.Polygon | None:
     return s
 
 
-def _pad_polygon(p: RawPad) -> shapely.geometry.Polygon | None:
+def _pad_polygon(p: RawPad, layer_id: int | None = None
+                 ) -> shapely.geometry.Polygon | None:
     # NOTE: We deliberately do NOT subtract the drill hole. A plated through-
     # hole pad has copper continuity across the hole's footprint (the barrel
     # plating fills the hole's cross-section for in-plane current flow). For
@@ -536,7 +567,10 @@ def _pad_polygon(p: RawPad) -> shapely.geometry.Polygon | None:
     # injected by fypa.altium.loader.build_problem(). Subtracting the hole would
     # leave a no-copper point at the pad centre — making the FEM unable to
     # attach via-coupling Connections at the via location.
-    return _pad_outer_shape(p)
+    #
+    # ``layer_id`` selects the copper layer so a pad with a per-layer pad stack
+    # contributes its layer-specific shape; ``None`` uses the top-level values.
+    return _pad_outer_shape(p, layer_id)
 
 
 def _via_polygon(v: RawVia) -> shapely.geometry.Polygon | None:
@@ -663,7 +697,7 @@ def build_layer_geometry(proj: ExtractedProject, layer_id: int,
     for p in proj.pads:
         if not _pad_on_layer(p, layer_id):
             continue
-        poly = _pad_polygon(p)
+        poly = _pad_polygon(p, layer_id)
         if poly is not None:
             pieces.append(poly)
 
@@ -954,14 +988,19 @@ def _build_net_layer_buckets(
         _add(f.layer_id, f.net_index, _fill_polygon(f))
 
     for p in proj.pads:
-        poly = _pad_polygon(p)
-        if poly is None:
-            continue
         if p.is_through_hole or p.layer_id == MULTI_LAYER_PAD_LAYER_ID:
+            # Through-hole / multi-layer pads sit on every enabled copper
+            # layer. Build the polygon per layer so a per-layer pad stack
+            # (different shape / size on different layers) contributes the
+            # right shape to each layer's net bucket.
             for lid in enabled_layers:
-                _add(lid, p.net_index, poly)
+                poly = _pad_polygon(p, lid)
+                if poly is not None:
+                    _add(lid, p.net_index, poly)
         else:
-            _add(p.layer_id, p.net_index, poly)
+            poly = _pad_polygon(p, p.layer_id)
+            if poly is not None:
+                _add(p.layer_id, p.net_index, poly)
 
     if include_vias:
         for v in proj.vias:
