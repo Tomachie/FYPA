@@ -1904,6 +1904,23 @@ class GLMeshViewer(QOpenGLWidget):
         self.viewChanged.emit()
 
     def paintGL(self) -> None:
+        # Reset the GL state the previous frame's QPainter overlay pass may
+        # have left behind. QPainter on a QOpenGLWidget renders through the
+        # GL paint engine, which — on some drivers — leaves GL_SCISSOR_TEST
+        # enabled (clipped to the last thing it drew) and the colour/depth
+        # write masks altered when it ends. That state is global to the
+        # context and survives into this paintGL, so the next glClear and
+        # every draw get clipped/masked to a stale rect, leaving the frame
+        # partially updated ("transformed/illegible") until enough repaints
+        # (e.g. dragging the mouse) happen to scrub in every region. Drivers
+        # that scrub this state on QPainter.end() never show it — hence it
+        # only reproduces on some machines. Reset before we touch the
+        # framebuffer so glClear and the depth-sorted passes start clean.
+        # See https://github.com/anarthrous-eda/FYPA/issues/1
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glDisable(GL.GL_STENCIL_TEST)
+        GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+        GL.glDepthMask(GL.GL_TRUE)
         # Render straight to the widget's framebuffer, unless supersampling
         # is enabled AND its offscreen buffers are available this frame —
         # then render oversized and downsample. The QPainter overlay pass
