@@ -23,7 +23,7 @@ REM Sync runtime + dev + build groups (pulls PyInstaller in via the `build`
 REM group). Resolves the lockfile, creates / updates .venv, fetches Python
 REM 3.12 if missing.
 echo Syncing dependencies (runtime + dev + build) ...
-uv sync --group build
+uv sync --group build --extra spacemouse
 if errorlevel 1 (
     echo ERROR: uv sync failed
     pause ^& exit /b 1

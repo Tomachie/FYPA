@@ -571,6 +571,8 @@ class GLMeshViewer(QOpenGLWidget):
 
         # --- Data extents ---
         self._data_bounds: tuple[float, float, float, float] | None = None
+        # Optional board-outline (or host) bounds for NavLib Fit + 3D reframe.
+        self._navlib_frame_bounds: tuple[float, float, float, float] | None = None
         # Max per-vertex z (in un-exaggerated mm) of the uploaded mesh.
         # Used by the 3D wheel/middle-drag zoom to enforce a hard stop
         # just above the copper top and to keep the apparent zoom step
@@ -856,31 +858,96 @@ class GLMeshViewer(QOpenGLWidget):
             h_px,
         )
 
-    def apply_navlib_camera_matrix(
-        self, matrix: list[list[float]],
-    ) -> None:
-        """Apply a NavLib camera-to-world matrix to the current view."""
-        from fypa.navlib_camera import (
-            parse_camera_matrix_2d,
-            parse_camera_matrix_3d,
-        )
-
-        w_px = max(1, self.width())
-        h_px = max(1, self.height())
+    def navlib_pivot_world(self) -> tuple[float, float, float]:
+        """Look-at / pivot point for NavLib (mm, world space)."""
         if self._view_mode == "3d":
+            return self._cam_target
+        return self._view_center_x, self._view_center_y, 0.0
+
+    def apply_navlib_pivot(self, x: float, y: float, z: float) -> None:
+        """NavLib pivot move — 3D pan is applied via :meth:`apply_navlib_3d_pose`."""
+        return
+
+    def apply_navlib_3d_pose(
+        self,
+        pivot: tuple[float, float, float] | None,
+        matrix: list[list[float]] | None,
+    ) -> None:
+        """Apply one batched 3D NavLib update (pivot pan, matrix orbit/zoom)."""
+        if self._view_mode != "3d":
+            return
+        from fypa.navlib_camera import parse_camera_matrix_3d
+
+        if pivot is not None:
+            self._cam_target = (
+                float(pivot[0]), float(pivot[1]), float(pivot[2]),
+            )
+        if matrix is not None:
             yaw, pitch, dist = parse_camera_matrix_3d(
                 matrix, self._cam_target,
             )
             self._cam_yaw_deg = max(-180.0, min(180.0, yaw))
             self._cam_pitch_deg = max(-89.0, min(89.0, pitch))
             self._cam_distance = max(min(dist, 1e7), 0.01)
-        else:
-            cx, cy, mpp = parse_camera_matrix_2d(matrix, w_px, h_px)
-            self._view_center_x = cx
-            self._view_center_y = cy
-            self._mm_per_pixel = max(min(mpp, 1e6), 1e-9)
         self.viewChanged.emit()
         self.update()
+
+    def navlib_scene_center_radius(
+        self,
+    ) -> tuple[tuple[float, float, float], float]:
+        """Scene centre and bounding radius for NavLib orthographic workaround."""
+        pmin, pmax = self.navlib_model_extents()
+        cx = (pmin[0] + pmax[0]) * 0.5
+        cy = (pmin[1] + pmax[1]) * 0.5
+        cz = (pmin[2] + pmax[2]) * 0.5
+        dx = pmax[0] - cx
+        dy = pmax[1] - cy
+        dz = pmax[2] - cz
+        radius = max((dx * dx + dy * dy + dz * dz) ** 0.5, 1.0)
+        return (cx, cy, cz), radius
+
+    def apply_navlib_camera_matrix(
+        self, matrix: list[list[float]],
+    ) -> None:
+        """Apply a NavLib camera-to-world matrix to the current view."""
+        if self._view_mode == "3d":
+            self.apply_navlib_3d_pose(None, matrix)
+            return
+
+        # 2D ortho: pan via camera matrix; zoom via view extents (Cura split).
+        from fypa.navlib_camera import (
+            adjust_ortho_navlib_camera,
+            parse_camera_center_2d,
+        )
+
+        scene_center, scene_radius = self.navlib_scene_center_radius()
+        adjusted = adjust_ortho_navlib_camera(
+            matrix, scene_center, scene_radius,
+        )
+        cx, cy = parse_camera_center_2d(adjusted)
+        self._view_center_x = cx
+        self._view_center_y = cy
+        self.viewChanged.emit()
+        self.update()
+
+    def set_navlib_frame_bounds(
+        self,
+        bounds: tuple[float, float, float, float] | None,
+    ) -> None:
+        """Bounds used for NavLib Fit and 3D reframe (board outline preferred)."""
+        if bounds is None:
+            self._navlib_frame_bounds = None
+            return
+        x_min, x_max, y_min, y_max = bounds
+        if not all(math.isfinite(v) for v in (x_min, x_max, y_min, y_max)):
+            self._navlib_frame_bounds = None
+            return
+        self._navlib_frame_bounds = (
+            float(x_min), float(x_max), float(y_min), float(y_max),
+        )
+
+    def _frame_bounds(self) -> tuple[float, float, float, float] | None:
+        return self._navlib_frame_bounds or self._data_bounds
 
     def navlib_model_extents(
         self,
@@ -888,14 +955,32 @@ class GLMeshViewer(QOpenGLWidget):
         """NavLib model bounding box (min, max) in world mm."""
         from fypa.navlib_camera import model_extents_from_bounds
 
+        in_3d = self._view_mode == "3d"
+        z_max = self._data_z_max
+        if in_3d:
+            z_max = self._data_z_max * self._vertical_exaggeration
         return model_extents_from_bounds(
-            self._data_bounds, self._data_z_max,
+            self._frame_bounds(),
+            z_max,
+            perspective_3d=in_3d,
         )
 
     def navlib_view_extents(
         self,
     ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        """NavLib orthographic view extents (min, max) in world mm."""
+        """NavLib view extents (min, max) in world mm."""
+        if self._view_mode == "3d":
+            from fypa.navlib_camera import view_extents_3d
+
+            w_px = max(1, int(self.width() - self._legend_right_inset))
+            h_px = max(1, self.height())
+            return view_extents_3d(
+                self._cam_target,
+                self._cam_distance,
+                self._cam_fov_deg,
+                w_px,
+                h_px,
+            )
         from fypa.navlib_camera import view_extents_2d
 
         return view_extents_2d(
@@ -911,15 +996,19 @@ class GLMeshViewer(QOpenGLWidget):
         pmin: tuple[float, float, float],
         pmax: tuple[float, float, float],
     ) -> None:
-        """Apply NavLib orthographic zoom/pan via view extents (2D mode)."""
-        from fypa.navlib_camera import apply_view_extents_2d
+        """Apply NavLib orthographic zoom via view extents (2D mode only)."""
+        if self._view_mode == "3d":
+            return
+        from fypa.navlib_camera import zoom_mpp_from_view_extents_2d
 
-        cx, cy, mpp = apply_view_extents_2d(
+        mpp = zoom_mpp_from_view_extents_2d(
             pmin, pmax,
             max(1, self.width()),
             max(1, self.height()),
         )
-        self.set_view_center_scale(cx, cy, mpp)
+        self.set_view_center_scale(
+            self._view_center_x, self._view_center_y, mpp,
+        )
 
     def navlib_pointer_world(self) -> tuple[float, float, float]:
         """World-space point under the cursor for NavLib zoom pivot."""
@@ -1454,19 +1543,32 @@ class GLMeshViewer(QOpenGLWidget):
     def _fit_3d_to_data(self) -> None:
         """Centre the 3D camera target on the data and pick a distance
         that frames the board with a healthy margin."""
-        if self._data_bounds is None:
+        from fypa.navlib_camera import perspective_fit_distance_mm
+
+        bounds = self._frame_bounds()
+        if bounds is None:
             return
-        x_min, x_max, y_min, y_max = self._data_bounds
+        x_min, x_max, y_min, y_max = bounds
         cx = (x_min + x_max) * 0.5
         cy = (y_min + y_max) * 0.5
         board_w = max(x_max - x_min, 1.0)
         board_h = max(y_max - y_min, 1.0)
-        # Distance ≈ half-diagonal / tan(fov/2), with margin so the
-        # board isn't kissing the viewport edges.
-        diag = math.hypot(board_w, board_h) * 1.6
+        w_px = max(1, int(self.width() - self._legend_right_inset))
+        h_px = max(1, self.height())
         self._cam_target = (cx, cy, 0.0)
-        self._cam_distance = max(diag / (2.0 * math.tan(
-            math.radians(self._cam_fov_deg) * 0.5)), 1.0)
+        self._cam_distance = perspective_fit_distance_mm(
+            board_w, board_h, self._cam_fov_deg, w_px / h_px,
+        )
+
+    def fit_3d_view(self) -> None:
+        """Frame the board in 3D instantly (top-down, no animation)."""
+        if self._frame_bounds() is None:
+            return
+        self._fit_3d_to_data()
+        self._cam_yaw_deg = self._CAM_DEFAULT_YAW_DEG
+        self._cam_pitch_deg = self._CAM_DEFAULT_PITCH_DEG
+        self.viewChanged.emit()
+        self.update()
 
     def _dolly_cam_distance(self, base_distance: float,
                               factor: float) -> float:
@@ -1513,7 +1615,7 @@ class GLMeshViewer(QOpenGLWidget):
         snapping, so the user can see where the camera was vs where
         it lands. If there's no data yet there's nothing to frame, so
         just snap the angles."""
-        if self._data_bounds is None:
+        if self._frame_bounds() is None:
             self._cam_yaw_deg = self._CAM_DEFAULT_YAW_DEG
             self._cam_pitch_deg = self._CAM_DEFAULT_PITCH_DEG
             self.viewChanged.emit()
