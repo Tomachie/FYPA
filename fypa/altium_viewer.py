@@ -51,6 +51,7 @@ from fypa.gl_mesh_viewer import (
     MarkerGroup,
     _install_default_surface_format,
 )
+from fypa.spacemouse_nav import SpaceMouseController
 
 
 # Application icon — shown in the title bar AND Windows taskbar.
@@ -6074,6 +6075,12 @@ class PdnViewer(QMainWindow):
         self._gl_viewer.editorDragReleased.connect(
             self._on_marker_drag_released)
 
+        self._spacemouse = SpaceMouseController(
+            self._gl_viewer,
+            self._on_spacemouse_fit,
+            self,
+        )
+
         plot_layout.addWidget(self._gl_viewer, 1)
 
         # Heatmap colour-scale strip — overlaid on the GL viewer's
@@ -9059,10 +9066,12 @@ class PdnViewer(QMainWindow):
         bo_state = self._overlay_state.get("board_outline", {}).get("both", {})
         if bo_state.get("vis") is None:
             self._gl_viewer.clear_board_outline()
+            self._sync_navlib_frame_bounds()
             return
         points = (self.metadata or {}).get("board_outline") or []
         if len(points) < 3:
             self._gl_viewer.clear_board_outline()
+            self._sync_navlib_frame_bounds()
             return
 
         ring = np.asarray(points, dtype=np.float64)
@@ -9129,8 +9138,7 @@ class PdnViewer(QMainWindow):
         colors[:, :3] = colour
         colors[:, 3] = alpha
         self._gl_viewer.set_board_outline(positions, colors)
-
-    # --- Stub-copper overlay -----------------------------------------------
+        self._sync_navlib_frame_bounds()
 
     # RGB of the stub-copper polygons — dim grey so they're visibly
     # present but obviously distinct from the heatmap LUT colours.
@@ -11131,6 +11139,27 @@ class PdnViewer(QMainWindow):
 
     # --- CAD-style fixed-scale viewport (via GLMeshViewer) -----------------
 
+    def _sync_navlib_frame_bounds(self) -> None:
+        """Keep NavLib Fit framing in sync with the board-outline box."""
+        if self._gl_viewer is None:
+            return
+        self._gl_viewer.set_navlib_frame_bounds(
+            self._board_outline_bounds() or self._data_bounds,
+        )
+
+    def _fit_board_to_view(self) -> None:
+        """User-triggered fit — frames board outline (or mesh) with margin."""
+        if self._gl_viewer is None or not self._gl_viewer.isVisible():
+            return
+        self._sync_navlib_frame_bounds()
+        bounds = self._board_outline_bounds() or self._data_bounds
+        if bounds is None:
+            return
+        if self.view_3d_box.isChecked():
+            self._gl_viewer.fit_3d_view()
+        else:
+            self._gl_viewer.fit_to_bounds(*bounds, padding=1.08)
+
     def _fit_board_to_canvas(self) -> None:
         """Frame the board in the GL canvas, with a little margin, centred —
         the one-time fit applied when a design is first shown. No-op after
@@ -11159,6 +11188,7 @@ class PdnViewer(QMainWindow):
             return
         self._suppress_view_changed = True
         try:
+            self._sync_navlib_frame_bounds()
             self._gl_viewer.fit_to_bounds(*bounds, padding=1.08)
             _, _, self._mm_per_pixel = self._gl_viewer.view_center_scale()
         finally:
@@ -16061,10 +16091,16 @@ class PdnViewer(QMainWindow):
         panel.raise_()
         gl.set_legend_right_inset(float(w) if panel.isVisible() else 0.0)
 
+    def _on_spacemouse_fit(self) -> None:
+        """SpaceMouse menu / fit button — frame board or reset 3D view."""
+        self._fit_board_to_view()
+
     def closeEvent(self, event) -> None:
         """Uninstall the application-wide Shift filter on window close
         so QApplication doesn't keep dispatching events at a dangling
         Python object."""
+        if getattr(self, "_spacemouse", None) is not None:
+            self._spacemouse.shutdown()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
@@ -18954,7 +18990,14 @@ class PdnViewer(QMainWindow):
         n_files: int | None = None
         try:
             from fypa.paraview_export import export_lean_solution
-            n_files = export_lean_solution(self.solution, Path(out_dir_str))
+            via_rows: list[dict] | None = None
+            try:
+                via_rows = self._get_or_compute_via_rows()
+            except Exception:
+                log.warning(
+                    "Via report unavailable for ParaView export", exc_info=True)
+            n_files = export_lean_solution(
+                self.solution, Path(out_dir_str), via_rows=via_rows)
         except Exception:
             log.exception(
                 "ParaView export to %s failed", out_dir_str)
@@ -21343,6 +21386,19 @@ when one of those has focus.</p>
   <tr><th>Gesture</th><th>Action</th></tr>
   <tr><td><kbd>Shift</kbd> + right-button drag</td><td>Rotate (orbit the camera around the board centre)</td></tr>
 </table>
+
+<h3>3Dconnexion SpaceMouse</h3>
+<ul>
+  <li><b>Translation</b> &mdash; pan the view (2D and 3D)</li>
+  <li><b>Translation Z</b> &mdash; zoom in / out</li>
+  <li><b>Rotation</b> &mdash; orbit the camera (3D mode only)</li>
+  <li><b>Menu / fit button</b> &mdash; fit board (2D) or reset 3D view</li>
+  <li>Requires <b>3DxWare</b> on Windows/macOS
+    (<code>uv sync --extra spacemouse</code>) or <b>spacenavd</b> on Linux
+    (<code>sudo apt install spacenavd libspnav0</code>)</li>
+  <li>Navigation stays active while FYPA is open so 3Dconnexion Settings
+    keeps the FYPA profile selected</li>
+</ul>
 
 <h3>Voltage / Voltage Drop mode only <span class='muted'>(2D only)</span></h3>
 <table>

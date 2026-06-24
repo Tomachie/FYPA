@@ -48,6 +48,9 @@ a = Analysis(
         # try/except in fypa/_clipper_fuse.py, which PyInstaller's analysis can
         # skip — name it explicitly so the default fuse backend ships.
         'pyclipr',
+        # 3Dconnexion SpaceMouse (optional extra: uv sync --extra spacemouse)
+        'pynavlib',
+        'pynavlib.pynavlib_interface',
     ] + _altium_monkey_submodules,
     hookspath=[],
     hooksconfig={},
