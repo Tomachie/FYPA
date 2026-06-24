@@ -8,7 +8,7 @@ numbers the tool reports in the **Vias** tab and the per-segment current
 overlay.
 
 The authoritative implementation lives in
-[fypa/altium_loader.py](../fypa/altium_loader.py); section anchors in this
+[fypa/altium/loader.py](../fypa/altium/loader.py); section anchors in this
 document point at the relevant ranges.
 
 ## Where vias fit into the FEM
@@ -21,7 +21,7 @@ inserts a chain of small `Resistor` elements (one per layer-to-layer
 Steiner point at the via's `(x, y)` on the two layer meshes it bridges.
 
 See `_coupling_networks` in
-[fypa/altium_loader.py:667-781](../fypa/altium_loader.py#L667-L781) for the
+[fypa/altium/loader.py:846-976](../fypa/altium/loader.py#L846-L976) for the
 exact element-construction code.
 
 ## Per-hop resistance formula
@@ -64,7 +64,7 @@ A = π * (d/2)²
 This branch keeps the formula valid for tiny micro-vias whose plating
 effectively fills the hole. (There is no separate fill term in this case —
 the void no longer exists.) See `_barrel_segment_resistance_ohm` in
-[fypa/altium_loader.py](../fypa/altium_loader.py).
+[fypa/altium/loader.py](../fypa/altium/loader.py).
 
 A through-hole pad with a 0 mm hole, or a missing stackup, or any other
 degenerate input falls back to a fixed per-hop value (see
@@ -75,9 +75,11 @@ degenerate input falls back to a fixed per-hop value (see
 FYPA reads the IPC-4761 protection record on every via and classifies the
 fill as **conductive** or **non-conductive** before solving:
 
-* A via must have one of the four IPC-4761 *FILLING* protection types
-  (V, VIa, VIb, VII — enum values 9, 10, 11, 12). Tenting, plugging, and
-  capping are not fills and leave the barrel cross-section unchanged.
+* A via must have one of the IPC-4761 *FILLING* protection types
+  (V, VIa, VIb, VII — enum values 9, 10, 11, 12; value 5 is also accepted as
+  a synonym for the V *filling* type, for resilience against `altium_monkey`
+  enum reorderings). Tenting, plugging, and capping are not fills and leave
+  the barrel cross-section unchanged.
 * The FILLING feature row's material string (free text in Altium, e.g.
   `Copper`, `Silver Epoxy`, `Polymer`, `Non-Conductive Epoxy`) is matched
   case-insensitively against the keywords *conductive*, *copper*, *Cu*,
@@ -100,7 +102,7 @@ Pure electroplated copper-fill closure ≈ copper itself (1.68 µΩ·cm) —
 drop the setting to ~2×10⁻⁵ Ω·mm in that case.
 
 The classifier and per-hop helper live in
-[fypa/altium_loader.py](../fypa/altium_loader.py) (`_is_conductive_fill`
+[fypa/altium/loader.py](../fypa/altium/loader.py) (`_is_conductive_fill`
 and `_barrel_segment_resistance_ohm`).
 
 ### How much does it actually move R?
@@ -141,7 +143,7 @@ Concretely, all of these answers are "yes":
   z-difference between the *centres* of the two copper layers, computed
   from the Altium stackup's `copper_thickness_mm` and
   `dielectric_thickness_mm`. See `_layer_z_centers_mm` in
-  [fypa/altium_loader.py:596-625](../fypa/altium_loader.py#L596-L625).
+  [fypa/altium/loader.py:638-669](../fypa/altium/loader.py#L638-L669).
   Edits to the stackup made through the viewer feed straight into this.
 
 * **Diameter of the via** — yes. The drill diameter (`hole_diameter_mm`)
@@ -158,7 +160,7 @@ Concretely, all of these answers are "yes":
   consistent.
 
 The Settings-tab field schema and the matching parameter docs live at
-[fypa/altium_viewer.py:12148-12194](../fypa/altium_viewer.py#L12148-L12194).
+[fypa/altium_viewer.py:17241-17296](../fypa/altium_viewer.py#L17241-L17296).
 
 ## Where each hop "lands"
 
@@ -174,12 +176,12 @@ matters in two ways:
   entirely (it has no closed-loop electrical role).
 
 The reasoning is documented inline at
-[fypa/altium_loader.py:706-738](../fypa/altium_loader.py#L706-L738).
+[fypa/altium/loader.py:846-976](../fypa/altium/loader.py#L846-L976).
 
 Through-hole **pads** are treated the same way as vias, but with an
 assumed span of *every enabled copper layer* (Altium pads do not carry an
 explicit blind/buried span). See `_via_through_holes` at
-[fypa/altium_loader.py:784-813](../fypa/altium_loader.py#L784-L813).
+[fypa/altium/loader.py:977-1012](../fypa/altium/loader.py#L977-L1012).
 
 ## Does Altium report whether the via is filled?
 
@@ -196,7 +198,7 @@ information in its PCB records, including:
   distinguishes through, blind, and buried geometry.
 
 **What FYPA does with that information today:** the PCB extractor
-([fypa/altium_extract.py](../fypa/altium_extract.py)) propagates the
+([fypa/altium/extract.py](../fypa/altium/extract.py)) propagates the
 IPC-4761 type and the FILLING row's material string onto `RawVia` so the
 resistance model can apply the conductive-fill shunt described above.
 Tenting, backdrill, and the remaining IPC-4761 feature rows (covering,
@@ -320,6 +322,6 @@ does not trigger an immediate re-solve; press **Re-run Solver** to apply.
 
 Solver-side constants (`PLATING_THICKNESS_MM`, `COPPER_RESISTIVITY_OHM_MM`,
 `FALLBACK_VIA_RESISTANCE_OHM`) are patched in
-[fypa/altium_loader.py:188-199](../fypa/altium_loader.py#L188-L199) when
+[fypa/altium/loader.py:227-230](../fypa/altium/loader.py#L227-L230) when
 the user re-runs the solver from the Settings tab, so the next solve
 picks up the new values without code changes.

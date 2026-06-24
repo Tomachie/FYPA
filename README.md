@@ -304,7 +304,8 @@ python FYPA.py geometry    YourBoard.PrjPcb           # per-layer copper summary
 python FYPA.py load        YourBoard.PrjPcb           # full pipeline, readiness report
 python FYPA.py solve       YourBoard.PrjPcb out.pkl   # solve + pickle
 python FYPA.py show        out.pkl                    # open viewer on a saved pickle
-python FYPA.py paraview    out.pkl out.vtu            # export to ParaView VTK
+python FYPA.py paraview    out.pkl out_dir\           # export to ParaView VTK (writes into a folder)
+python FYPA.py gerber-gui  path\to\gerber_folder      # import a board from Gerber + Excellon files
 ```
 
 ### Editor mode — sources / sinks without touching the schematic
@@ -336,10 +337,11 @@ along with a fingerprint of every input that affects the solve:
 
 * The `.PrjPcb` plus every `.PcbDoc` / `.SchDoc` it references
   (parsed from the `DocumentPath=` lines)
-* The tool's own solver-affecting source files (`fypa/altium_extract.py`,
-  `fypa/altium_annotations.py`, `fypa/altium_geometry.py`,
-  `fypa/altium_loader.py`, `fypa/cli.py`, `fypa/lean_solution.py`, and the
-  modified `pdnsolver/` modules)
+* The tool's own solver-affecting source files (`fypa/altium/extract.py`,
+  `fypa/altium/annotations.py`, `fypa/altium/loader.py`,
+  `fypa/gerber/extract.py`, `fypa/gerber/loader.py`,
+  `fypa/altium_geometry.py`, `fypa/cli.py`, `fypa/lean_solution.py`, and the
+  modified `pdnsolver/` modules — `problem.py`, `mesh.py`, `solver.py`)
 
 On subsequent runs the fingerprint is recomputed and compared. If
 nothing has changed the cached solution is reused — typical startup
@@ -476,12 +478,24 @@ After editing the spec, re-run `packaging\build_dist.bat` to rebuild.
 FYPA.py                  Thin launcher shim (repo root)
 fypa/                    Application package:
   cli.py                 CLI entry; orchestrates the pipeline
-  altium_extract.py      altium_monkey adapter → typed dataclasses (mm-based)
-  altium_annotations.py  Parses PDN_* parameters, resolves terminal pins
+  altium/                Altium project front-end:
+    extract.py             altium_monkey adapter → typed dataclasses (mm-based)
+    annotations.py         Parses PDN_* parameters, resolves terminal pins
+    loader.py              Orchestrator; assembles the padne Problem
+  gerber/                Gerber + Excellon front-end:
+    extract.py             Gerber/drill parser → copper geometry
+    loader.py              Assembles the padne Problem from Gerber input
+    import_ui.py           Layer-mapping / stackup import dialogs
   altium_geometry.py     Builds per-(layer, net) Shapely MultiPolygons
-  altium_loader.py       Orchestrator; assembles the padne Problem
+  _clipper_fuse.py       Clipper2-based polygon fuse helper (fast union path)
+  editor_directives.py   Editor-mode SOURCE / SINK / SERIES directives
+  project_file.py        Read / write the sidecar .fypa project file
   altium_viewer.py       Qt viewer (side panel, tabs, scale controller)
   gl_mesh_viewer.py      Custom QOpenGLWidget — mesh-on-GPU heatmap canvas
+  paraview_export.py     ParaView VTU export
+  spacemouse_nav.py      3Dconnexion SpaceMouse integration
+  navlib_camera.py       NavLib camera adapter for the SpaceMouse
+  log_buffer.py          In-memory log capture for the Messages tab
   lean_solution.py       Compact numeric solution (cache / pickle payload)
 pdnsolver/               Vendored fork of padne (FEM solver + mesher)
 packaging/               PyInstaller spec, build script, Altium launcher

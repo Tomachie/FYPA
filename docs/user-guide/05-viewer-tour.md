@@ -122,8 +122,8 @@ shows a short "no issues" message.
 ## 5.8 The Heatmap tab
 
 The viewport itself lives in a tab called *Heatmap*. You will rarely
-click away from it during normal use, but FYPA can also open
-single-rail / single-layer comparison views in additional tabs.
+click away from it during normal use — the other tabs hold the setup
+controls, node / via tables, messages, and settings.
 
 ## 5.9 Interaction reference
 
