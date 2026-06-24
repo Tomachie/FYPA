@@ -327,58 +327,97 @@ class PdnParameterSource:
         return self.sch_lookup_designator or self.designator
 
 
-def _schdoc_for_source_designator(proj: ExtractedProject, designator: str) -> str:
-    target = designator.upper()
-    for comp in proj.sch_components:
-        if comp.designator.upper() == target:
-            return comp.schdoc_name
-    return "(pcb)"
+def _build_pads_by_component(
+    proj: ExtractedProject,
+) -> dict[int, dict[str, RawPad]]:
+    """Routed pads grouped by ``component_index`` then upper-cased designator."""
+    out: dict[int, dict[str, RawPad]] = {}
+    for p in proj.pads:
+        if p.net_index == NO_NET:
+            continue
+        out.setdefault(p.component_index, {})[p.designator.upper()] = p
+    return out
 
 
-def _schdoc_for_pcb_instance(proj: ExtractedProject, pcb_index: int,
-                             lookup_des: str) -> str:
+def _build_netlist_designator_index(
+    netlist,
+) -> dict[str, list[tuple[str, tuple[str, ...], tuple[str, ...]]]]:
+    """Compiled-netlist terminals keyed by component designator.
+
+    Each entry is ``(pin_key, net_names_upper, source_sheets)``. Built once so
+    callers avoid an O(nets x terminals) rescan per directive.
+    """
+    out: dict[str, list[tuple[str, tuple[str, ...], tuple[str, ...]]]] = {}
+    if netlist is None:
+        return out
+    for net in netlist.nets:
+        names = tuple(
+            n.upper() for n in (net.name, *getattr(net, "aliases", ())) if n
+        )
+        sheets = tuple(s for s in (getattr(net, "source_sheets", ()) or ()) if s)
+        for term in net.terminals:
+            out.setdefault(term.designator.upper(), []).append(
+                (str(term.pin).upper(), names, sheets)
+            )
+    return out
+
+
+def _schdoc_for_pcb_instance(
+    proj: ExtractedProject,
+    pcb_index: int,
+    lookup_des: str,
+    *,
+    pads_by_component: dict[int, dict[str, RawPad]] | None = None,
+    netlist_index: dict[str, list[tuple[str, tuple[str, ...], tuple[str, ...]]]]
+    | None = None,
+) -> str:
     """Infer the schematic sheet for one PCB placement.
 
     Uses compiled-netlist terminal ↔ pad connectivity so Blanket/ECO
     directives on a specific ``pcb_index`` stay scoped to that instance's
     sheet rather than the first ``sch_components`` row for ``lookup_des``.
+
+    Pass ``pads_by_component`` / ``netlist_index`` (from
+    :func:`_build_pads_by_component` / :func:`_build_netlist_designator_index`)
+    to reuse the indexes across many directives; otherwise they are built
+    on demand for this single call.
     """
     if not lookup_des:
         return ""
     target_des = lookup_des.upper()
-    routed_pads: dict[str, RawPad] = {
-        p.designator.upper(): p
-        for p in proj.pads
-        if p.component_index == pcb_index and p.net_index != NO_NET
-    }
+    if pads_by_component is None:
+        pads_by_component = _build_pads_by_component(proj)
+    routed_pads = pads_by_component.get(pcb_index, {})
 
     sheet_votes: dict[str, int] = {}
     sheet_paths: dict[str, str] = {}
 
-    netlist = proj.compiled_netlist
-    if netlist is not None and routed_pads:
-        for net in netlist.nets:
-            names = [net.name, *getattr(net, "aliases", ())]
-            for term in net.terminals:
-                if term.designator.upper() != target_des:
-                    continue
-                pad = routed_pads.get(str(term.pin).upper())
-                if pad is None:
-                    continue
-                pcb_net_name = proj.nets[pad.net_index].name
-                if not any(
-                    n and n.upper() == pcb_net_name.upper() for n in names
-                ):
-                    continue
-                for sheet in getattr(net, "source_sheets", ()) or ():
-                    if not sheet:
-                        continue
-                    key = sheet.replace("\\", "/").lower()
-                    sheet_votes[key] = sheet_votes.get(key, 0) + 1
-                    sheet_paths.setdefault(key, sheet)
+    if routed_pads:
+        if netlist_index is None:
+            netlist_index = _build_netlist_designator_index(proj.compiled_netlist)
+        for pin_key, names, sheets in netlist_index.get(target_des, ()):
+            pad = routed_pads.get(pin_key)
+            if pad is None:
+                continue
+            if proj.nets[pad.net_index].name.upper() not in names:
+                continue
+            for sheet in sheets:
+                key = sheet.replace("\\", "/").lower()
+                sheet_votes[key] = sheet_votes.get(key, 0) + 1
+                sheet_paths.setdefault(key, sheet)
 
     if sheet_votes:
-        best = max(sheet_votes, key=lambda k: sheet_votes[k])
+        # Deterministic tie-break: highest vote, ties broken by the
+        # lexicographically smallest sheet key (sorted() before max()).
+        best = max(sorted(sheet_votes), key=lambda k: sheet_votes[k])
+        top = sheet_votes[best]
+        if sum(1 for v in sheet_votes.values() if v == top) > 1:
+            log.debug(
+                "Ambiguous sheet vote for %s (pcb_index=%d): %s; choosing %s",
+                lookup_des, pcb_index,
+                sorted(k for k, v in sheet_votes.items() if v == top),
+                sheet_paths[best],
+            )
         return sheet_paths[best]
 
     sch_matches = [
@@ -406,15 +445,29 @@ def _iter_pdn_parameter_sources(proj: ExtractedProject) -> list[PdnParameterSour
             sch_lookup_designator=comp.designator,
         ))
 
+    pads_by_component: dict[int, dict[str, RawPad]] | None = None
+    netlist_index: (
+        dict[str, list[tuple[str, tuple[str, ...], tuple[str, ...]]]] | None
+    ) = None
     for idx, pcb in enumerate(proj.pcb_components):
         if _ci_get(pcb.parameters, ROLE_KEY) is None:
             continue
         lookup_des = pcb.source_designator or pcb.designator
         if lookup_des.upper() in sch_with_role:
             continue
+        if pads_by_component is None:
+            # Built once, only when a PCB-sourced directive actually exists.
+            pads_by_component = _build_pads_by_component(proj)
+            netlist_index = _build_netlist_designator_index(
+                proj.compiled_netlist
+            )
         sources.append(PdnParameterSource(
             designator=pcb.designator,
-            schdoc_name=_schdoc_for_pcb_instance(proj, idx, lookup_des),
+            schdoc_name=_schdoc_for_pcb_instance(
+                proj, idx, lookup_des,
+                pads_by_component=pads_by_component,
+                netlist_index=netlist_index,
+            ),
             parameters=pcb.parameters,
             pcb_index=idx,
             sch_lookup_designator=lookup_des,
@@ -430,6 +483,10 @@ def _pcb_indices_for_source(comp: PdnParameterSource,
 
 
 def _sheet_name_matches(schdoc_name: str, source_sheets: list[str]) -> bool:
+    # A net with no recorded sheet provenance (e.g. a global/power net) cannot
+    # contradict the inferred instance sheet, so it is accepted. This is the
+    # one remaining permissive path; cross-instance mis-binding is bounded by
+    # the routed-pin scoping the caller applies (see _resolve_local_net_pins).
     if not source_sheets:
         return True
     if not schdoc_name:
@@ -460,11 +517,13 @@ def _resolve_local_net_pins(
     target_des = sch_designator.upper()
     pins: list[str] = []
     seen: set[str] = set()
+    unscoped_used = False
     for net in netlist.nets:
         names = [net.name, *getattr(net, "aliases", ())]
         if not any(n.upper() == local_net_name.upper() for n in names if n):
             continue
-        if not _sheet_name_matches(schdoc_name, list(getattr(net, "source_sheets", ()) or ())):
+        net_sheets = list(getattr(net, "source_sheets", ()) or ())
+        if not _sheet_name_matches(schdoc_name, net_sheets):
             continue
         for term in net.terminals:
             if term.designator.upper() != target_des:
@@ -476,6 +535,14 @@ def _resolve_local_net_pins(
             if key not in seen:
                 seen.add(key)
                 pins.append(pin)
+                if schdoc_name and not net_sheets:
+                    unscoped_used = True
+    if unscoped_used:
+        log.debug(
+            "Local net %r on %s resolved via net(s) lacking sheet provenance; "
+            "match scoped by routed pins only.",
+            local_net_name, sch_designator,
+        )
     return pins
 
 
