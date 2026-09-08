@@ -80,7 +80,7 @@ class BaseLumped:
 
     @property
     def terminals(self) -> list[NodeID]:
-        ...
+        raise NotImplementedError
 
     @property
     def is_source(self) -> bool:
@@ -180,10 +180,18 @@ class VoltageRegulator(BaseLumped):
 
     voltage: float
     gain: float
+    # Averaged switch legs for external-FET stages (LS FETs): each entry is
+    # ``(f, t, coeff)`` with current ``coeff * i_v`` from *f* to *t*. The stamp
+    # also injects ``coeff * i_v`` at *f* as PWM compensation so KCL on the
+    # switch-node copper still leaves ``i_v`` for the high-side path.
+    switch_legs: tuple[tuple[NodeID, NodeID, float], ...] = ()
 
     @property
     def terminals(self) -> list[NodeID]:
-        return [self.v_p, self.v_n, self.s_f, self.s_t]
+        nodes = [self.v_p, self.v_n, self.s_f, self.s_t]
+        for f, t, _coeff in self.switch_legs:
+            nodes.extend((f, t))
+        return nodes
 
     @property
     def is_source(self) -> bool:

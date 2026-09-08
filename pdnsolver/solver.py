@@ -1868,7 +1868,8 @@ def stamp_network_into_system(network: problem.Network,
             case problem.VoltageRegulator(v_p=v_p, v_n=v_n,
                                           s_f=s_f, s_t=s_t,
                                           voltage=voltage,
-                                          gain=gain):
+                                          gain=gain,
+                                          switch_legs=switch_legs):
                 i_v_p = node_indexer.node_to_global_index[v_p]
                 i_v_n = node_indexer.node_to_global_index[v_n]
                 i_s_f = node_indexer.node_to_global_index[s_f]
@@ -1890,6 +1891,17 @@ def stamp_network_into_system(network: problem.Network,
                 rows.extend((i_s_f, i_s_t))
                 cols.extend((i_v, i_v))
                 vals.extend((-gain, gain))
+                # External-FET LS (and similar) legs: I = coeff·i_v from f→t,
+                # plus +coeff·i_v at f so switch-node KCL still leaves i_v for
+                # the high-side path (averaged PWM compensation).
+                for leg_f, leg_t, coeff in switch_legs:
+                    if coeff == 0.0:
+                        continue
+                    i_f = node_indexer.node_to_global_index[leg_f]
+                    i_t = node_indexer.node_to_global_index[leg_t]
+                    rows.extend((i_f, i_t, i_f))
+                    cols.extend((i_v, i_v, i_v))
+                    vals.extend((-coeff, coeff, coeff))
             case _:
                 raise NotImplementedError(f"Unsupported node type {element}")
 
