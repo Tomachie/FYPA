@@ -379,7 +379,8 @@ def do_annotations(args: argparse.Namespace) -> int:
 
 def do_load(args: argparse.Namespace) -> int:
     loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc,
-                          pdn_json=args.pdn_json, pdn_corner=args.pdn_corner)
+                          pdn_json=getattr(args, "pdn_json", None),
+                          pdn_corner=getattr(args, "pdn_corner", "typ"))
     print(loaded.diagnostic_summary())
     if args.png:
         args.png.parent.mkdir(parents=True, exist_ok=True)
@@ -1272,7 +1273,8 @@ def save_solution_file(path: Path, solution, metadata: dict | None) -> None:
 
 def do_solve(args: argparse.Namespace) -> int:
     loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc,
-                          pdn_json=args.pdn_json, pdn_corner=args.pdn_corner)
+                          pdn_json=getattr(args, "pdn_json", None),
+                          pdn_corner=getattr(args, "pdn_corner", "typ"))
     solution, metadata = _solve_loaded(loaded, args)
     # ``mesh_failed``, not the records list: a failure whose geometry was too
     # degenerate to record leaves the list empty, and testing that would pickle
