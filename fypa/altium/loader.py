@@ -2430,6 +2430,8 @@ def build_solve_metadata(
             "channel_index": ch_idx,
             "label": label,
             "schdoc": d.schdoc_name,
+            "from_pdn_json": (d.designator or "").upper() in getattr(
+                loaded, "pdn_designators", frozenset()),
         }
         if isinstance(d, SourceSpec):
             common["value"] = d.voltage
@@ -5061,9 +5063,12 @@ def load_project(prjpcb_path: str | Path,
     # A Tomachie power-tree file supplies PDN_* parameters for the components
     # the designer did not annotate (fypa.tomachie_pdn).
     pdn_notes: list[str] = []
+    pdn_designators: set[str] = set()
     if pdn_json is not None:
-        from fypa.tomachie_pdn import apply_to_project, read_pdn_parameters
+        from fypa.tomachie_pdn import (apply_to_project, applied_designators,
+                                       read_pdn_parameters)
         params, pdn_notes = read_pdn_parameters(pdn_json, pdn_corner)
+        pdn_designators = applied_designators(params, extracted)
         extracted, more = apply_to_project(extracted, params)
         pdn_notes = [f"pdn.json: {n}" for n in pdn_notes + more]
         log.info("  %s: PDN_* parameters for %d component(s), %s corner",
@@ -5142,6 +5147,9 @@ def load_project(prjpcb_path: str | Path,
     # load made with another one, or none, has to be rebuilt.
     loaded.pdn_json_applied = ((str(Path(pdn_json).resolve()), pdn_corner)
                                if pdn_json is not None else None)
+    # Designators whose directives came from the Tomachie file, so the Setup tab
+    # says where they came from instead of naming a schematic sheet.
+    loaded.pdn_designators = frozenset(pdn_designators)
     return loaded
 
 

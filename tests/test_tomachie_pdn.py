@@ -174,3 +174,14 @@ def test_project_named_in_the_file_is_found_up_to_two_folders_above(tmp_path):
     pdn = tmp_path / "output" / "enrich" / "board.pdn.json"
     pdn.parent.mkdir(parents=True)
     assert _project_for(None, pdn, {"project_file": "board.PrjPcb"}) == prj
+
+
+def test_nothing_is_set_on_a_rail_nothing_drives():
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][0]["source"]["pins"] = []          # VBUS has no source now
+    p, notes = params(pdn=pdn)
+    # VBUS undriven -> U2's +3V3 and U3's +1V8 undriven -> +3V3A (behind FB1) too.
+    for ref in ("U2", "U3", "U5", "U7", "R17", "L1", "FB1"):
+        assert ref not in p, ref
+    assert any("Rail +3V3: nothing in the file drives it" in n for n in notes)
+    assert any("U2 (+3V3): nothing in the file drives its input (VBUS)" in n for n in notes)
