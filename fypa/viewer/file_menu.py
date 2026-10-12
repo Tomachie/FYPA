@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+
+from fypa.viewer.tomachie_menu import pdn_choice as _tomachie_pdn_choice
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
@@ -100,6 +102,15 @@ class _FileMenuMixin:
         )
         mb = self.menuBar()
         file_menu = mb.addMenu("&File")
+
+        load_pdn = QAction("Load &Tomachie pdn.json…", self)
+        load_pdn.setStatusTip(
+            "Set up sources, regulators, series parts and loads from a Tomachie "
+            "power-tree file, read from the schematic and the parts' datasheets")
+        from fypa.viewer.tomachie_menu import on_load_tomachie_pdn
+        load_pdn.triggered.connect(lambda: on_load_tomachie_pdn(self))
+        file_menu.addAction(load_pdn)
+        file_menu.addSeparator()
 
         open_proj = QAction("&Import Altium Design…", self)
         open_proj.setShortcut(QKeySequence.Open)         # Ctrl+O
@@ -1075,6 +1086,8 @@ class _FileMenuMixin:
                 for d in (getattr(getattr(self, "_project", None),
                                   "no_auto_bridge", []) or [])
             },
+            pdn_json=_tomachie_pdn_choice(self)[0],
+            pdn_corner=_tomachie_pdn_choice(self)[1],
             parent=self,
         )
         if is_import:

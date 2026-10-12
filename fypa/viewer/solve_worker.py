@@ -334,9 +334,16 @@ class _SolveWorker(QThread):
                   load_only: bool = False,
                   adaptive_regulator_gain: bool = False,
                   no_auto_bridge: set[str] | None = None,
+                  pdn_json: Path | None = None,
+                  pdn_corner: str = "typ",
                   parent=None) -> None:
         super().__init__(parent)
         self._prjpcb_path = prjpcb_path
+        # A Tomachie power-tree file supplying PDN_* directives (File > Load
+        # Tomachie pdn.json…). Like the auto-bridge opt-out it acts while
+        # annotations are parsed, so it reaches load_project.
+        self._pdn_json = pdn_json
+        self._pdn_corner = pdn_corner
         self._settings = settings
         # Designators the user has told the tool not to short automatically
         # (Bridges tab). Has to reach load_project, not the editor-directive
@@ -645,6 +652,13 @@ class _SolveWorker(QThread):
                     self.stage_changed.emit(
                         "Auto-bridge opt-out changed; reloading design info…")
                     loaded = None
+            if loaded is not None:
+                _want_pdn = ((str(Path(self._pdn_json).resolve()), self._pdn_corner)
+                             if self._pdn_json else None)
+                if getattr(loaded, "pdn_json_applied", None) != _want_pdn:
+                    self.stage_changed.emit(
+                        "Tomachie pdn.json changed; reloading design info…")
+                    loaded = None
 
             if loaded is None:
                 self.stage_changed.emit("Loading project from disk…")
@@ -652,7 +666,9 @@ class _SolveWorker(QThread):
                     loaded = load_project(
                         self._prjpcb_path,
                         pcbdoc_selector=self._pcbdoc_selector,
-                        no_auto_bridge=self._no_auto_bridge or None)
+                        no_auto_bridge=self._no_auto_bridge or None,
+                        pdn_json=self._pdn_json,
+                        pdn_corner=self._pdn_corner)
                 # Persist the freshly-loaded design info so the next run
                 # (e.g. a Re-run that only changes physics) can skip the
                 # extract step. Failures are non-fatal.

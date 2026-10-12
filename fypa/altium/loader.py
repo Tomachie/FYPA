@@ -5125,7 +5125,7 @@ def load_project(prjpcb_path: str | Path,
     for i in getattr(annotations, "infos", []):
         log.info("Annotation: %s", i)
 
-    return LoadedProject(
+    loaded = LoadedProject(
         extracted=extracted,
         annotations=annotations,
         no_auto_bridge_applied=frozenset(
@@ -5138,6 +5138,11 @@ def load_project(prjpcb_path: str | Path,
             if 0 <= old < len(extracted.nets)
         ),
     )
+    # Which Tomachie power-tree file (and corner) this load applied: a cached
+    # load made with another one, or none, has to be rebuilt.
+    loaded.pdn_json_applied = ((str(Path(pdn_json).resolve()), pdn_corner)
+                               if pdn_json is not None else None)
+    return loaded
 
 
 if __name__ == "__main__":

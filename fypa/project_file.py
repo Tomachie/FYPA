@@ -298,6 +298,10 @@ class ProjectFile:
     # editor directives are applied, so an editor directive cannot veto one
     # — this list is the only thing that can. Case-insensitive on use.
     no_auto_bridge: list[str] = field(default_factory=list)
+    # A Tomachie power-tree file supplying PDN_* directives, and the corner
+    # ("typ" / "max") it is solved at (File > Load Tomachie pdn.json…).
+    pdn_json: str | None = None
+    pdn_corner: str = "typ"
     viewer_settings: dict[str, Any] = field(default_factory=dict)
 
     # ---- Gerber-import fields (schema v2) --------------------------------
@@ -339,6 +343,8 @@ class ProjectFile:
             "cap_overrides": [c.to_dict() for c in self.cap_overrides],
             "net_renames": dict(self.net_renames),
             "no_auto_bridge": list(self.no_auto_bridge),
+            "pdn_json": _rel(self.pdn_json, base),
+            "pdn_corner": self.pdn_corner,
             "viewer_settings": dict(self.viewer_settings),
             "source_kind": self.source_kind,
             "gerber_files": [_rel(p, base) for p in self.gerber_files],
@@ -387,6 +393,8 @@ class ProjectFile:
                 for c in doc.get("cap_overrides", [])
             ],
             no_auto_bridge=[str(d) for d in doc.get("no_auto_bridge", [])],
+            pdn_json=_abs(doc.get("pdn_json"), base),
+            pdn_corner=str(doc.get("pdn_corner", "typ")),
             net_renames=dict(doc.get("net_renames", {})),
             viewer_settings=dict(doc.get("viewer_settings", {})),
             source_kind=str(doc.get("source_kind", "altium")),
