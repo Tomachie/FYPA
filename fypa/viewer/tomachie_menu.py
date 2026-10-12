@@ -18,7 +18,7 @@ import json
 import logging
 from pathlib import Path
 
-from PySide6.QtWidgets import QFileDialog, QInputDialog
+from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 log = logging.getLogger(__name__)
 
@@ -79,10 +79,33 @@ def _project_for(window, pdn_path: Path, pdn: dict) -> Path | None:
                 return candidate
             folder = folder.parent
     design = pdn.get("design", "")
+    title = f"Altium project for {design}" if design else "Altium project"
+    if named:
+        title += f" ({Path(named).name})"
     prj_str, _ = QFileDialog.getOpenFileName(
-        window, f"Altium project for {design}" if design else "Altium project",
+        window, title,
         str(pdn_path.parent), "Altium project (*.PrjPcb);;All files (*)")
     return Path(prj_str) if prj_str else None
+
+
+def written_for_another_project(pdn: dict, prjpcb: Path) -> str | None:
+    """The project the file was written for, when it is not ``prjpcb``."""
+    named = pdn.get("project_file")
+    if named and Path(named).name.lower() != prjpcb.name.lower():
+        return Path(named).name
+    return None
+
+
+def _confirm_project(window, pdn_path: Path, pdn: dict, prjpcb: Path) -> bool:
+    """A pdn.json applied to a board it was not written for gives confident
+    nonsense: say so and let the user decide."""
+    other = written_for_another_project(pdn, prjpcb)
+    if other is None:
+        return True
+    return QMessageBox.question(
+        window, "Load Tomachie pdn.json",
+        f"{pdn_path.name} was written for {other}, but the project is {prjpcb.name}."
+        "\n\nApply it anyway?") == QMessageBox.Yes
 
 
 def on_load_tomachie_pdn(window) -> None:
@@ -105,6 +128,10 @@ def on_load_tomachie_pdn(window) -> None:
     if not ok:
         return
     corner = CORNERS[label]
+    pdn = _read(pdn_path)
+    prj = open_prj or _project_for(window, pdn_path, pdn)
+    if prj is None or not _confirm_project(window, pdn_path, pdn, prj):
+        return
     window._tomachie_pdn = (pdn_path, corner)
     project = getattr(window, "_project", None)
     if project is not None and hasattr(project, "pdn_json"):
@@ -112,6 +139,4 @@ def on_load_tomachie_pdn(window) -> None:
     if open_prj is not None and hasattr(window, "_on_reload_design_info"):
         window._on_reload_design_info()     # re-extract with the file, re-solve
         return
-    prj = _project_for(window, pdn_path, _read(pdn_path))
-    if prj is not None:
-        _open_altium_project_at(window, prj, None, clean=False, force_solve=True)
+    _open_altium_project_at(window, prj, None, clean=False, force_solve=True)
