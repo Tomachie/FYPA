@@ -333,6 +333,8 @@ def _start_launcher_altium_solve(
 
     adaptive = _consume_cli_adaptive_flag(window)
 
+    from fypa.viewer.tomachie_menu import pdn_choice
+    pdn_json, pdn_corner = pdn_choice(window)
     worker = _SolveWorker(
         prjpcb_path, settings,
         pcbdoc_selector=str(pcbdoc_path) if pcbdoc_path else None,
@@ -340,6 +342,8 @@ def _start_launcher_altium_solve(
         try_solve_cache_first=imp["try_solve_cache_first"],
         load_only=imp["load_only"],
         adaptive_regulator_gain=bool(adaptive),
+        pdn_json=pdn_json,
+        pdn_corner=pdn_corner,
         parent=window,
     )
     _stash_pending_altium_recent(
