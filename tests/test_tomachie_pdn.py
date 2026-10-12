@@ -165,3 +165,12 @@ def test_regulator_quiescent_current():
     pdn["regulators"][1]["quiescent_current"] = {"amps": 5.5e-5, "basis": "typ"}
     p, _ = params(pdn=pdn)
     assert p["U3"]["PDN1_QUIESCENT"] == "5.5e-05"
+
+
+def test_project_named_in_the_file_is_found_up_to_two_folders_above(tmp_path):
+    from fypa.viewer.tomachie_menu import _project_for
+    prj = tmp_path / "board.PrjPcb"
+    prj.write_text("")
+    pdn = tmp_path / "output" / "enrich" / "board.pdn.json"
+    pdn.parent.mkdir(parents=True)
+    assert _project_for(None, pdn, {"project_file": "board.PrjPcb"}) == prj

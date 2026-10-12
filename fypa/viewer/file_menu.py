@@ -103,15 +103,6 @@ class _FileMenuMixin:
         mb = self.menuBar()
         file_menu = mb.addMenu("&File")
 
-        load_pdn = QAction("Load &Tomachie pdn.json…", self)
-        load_pdn.setStatusTip(
-            "Set up sources, regulators, series parts and loads from a Tomachie "
-            "power-tree file, read from the schematic and the parts' datasheets")
-        from fypa.viewer.tomachie_menu import on_load_tomachie_pdn
-        load_pdn.triggered.connect(lambda: on_load_tomachie_pdn(self))
-        file_menu.addAction(load_pdn)
-        file_menu.addSeparator()
-
         open_proj = QAction("&Import Altium Design…", self)
         open_proj.setShortcut(QKeySequence.Open)         # Ctrl+O
         open_proj.setStatusTip(
@@ -134,6 +125,14 @@ class _FileMenuMixin:
             lambda: self._on_menu_open_project(clean=True)
         )
         file_menu.addAction(open_proj_clean)
+
+        from fypa.viewer.tomachie_menu import SHORTCUT, on_load_tomachie_pdn
+        load_pdn = QAction("Load &Tomachie pdn.json…", self)
+        load_pdn.setShortcut(SHORTCUT)
+        load_pdn.setStatusTip(
+            "Set up sources, regulators, series parts and loads from a Tomachie pdn.json")
+        load_pdn.triggered.connect(lambda: on_load_tomachie_pdn(self))
+        file_menu.addAction(load_pdn)
 
         # "Solve automatically on import" is set in Settings > General options,
         # not the File menu; the import flow reads the persisted pref directly.
