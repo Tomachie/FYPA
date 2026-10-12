@@ -185,3 +185,12 @@ def test_nothing_is_set_on_a_rail_nothing_drives():
         assert ref not in p, ref
     assert any("Rail +3V3: nothing in the file drives it" in n for n in notes)
     assert any("U2 (+3V3): nothing in the file drives its input (VBUS)" in n for n in notes)
+
+
+def test_a_file_written_for_another_project_is_noticed():
+    from pathlib import Path
+    from fypa.viewer.tomachie_menu import written_for_another_project
+    pdn = {"project_file": "board.PrjPcb"}
+    assert written_for_another_project(pdn, Path("x/BOARD.PrjPcb")) is None
+    assert written_for_another_project(pdn, Path("x/other.PrjPcb")) == "board.PrjPcb"
+    assert written_for_another_project({}, Path("x/other.PrjPcb")) is None
