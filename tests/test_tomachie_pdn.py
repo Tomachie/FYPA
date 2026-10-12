@@ -158,3 +158,10 @@ def test_resistive_path_returns_through_its_last_part():
 def test_pad_name_with_an_underscore_survives():
     p, _ = params()
     assert p["U8"]["PDN1_P_PINS"] == "VDD_IO"
+
+
+def test_regulator_quiescent_current():
+    pdn = copy.deepcopy(PDN)
+    pdn["regulators"][1]["quiescent_current"] = {"amps": 5.5e-5, "basis": "typ"}
+    p, _ = params(pdn=pdn)
+    assert p["U3"]["PDN1_QUIESCENT"] == "5.5e-05"
