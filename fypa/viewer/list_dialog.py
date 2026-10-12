@@ -46,8 +46,17 @@ def show_list_notice(parent, title: str, intro: str, items: list[str], outro: st
 
     screen = (parent.screen() if parent is not None else None) or QApplication.primaryScreen()
     max_h = int(screen.availableGeometry().height() * MAX_SCREEN_FRACTION) if screen else 600
-    dlg.resize(WIDTH_PX, min(max_h, 220 + 60 * len(items)))
-    dlg.setMaximumHeight(max_h if max_h > 300 else 600)
+    dlg.resize(WIDTH_PX, 200)
+    dlg.layout().activate()
+    # The list is as tall as its rows (a single item does not leave an empty box),
+    # and the whole dialog stops at MAX_SCREEN_FRACTION of the screen: past that
+    # the list scrolls.
+    rows = sum(lst.sizeHintForRow(i) + lst.spacing() for i in range(lst.count()))
+    rows += 2 * lst.frameWidth() + 4
+    others = dlg.sizeHint().height() - lst.sizeHint().height()
+    list_h = max(40, min(rows, max_h - others))
+    lst.setFixedHeight(list_h)
+    dlg.resize(WIDTH_PX, others + list_h)
     dlg.exec()
 
 
