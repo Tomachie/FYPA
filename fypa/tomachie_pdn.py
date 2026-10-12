@@ -169,6 +169,9 @@ class TomachiePdn:
                       "IN_P_NET": vin, "IN_N_NET": self.gnd,
                       "OUT_P_PINS": ",".join(_pads(reg["refdes"], src.get("pins", []))),
                       "IN_P_PINS": ",".join(vin_pins)}
+            iq = _amps(reg.get("quiescent_current"))
+            if iq is not None:
+                values["QUIESCENT"] = f"{iq:g}"
             eff = _number(reg.get("efficiency"))
             if kind == "SMPS":
                 if eff is None:
