@@ -5023,6 +5023,8 @@ def _apply_net_remap(
 def load_project(prjpcb_path: str | Path,
                  pcbdoc_selector: str | Path | None = None,
                  no_auto_bridge: set[str] | None = None,
+                 pdn_json: str | Path | None = None,
+                 pdn_corner: str = "typ",
                  ) -> LoadedProject:
     """Load and prepare an Altium project for PDN analysis.
 
@@ -5055,6 +5057,17 @@ def load_project(prjpcb_path: str | Path,
     log.info("Stage 1/2: extract done in %.2fs", time.monotonic() - _t)
     enabled = extracted.enabled_copper_layer_ids()
     log.info("  enabled copper layers: %s", enabled)
+
+    # A Tomachie power-tree file supplies PDN_* parameters for the components
+    # the designer did not annotate (fypa.tomachie_pdn).
+    pdn_notes: list[str] = []
+    if pdn_json is not None:
+        from fypa.tomachie_pdn import apply_to_project, read_pdn_parameters
+        params, pdn_notes = read_pdn_parameters(pdn_json, pdn_corner)
+        extracted, more = apply_to_project(extracted, params)
+        pdn_notes = [f"pdn.json: {n}" for n in pdn_notes + more]
+        log.info("  %s: PDN_* parameters for %d component(s), %s corner",
+                 Path(pdn_json).name, len(params), pdn_corner)
 
     log.info("Stage 2/2: parsing PDN_* annotations (pass 1: discover merges)")
     _t = time.monotonic()
@@ -5104,6 +5117,7 @@ def load_project(prjpcb_path: str | Path,
     # WARNING level so they always appear — auto-inferred SERIES nets are
     # particularly important: a component accidentally bridging two wrong
     # nets (e.g. +3V3L → GND) shows up here and causes large phantom currents.
+    annotations.warnings.extend(pdn_notes)
     for w in annotations.warnings:
         log.warning("Annotation: %s", w)
     for e in annotations.errors:

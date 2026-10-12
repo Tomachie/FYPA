@@ -123,6 +123,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command", required=True)
 
+    def _add_pdn_json_arg(sp_: argparse.ArgumentParser) -> None:
+        sp_.add_argument(
+            "--pdn-json", type=Path, default=None, metavar="FILE",
+            help="A Tomachie power-tree file (<design>.pdn.json): PDN_* sources, "
+                 "regulators, series parts and sinks for every component the "
+                 "schematic does not annotate itself.")
+        sp_.add_argument(
+            "--pdn-corner", choices=("typ", "max"), default="typ",
+            help="With --pdn-json: solve each load at its typical (default) or "
+                 "maximum current, each series part at its typical or maximum "
+                 "resistance.")
+
     def _add_pcbdoc_arg(sp_: argparse.ArgumentParser) -> None:
         sp_.add_argument(
             "--pcbdoc", default=None,
@@ -150,6 +162,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--png", type=Path, default=None,
                     help="Optional path for a per-layer geometry quicklook PNG.")
     _add_pcbdoc_arg(sp)
+    _add_pdn_json_arg(sp)
 
     def _add_mesh_args(
         sp_: argparse.ArgumentParser, *, optional: bool = False,
@@ -208,6 +221,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("output", type=Path, help="Path to write the pickled solution to")
     _add_mesh_args(sp)
     _add_pcbdoc_arg(sp)
+    _add_pdn_json_arg(sp)
 
     sp = sub.add_parser("show", help="Open the interactive solution viewer")
     sp.add_argument("solution", type=Path)
@@ -364,7 +378,8 @@ def do_annotations(args: argparse.Namespace) -> int:
 
 
 def do_load(args: argparse.Namespace) -> int:
-    loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc)
+    loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc,
+                          pdn_json=args.pdn_json, pdn_corner=args.pdn_corner)
     print(loaded.diagnostic_summary())
     if args.png:
         args.png.parent.mkdir(parents=True, exist_ok=True)
@@ -1256,7 +1271,8 @@ def save_solution_file(path: Path, solution, metadata: dict | None) -> None:
 
 
 def do_solve(args: argparse.Namespace) -> int:
-    loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc)
+    loaded = load_project(args.prjpcb, pcbdoc_selector=args.pcbdoc,
+                          pdn_json=args.pdn_json, pdn_corner=args.pdn_corner)
     solution, metadata = _solve_loaded(loaded, args)
     # ``mesh_failed``, not the records list: a failure whose geometry was too
     # degenerate to record leaves the list empty, and testing that would pickle
