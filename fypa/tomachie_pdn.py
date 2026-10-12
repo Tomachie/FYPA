@@ -123,6 +123,8 @@ class TomachiePdn:
         self.regs = {g["refdes"]: g for g in pdn.get("regulators", [])}
         self.ch = _Channels()
         self.notes: List[str] = []
+        self.powered: set = set()          # rails something in the file drives
+        self.pending_regs: List[tuple] = []  # (rail, refdes, values, input rail, output_path)
 
     # ------------------------------------------------------------ roles
     def _sources(self):
@@ -139,14 +141,16 @@ class TomachiePdn:
                 self.ch.add(src["refdes"], ("SOURCE", name), {
                     "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": src.get("output_net") or name,
                     "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))})
+                self.powered.add(name)
 
-    def _input(self, reg: dict) -> Tuple[Optional[str], List[str]]:
-        """The net the regulator's input pins sit on, and those pins."""
+    def _input(self, reg: dict) -> Tuple[Optional[str], List[str], Optional[str]]:
+        """The net the regulator's input pins sit on, those pins, and the input rail."""
         for rail in reg.get("input_rails", []):
             for l in self.rails.get(rail, {}).get("loads", []):
                 if l["role"] == "regulator" and l["refdes"] == reg["refdes"]:
-                    return l.get("input_net") or rail, _pads(l["refdes"], l.get("pins", []))
-        return None, []
+                    return (l.get("input_net") or rail, _pads(l["refdes"], l.get("pins", [])),
+                            rail)
+        return None, [], None
 
     def _regulators(self):
         for name, r in self.rails.items():
@@ -156,7 +160,7 @@ class TomachiePdn:
             reg = self.regs.get(src.get("refdes", ""))
             v = _number(r.get("voltage", {}).get("nominal"))
             kind = REGULATOR_TYPE.get((reg or {}).get("type"))
-            vin, vin_pins = self._input(reg) if reg else (None, [])
+            vin, vin_pins, vin_rail = self._input(reg) if reg else (None, [], None)
             if reg is None or v is None or kind is None or vin is None:
                 why = ("no regulator entry" if reg is None else "no stated voltage" if v is None
                        else "not known whether linear or switching" if kind is None
@@ -180,8 +184,34 @@ class TomachiePdn:
                                       "its input current is understated")
                 else:
                     values["REGULATOR_EFFICIENCY"] = f"{eff:g}"
-            self.ch.add(reg["refdes"], ("REGULATOR", name), values)
-            for e in src.get("output_path", []):
+            self.pending_regs.append((name, reg["refdes"], values, vin_rail,
+                                      src.get("output_path", [])))
+
+    def _power(self):
+        """Which rails the file drives, to a fixed point: a source's rail; a regulator's
+        output when its input rail is driven; a branch rail behind series parts when its
+        parent is. Only those get directives - a sink on a rail nothing drives draws
+        current from nowhere, and the solve has no answer (FYPA shows it as a huge
+        ground-node current and kilovolt readings)."""
+        changed = True
+        while changed:
+            changed = False
+            for name, r in self.rails.items():
+                if name not in self.powered and r.get("parent_rail") in self.powered:
+                    self.powered.add(name)
+                    changed = True
+            for rail, *_rest in self.pending_regs:
+                vin_rail = _rest[2]
+                if rail not in self.powered and vin_rail in self.powered:
+                    self.powered.add(rail)
+                    changed = True
+        for rail, ref, values, vin_rail, path in self.pending_regs:
+            if rail not in self.powered:
+                self.notes.append(f"{ref} ({rail}): nothing in the file drives its input "
+                                  f"({vin_rail}); no REGULATOR")
+                continue
+            self.ch.add(ref, ("REGULATOR", rail), values)
+            for e in path:
                 if e.get("net_in") and e.get("net_out"):
                     self._series(e)
 
@@ -203,12 +233,20 @@ class TomachiePdn:
 
     def _branches(self):
         for r in self.rails.values():
+            if r["name"] not in self.powered:
+                continue
             for e in r.get("series_from_parent", []):
                 if e.get("net_in") and e.get("net_out"):
                     self._series(e)
 
     def _loads(self):
         for name, r in self.rails.items():
+            if name not in self.powered:
+                drawn = [l["refdes"] for l in r.get("loads", []) if l["role"] != "regulator"]
+                if drawn:
+                    self.notes.append(f"Rail {name}: nothing in the file drives it; its loads "
+                                      f"are left out: {', '.join(drawn)}")
+                continue
             for l in r.get("loads", []):
                 if l["role"] == "regulator":
                     continue                # carried by the regulator's input
@@ -258,6 +296,7 @@ class TomachiePdn:
     def parameters(self) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
         self._sources()
         self._regulators()
+        self._power()
         self._branches()
         self._loads()
         return dict(self.ch.params), self.notes
@@ -296,3 +335,10 @@ def apply_to_project(extracted, params: Dict[str, Dict[str, str]]):
         if des_u not in placed:
             notes.append(f"{des}: in the file but not in the schematic")
     return replace(extracted, sch_components=tuple(comps)), notes
+
+
+def applied_designators(params: Dict[str, Dict[str, str]], extracted) -> set:
+    """Upper-cased designators whose directives came from the file (not those that
+    kept their own schematic annotation)."""
+    own = {c.designator.upper() for c in extracted.sch_components if _has_pdn(c.parameters)}
+    return {d.upper() for d in params} - own
