@@ -20,6 +20,9 @@ Mapping:
   ``IN_P_NET`` the net its input pins sit on;
 * a part in series (a fuse, ferrite, sense resistor, pass FET, a switcher's inductor)
   -> ``SERIES`` with its DC resistance; a 0 ohm link is left to FYPA's own auto-bridge;
+* a non-synchronous buck's freewheel diode (the regulator's ``switch_node`` with
+  ``rectifier: "diode"``) -> ``FREEWHEEL`` on the diode, anode pads to cathode pads,
+  ``DUTY`` = output rail nominal / input rail nominal, bound to the regulator;
 * a load -> ``SINK`` with ``PDN_I`` (typical, or maximum with ``corner="max"``) and
   ``PDN_MIN_V`` from the datasheet minimum supply voltage.
 
@@ -128,6 +131,7 @@ class TomachiePdn:
         self.notes: List[str] = []
         self.powered: set = set()          # rails something in the file drives
         self.pending_regs: List[tuple] = []  # (rail, refdes, values, input rail, output_path)
+        self.freewheels: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}  # (reg, rail) -> diode
 
     # ------------------------------------------------------------ roles
     def _sources(self):
@@ -141,9 +145,10 @@ class TomachiePdn:
                     self.notes.append(f"Rail {name}: source {src.get('refdes')} has no stated "
                                       "voltage or pins; no SOURCE")
                     continue
-                self.ch.add(src["refdes"], ("SOURCE", name), {
+                values = {
                     "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": src.get("output_net") or name,
-                    "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))})
+                    "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))}
+                self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 
     def _input(self, reg: dict) -> Tuple[Optional[str], List[str], Optional[str]]:
@@ -187,8 +192,55 @@ class TomachiePdn:
                                       "its input current is understated")
                 else:
                     values["REGULATOR_EFFICIENCY"] = f"{eff:g}"
+            if kind == "SMPS":
+                self._freewheel(reg, name, values, v, vin_rail)
             self.pending_regs.append((name, reg["refdes"], values, vin_rail,
                                       src.get("output_path", [])))
+
+    def _freewheel(self, reg: dict, rail: str, values: Dict[str, str], v_out: float,
+                   vin_rail: str):
+        """A non-synchronous buck's freewheel diode, from the regulator's ``switch_node``
+        (spec revision 6). Its switch pins conduct D = Vout / Vin of the period and the
+        diode the rest, from its anode net into the switch node. Absent, or
+        any other ``rectifier`` (``"synchronous"``, ``"diode_to_output"``): nothing - the
+        switch pins carry the whole output current, as before."""
+        sw = reg.get("switch_node")
+        ref = reg["refdes"]
+        # "synchronous", "diode_to_output" (a boost's rectifier, to another net) and
+        # any value not known here: today's behaviour.
+        if not isinstance(sw, dict) or sw.get("rectifier") != "diode":
+            return
+        if sw.get("net") and sw["net"] != values["OUT_P_NET"]:
+            self.notes.append(f"{ref} ({rail}): switch node {sw['net']} is not the net its "
+                              f"output pins sit on ({values['OUT_P_NET']}); no freewheel diode")
+            return
+        fw = sw.get("freewheel_diode") or {}
+        d_ref = fw.get("refdes")
+        anode, cathode = fw.get("anode_pins") or [], fw.get("cathode_pins") or []
+        anode_net = fw.get("anode_net")
+        v_in = _number(self.rails.get(vin_rail, {}).get("voltage", {}).get("nominal"))
+        missing = [k for k, ok in (("refdes", d_ref), ("anode_pins", anode),
+                                   ("cathode_pins", cathode), ("anode_net", anode_net),
+                                   (f"{vin_rail} nominal voltage", v_in)) if not ok]
+        if missing:
+            self.notes.append(f"{ref} ({rail}): non-synchronous, but the file does not give the "
+                              f"freewheel diode's {', '.join(missing)}; its switch pins carry "
+                              "the whole output current")
+            return
+        duty = v_out / v_in
+        if not 0.0 < duty < 1.0:
+            self.notes.append(f"{ref} ({rail}): duty cycle {v_out:g} V / {v_in:g} V is not "
+                              "between 0 and 1; no freewheel diode")
+            return
+        if sw.get("pins"):
+            # The switch pins deliver D of the output current: they are the
+            # regulator's output pins in the solve.
+            values["OUT_P_PINS"] = ",".join(_pads(ref, sw["pins"]))
+        self.freewheels[(ref, rail)] = (d_ref, {
+            "ROLE": "FREEWHEEL", "DUTY": f"{duty:.6g}", "SMPS_HOST": ref,
+            "P_NET": anode_net, "N_NET": values["OUT_P_NET"],
+            "P_PINS": ",".join(_pads(d_ref, anode)),
+            "N_PINS": ",".join(_pads(d_ref, cathode))})
 
     def _power(self):
         """Which rails the file drives, to a fixed point: a source's rail; a regulator's
@@ -214,6 +266,12 @@ class TomachiePdn:
                                   f"({vin_rail}); no REGULATOR")
                 continue
             self.ch.add(ref, ("REGULATOR", rail), values)
+            fw = self.freewheels.get((ref, rail))
+            if fw is not None:
+                d_ref, fw_values = fw
+                self.ch.add(d_ref, ("FREEWHEEL", ref, rail), fw_values)
+                self.notes.append(f"{d_ref}: freewheel diode of {ref}; its switch pins carry "
+                                  f"D = {fw_values['DUTY']} of {rail}'s current, {d_ref} the rest")
             if values["IN_P_NET"] != vin_rail:
                 self.reg_inputs.append((ref, values["IN_P_NET"], vin_rail))
             for e in path:

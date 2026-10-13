@@ -194,3 +194,50 @@ def test_a_file_written_for_another_project_is_noticed():
     assert written_for_another_project(pdn, Path("x/BOARD.PrjPcb")) is None
     assert written_for_another_project(pdn, Path("x/other.PrjPcb")) == "board.PrjPcb"
     assert written_for_another_project({}, Path("x/other.PrjPcb")) is None
+
+
+SWITCH_NODE = {"net": "SW", "pins": ["U2_8"], "rectifier": "diode",
+               "freewheel_diode": {"refdes": "D9", "part_number": "SS34",
+                                   "anode_pins": ["D9_2"], "cathode_pins": ["D9_1"],
+                                   "anode_net": "GND"}}
+
+
+def _with_switch_node(switch_node):
+    pdn = copy.deepcopy(PDN)
+    pdn["spec_revision"] = 6
+    pdn["regulators"][0]["switch_node"] = switch_node
+    return pdn
+
+
+def test_non_synchronous_buck_puts_its_freewheel_diode_on_the_switch_node():
+    p, notes = params(pdn=_with_switch_node(SWITCH_NODE))
+    # D = output rail nominal / input rail nominal = 3.3 V / 5 V.
+    assert p["D9"] == {"PDN1_ROLE": "FREEWHEEL", "PDN1_DUTY": "0.66", "PDN1_SMPS_HOST": "U2",
+                       "PDN1_P_NET": "GND", "PDN1_N_NET": "SW", "PDN1_P_PINS": "2",
+                       "PDN1_N_PINS": "1"}
+    assert p["U2"]["PDN1_OUT_P_PINS"] == "8"
+    assert any("D9: freewheel diode of U2" in n for n in notes)
+
+
+def test_synchronous_or_absent_switch_node_changes_nothing():
+    before, _ = params()
+    sync, _ = params(pdn=_with_switch_node(dict(SWITCH_NODE, rectifier="synchronous")))
+    assert sync == before and "D9" not in sync
+
+
+def test_diode_switch_node_without_its_pads_is_said_and_not_guessed():
+    partial = copy.deepcopy(SWITCH_NODE)
+    del partial["freewheel_diode"]["anode_pins"]
+    before, _ = params()
+    p, notes = params(pdn=_with_switch_node(partial))
+    assert p == before
+    assert any("U2 (+3V3): non-synchronous" in n and "anode_pins" in n for n in notes)
+
+
+def test_rectifier_to_the_output_or_unknown_changes_nothing():
+    before, _ = params()
+    for rect in ("diode_to_output", "something_new"):
+        sn = {"net": "SW", "pins": ["U2_8"], "rectifier": rect}
+        p, _ = params(pdn=_with_switch_node(sn))
+        assert p == before, rect
+
