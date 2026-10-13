@@ -148,6 +148,16 @@ class TomachiePdn:
                 values = {
                     "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": src.get("output_net") or name,
                     "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))}
+                ret = src.get("return")
+                if isinstance(ret, dict) and ret.get("net"):
+                    # The file names the return (J3: on V-, closed to GND
+                    # through L12's second winding); place_on_board then leaves it.
+                    values["N_NET"] = ret["net"]
+                    if ret.get("pins"):
+                        values["N_PINS"] = ",".join(_pads(src["refdes"], ret["pins"]))
+                    for e in ret.get("path") or []:
+                        if e.get("net_in") and e.get("net_out"):
+                            self._series(e)
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 

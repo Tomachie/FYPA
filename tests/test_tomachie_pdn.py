@@ -241,3 +241,17 @@ def test_rectifier_to_the_output_or_unknown_changes_nothing():
         p, _ = params(pdn=_with_switch_node(sn))
         assert p == before, rect
 
+
+def test_source_return_from_the_file():
+    pdn = copy.deepcopy(PDN)
+    pdn["ground_nets"] = ["GND", "V-"]
+    pdn["rails"][0]["source"]["return"] = {
+        "pins": ["J1_A1"], "net": "V-", "ground_net": "GND",
+        "path": [{"refdes": "L9", "class": "inductor", "net_in": "GND", "net_out": "V-",
+                  "resistance_ohm": "unknown",
+                  "datasheet_figures": [{"spec": "dcr", "max": "0.002", "unit": "ohm"}]}]}
+    p, _ = params(pdn=pdn)
+    j1 = p["J1"]
+    assert (j1["PDN1_N_NET"], j1["PDN1_N_PINS"]) == ("V-", "A1")
+    assert p["L9"] == {"PDN1_ROLE": "SERIES", "PDN1_R": "0.002", "PDN1_P_NET": "GND",
+                       "PDN1_N_NET": "V-"}
