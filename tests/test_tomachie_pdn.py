@@ -70,14 +70,18 @@ def test_source_on_the_connector_pads():
 
 
 def test_switcher_regulates_on_its_switch_node_with_the_inductor_in_series():
-    p, _ = params()
+    p, notes = params()
     u2 = p["U2"]
     assert (u2["PDN1_ROLE"], u2["PDN1_REGULATOR_TYPE"], u2["PDN1_REGULATOR_EFFICIENCY"]) == \
         ("REGULATOR", "SMPS", "0.88")
     assert (u2["PDN1_OUT_P_NET"], u2["PDN1_IN_P_NET"], u2["PDN1_IN_P_PINS"]) == ("SW", "VBUS", "2,3")
     l1 = p["L1"]
     assert (l1["PDN1_ROLE"], l1["PDN1_P_NET"], l1["PDN1_N_NET"]) == ("SERIES", "SW", "+3V3")
-    assert float(l1["PDN1_R"]) == pytest.approx(0.064)        # DCR, never the impedance
+    # The output inductor is inside U2's regulation loop (feedback after it), so
+    # it is bridged at 1 mOhm - above the 0.9 mOhm net-merge threshold - and its
+    # DCR (64 mOhm) is not a rail drop; its loss is in the efficiency.
+    assert float(l1["PDN1_R"]) == pytest.approx(0.001)
+    assert any("L1: inside U2's regulation loop; bridged" in n for n in notes)
 
 
 def test_ldo():
@@ -94,7 +98,9 @@ def test_sink_with_datasheet_minimum():
 def test_worst_case_corner_takes_the_maximums():
     p, _ = params("max")
     assert p["U5"]["PDN1_I"] == "0.35"
-    assert float(p["L1"]["PDN1_R"]) == pytest.approx(0.068)
+    # A switcher's output inductor stays bridged in the worst case too: its
+    # maximum DCR (68 mOhm) is inside the regulation loop as well.
+    assert float(p["L1"]["PDN1_R"]) == pytest.approx(0.001)
 
 
 def test_ferrite_branch_and_zero_ohm_link():
