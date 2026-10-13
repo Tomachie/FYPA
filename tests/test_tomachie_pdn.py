@@ -43,7 +43,12 @@ PDN = {
               "resistance_ohm": "unknown",
               "datasheet_figures": [{"spec": "dcr", "max": "0.08", "unit": "ohm"}]},
              {"refdes": "R9", "class": "resistor", "net_in": "+3V3", "net_out": "+3V3A",
-              "resistance_ohm": 0.0, "datasheet_figures": []}],
+              "resistance_ohm": 0.0, "datasheet_figures": []},
+             # Not in any regulation loop: its DCR is a real drop, typ or max by corner.
+             {"refdes": "FB2", "class": "ferrite", "net_in": "+3V3", "net_out": "+3V3A",
+              "resistance_ohm": "unknown",
+              "datasheet_figures": [{"spec": "dcr", "typ": "45", "max": "60", "unit": "mΩ"},
+                                    {"spec": "impedance", "typ": "600", "unit": "ohm"}]}],
          "loads": [{"role": "ic", "refdes": "U7", "pins": ["U7_3"],
                     "current": {"amps": 0.01}, "current_max": {"amps": 0.02}}]},
         {"name": "+1V8", "voltage": {"nominal": 1.8, **V},
@@ -101,6 +106,15 @@ def test_worst_case_corner_takes_the_maximums():
     # A switcher's output inductor stays bridged in the worst case too: its
     # maximum DCR (68 mOhm) is inside the regulation loop as well.
     assert float(p["L1"]["PDN1_R"]) == pytest.approx(0.001)
+
+
+def test_series_dcr_typical_nominally_maximum_in_the_worst_case():
+    nominal, _ = params()
+    worst, _ = params("max")
+    # DCR, never the impedance; typical in the nominal corner, maximum in the worst.
+    assert float(nominal["FB2"]["PDN1_R"]) == pytest.approx(0.045)
+    assert float(worst["FB2"]["PDN1_R"]) == pytest.approx(0.060)
+    assert (nominal["FB2"]["PDN1_P_NET"], nominal["FB2"]["PDN1_N_NET"]) == ("+3V3", "+3V3A")
 
 
 def test_ferrite_branch_and_zero_ohm_link():
