@@ -217,8 +217,21 @@ class TomachiePdn:
             if values["IN_P_NET"] != vin_rail:
                 self.reg_inputs.append((ref, values["IN_P_NET"], vin_rail))
             for e in path:
-                if e.get("net_in") and e.get("net_out"):
-                    self._series(e)
+                if not (e.get("net_in") and e.get("net_out")):
+                    continue
+                if values["REGULATOR_TYPE"] == "SMPS":
+                    # A switcher regulates its rail AFTER the output inductor (the
+                    # feedback divider sits on the rail), so the inductor's DC
+                    # resistance does not lower the rail - its loss is in the
+                    # efficiency. U12/L14: 2 A x 24.7 mOhm read as a 50 mV
+                    # rail drop that the LM5013's feedback removes.
+                    self.notes.append(f"{e['refdes']}: inside {ref}'s regulation loop; bridged "
+                                      "(its loss is in the efficiency)")
+                    self.ch.add(e["refdes"], ("SERIES", e["net_in"], e["net_out"]), {
+                        "ROLE": "SERIES", "R": "0.001", "P_NET": e["net_in"],
+                        "N_NET": e["net_out"]})
+                    continue
+                self._series(e)
 
     def _series(self, e: dict):
         ref = e["refdes"]
