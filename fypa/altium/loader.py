@@ -39,6 +39,7 @@ from fypa.altium.annotations import (
     TerminalSpec,
     _channel_label,
     parse_annotations,
+    regulator_input_gain,
 )
 from fypa.altium.extract import (
     ExtractedProject,
@@ -931,7 +932,8 @@ def _directive_to_network(
     elif isinstance(d, RegulatorSpec):
         node_vp, node_vn = _pp.NodeID(), _pp.NodeID()
         node_sf, node_st = _pp.NodeID(), _pp.NodeID()
-        # External-FET LS legs: one NodeID pair per SwitchPathLeg, current
+        # Switch legs (external-FET LS FETs, a non-synchronous buck's
+        # freewheel diode): one NodeID pair per SwitchPathLeg, current
         # coupled to the regulator's i_v with PWM compensation in the stamp.
         switch_leg_nodes: list[tuple[_pp.NodeID, _pp.NodeID, float]] = []
         leg_terminals: list[tuple] = []
@@ -954,11 +956,13 @@ def _directive_to_network(
         # An external-FET stage relocates the cut onto the part that carries
         # the full output current, so the element spans a conductor and its
         # input draws i_v. The conversion ratio lives in the switch legs.
+        # A non-synchronous buck's element carries only the switch pins'
+        # share of the output current; see regulator_input_gain.
         cut_r = getattr(d, "cut_resistance", None)
         element = _pp.VoltageRegulator(
             v_p=node_vp, v_n=node_vn, s_f=node_sf, s_t=node_st,
             voltage=d.voltage, gain=d.gain,
-            input_gain=1.0 if cut_r is not None else None,
+            input_gain=regulator_input_gain(d),
             switch_legs=tuple(switch_leg_nodes),
         )
         # The cut part's own series resistance (inductor DCR, or RDSon for a
@@ -2039,11 +2043,13 @@ def _replace_regulator_gains(
                 legs = d.switch_path_legs
                 if legs and d.smps_topology:
                     ls_in, ls_out = _compute_ls_coeffs(d.smps_topology, gain)
+                    # A freewheel leg's coefficient is set by the duty cycle
+                    # the file states, not by the gain.
                     legs = tuple(
                         dataclasses.replace(
                             leg,
                             coeff=ls_in if leg.kind == "ls_in" else ls_out,
-                        )
+                        ) if leg.kind in ("ls_in", "ls_out") else leg
                         for leg in legs
                     )
                 d = dataclasses.replace(d, gain=gain, switch_path_legs=legs)
@@ -2123,9 +2129,14 @@ def _retune_problem_regulator_gains(problem, loaded) -> bool:
             (f, t, float(sl.coeff))
             for (f, t, _c), sl in zip(elem.switch_legs, spec.switch_path_legs)
         )
-        if elem.gain != spec.gain or new_legs != elem.switch_legs:
+        # A non-synchronous buck's input draw is gain / D x i_v, so it
+        # moves with the gain too.
+        new_input_gain = regulator_input_gain(spec)
+        if (elem.gain != spec.gain or new_legs != elem.switch_legs
+                or elem.input_gain != new_input_gain):
             net.elements[i] = _dc_replace(
                 elem, gain=spec.gain, switch_legs=new_legs,
+                input_gain=new_input_gain,
             )
             changed += 1
     log.debug("Adaptive gain: retuned %d regulator element(s) in place",
@@ -2479,6 +2490,8 @@ def build_solve_metadata(
                 common["efficiency"] = d.efficiency
             if getattr(d, "smps_topology", None):
                 common["smps_topology"] = d.smps_topology
+            if getattr(d, "freewheel_duty", None):
+                common["freewheel_duty"] = d.freewheel_duty
             if getattr(d, "switch_path_legs", None):
                 common["switch_path_legs"] = [
                     {
