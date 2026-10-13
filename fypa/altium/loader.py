@@ -5066,8 +5066,8 @@ def load_project(prjpcb_path: str | Path,
     pdn_designators: set[str] = set()
     if pdn_json is not None:
         from fypa.tomachie_pdn import (apply_to_project, applied_designators,
-                                       read_pdn_parameters)
-        params, pdn_notes = read_pdn_parameters(pdn_json, pdn_corner)
+                                       read_pdn_for_board)
+        params, pdn_notes = read_pdn_for_board(pdn_json, pdn_corner, extracted)
         pdn_designators = applied_designators(params, extracted)
         extracted, more = apply_to_project(extracted, params)
         pdn_notes = [f"pdn.json: {n}" for n in pdn_notes + more]
