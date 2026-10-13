@@ -119,6 +119,9 @@ class TomachiePdn:
         if not grounds:
             raise PdnImportError("The file names no ground net")
         self.gnd = grounds[0]
+        self.grounds = list(grounds)
+        # (regulator, net its input pins sit on, its input rail) - joined on the board
+        self.reg_inputs: List[Tuple[str, str, str]] = []
         self.rails = {r["name"]: r for r in pdn.get("rails", [])}
         self.regs = {g["refdes"]: g for g in pdn.get("regulators", [])}
         self.ch = _Channels()
@@ -211,6 +214,8 @@ class TomachiePdn:
                                   f"({vin_rail}); no REGULATOR")
                 continue
             self.ch.add(ref, ("REGULATOR", rail), values)
+            if values["IN_P_NET"] != vin_rail:
+                self.reg_inputs.append((ref, values["IN_P_NET"], vin_rail))
             for e in path:
                 if e.get("net_in") and e.get("net_out"):
                     self._series(e)
@@ -220,12 +225,20 @@ class TomachiePdn:
         typ, mx = dc_resistance(e)
         r = mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
         if e.get("class") == "diode":
-            self.notes.append(f"{ref}: a series diode's forward voltage is not resistive; "
-                              "left to FYPA's auto-bridge")
+            # FYPA has no forward-voltage element. Bridged so the solve reaches what is
+            # behind it (D2, the reverse-polarity diode ahead of U12); the rail
+            # behind it then sits one forward drop higher than on the board.
+            self.notes.append(f"{ref}: series diode - its forward voltage is not modelled "
+                              "(bridged at 0.5 mOhm); the rail after it reads one forward "
+                              "drop high")
+            self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), {
+                "ROLE": "SERIES", "R": "0.0005", "P_NET": e["net_in"], "N_NET": e["net_out"]})
             return
         if r is None:
-            self.notes.append(f"{ref}: DC resistance not known; no SERIES")
-            return
+            # Dropping it would cut the rail off from its source (F1, the input
+            # fuse); bridged and named, so the drop across it is visibly not modelled.
+            self.notes.append(f"{ref}: DC resistance not in the file; bridged at 0.5 mOhm")
+            r = 0.0005
         if r <= 0:
             return                          # a 0 ohm link: FYPA bridges it itself
         self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), {
@@ -292,6 +305,126 @@ class TomachiePdn:
             values["MIN_V"] = f"{_number(sm['volts']):g}"
         self.ch.add(l["refdes"], ("SINK", net), values)
 
+    # ------------------------------------------------------------ the board
+    def series_elements(self) -> Dict[str, dict]:
+        """Every part the file lists in series, by designator (for its DC resistance)."""
+        out: Dict[str, dict] = {}
+        for r in self.rails.values():
+            for e in r.get("series_from_parent", []) + (r.get("source") or {}).get("output_path", []):
+                out.setdefault(e.get("refdes", ""), e)
+        return out
+
+    def place_on_board(self, params: Dict[str, Dict[str, str]], extracted) -> List[str]:
+        """What only the board can answer, applied to ``params`` in place:
+
+        * a source's return is the ground net its pads are on (J3: V-, not GND);
+          when that is not the main ground, the common-mode choke the file lists in series
+          carries the return through its second winding, at the same DC resistance;
+        * a regulator whose input pins sit behind an input filter (U12: VIN -> C69 -> L10
+          -> its VIN pin) gets the filter's parts as SERIES, so the solve reaches its input.
+        """
+        notes: List[str] = []
+        pads = defaultdict(set)        # designator -> nets its pads are on
+        for pad in extracted.pads:
+            if pad.component_index < 0:
+                continue
+            comp = extracted.pcb_components[pad.component_index]
+            des = (comp.source_designator or comp.designator).upper()
+            pads[des].add(extracted.net_name(pad.net_index))
+        grounds = set(self.grounds)
+        known = {k.upper(): v for k, v in self.series_elements().items()}
+
+        def ohms(des: str) -> Tuple[float, str]:
+            e = known.get(des)
+            if e is not None:
+                typ, mx = dc_resistance(e)
+                r = mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
+                if r is not None and r > 0:
+                    return r, ""
+            return 0.0005, f"{des}: DC resistance not in the file; bridged at 0.5 mOhm"
+
+        def add(des: str, values: Dict[str, str]):
+            ch = params.setdefault(des, {})
+            used = [int(k[3:].split("_", 1)[0]) for k in ch
+                    if k.startswith("PDN") and k[3:].split("_", 1)[0].isdigit()]
+            n = 1 + max(used or [0])
+            for k, v in values.items():
+                ch[f"PDN{n}_{k}"] = v
+
+        # 1) source returns
+        for des, ch in list(params.items()):
+            on = pads.get(des.upper(), set())
+            for k, v in list(ch.items()):
+                if not (k.endswith("_ROLE") and v == "SOURCE"):
+                    continue
+                nk = k[:-len("ROLE")] + "N_NET"
+                if ch.get(nk) in on:
+                    continue
+                ret = sorted(on & grounds)
+                if not ret:
+                    notes.append(f"{des}: no pad on any ground net of the file; return left as {ch.get(nk)}")
+                    continue
+                ch[nk] = ret[0]
+                notes.append(f"{des}: source return is {ret[0]} (its pads), not {self.gnd}")
+                if ret[0] == self.gnd:
+                    continue
+                choke = [c for c, nets in pads.items()
+                         if c in known and ret[0] in nets and self.gnd in nets]
+                if not choke:
+                    notes.append(f"{des}: nothing the file lists joins {ret[0]} to {self.gnd}; "
+                                 "the return is not closed")
+                    continue
+                r, why = ohms(choke[0])
+                if why:
+                    notes.append(why)
+                add(choke[0], {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": ret[0], "N_NET": self.gnd})
+                notes.append(f"{choke[0]}: return winding {ret[0]} -> {self.gnd}, {r:g} Ohm")
+
+        # 2) regulator input filters: the passive parts between the input pins' net and the rail
+        def passive(des: str) -> bool:
+            return des[:1] in ("L", "R", "C", "F") or des.startswith("FB")
+
+        edges = defaultdict(list)       # net -> [(designator, other net)]
+        for des, nets in pads.items():
+            if not passive(des):
+                continue
+            sig = sorted(n for n in nets if n not in grounds)
+            if len(sig) == 2:
+                edges[sig[0]].append((des, sig[1]))
+                edges[sig[1]].append((des, sig[0]))
+        placed = set()
+        for ref, pin_net, rail in self.reg_inputs:
+            prev = {pin_net: None}
+            frontier = [pin_net]
+            for _ in range(4):
+                nxt = []
+                for n in frontier:
+                    for des, other in edges.get(n, []):
+                        if other not in prev:
+                            prev[other] = (des, n)
+                            nxt.append(other)
+                frontier = nxt
+                if rail in prev:
+                    break
+            if rail not in prev:
+                notes.append(f"{ref}: no passive path on the board from its input pins ({pin_net}) "
+                             f"to {rail}")
+                continue
+            n = rail
+            while prev[n] is not None:
+                des, back = prev[n]
+                if (des, n, back) in placed:     # a filter two regulators share (U29, U30: L26)
+                    n = back
+                    continue
+                placed.add((des, n, back))
+                r, why = ohms(des)
+                if why:
+                    notes.append(why)
+                add(des, {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": n, "N_NET": back})
+                notes.append(f"{ref}: input filter {des} {n} -> {back}")
+                n = back
+        return notes
+
     # ------------------------------------------------------------ run
     def parameters(self) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
         self._sources()
@@ -306,6 +439,15 @@ def read_pdn_parameters(path, corner: str = "typ") -> Tuple[Dict[str, Dict[str, 
     """``{designator: {PDNn_*: value}}`` and notes, from a Tomachie ``.pdn.json``."""
     pdn = json.loads(Path(path).read_text(encoding="utf-8"))
     return TomachiePdn(pdn, corner).parameters()
+
+
+def read_pdn_for_board(path, corner: str, extracted) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    """As :func:`read_pdn_parameters`, then completed from the board itself
+    (:meth:`TomachiePdn.place_on_board`)."""
+    pdn = json.loads(Path(path).read_text(encoding="utf-8"))
+    reader = TomachiePdn(pdn, corner)
+    params, notes = reader.parameters()
+    return params, notes + reader.place_on_board(params, extracted)
 
 
 def _has_pdn(params: Dict[str, str]) -> bool:
