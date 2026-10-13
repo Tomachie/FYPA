@@ -229,16 +229,16 @@ class TomachiePdn:
             # behind it (D2, the reverse-polarity diode ahead of U12); the rail
             # behind it then sits one forward drop higher than on the board.
             self.notes.append(f"{ref}: series diode - its forward voltage is not modelled "
-                              "(bridged at 0.5 mOhm); the rail after it reads one forward "
+                              "(bridged at 1 mOhm); the rail after it reads one forward "
                               "drop high")
             self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), {
-                "ROLE": "SERIES", "R": "0.0005", "P_NET": e["net_in"], "N_NET": e["net_out"]})
+                "ROLE": "SERIES", "R": "0.001", "P_NET": e["net_in"], "N_NET": e["net_out"]})
             return
         if r is None:
             # Dropping it would cut the rail off from its source (F1, the input
             # fuse); bridged and named, so the drop across it is visibly not modelled.
-            self.notes.append(f"{ref}: DC resistance not in the file; bridged at 0.5 mOhm")
-            r = 0.0005
+            self.notes.append(f"{ref}: DC resistance not in the file; bridged at 1 mOhm")
+            r = 0.001
         if r <= 0:
             return                          # a 0 ohm link: FYPA bridges it itself
         self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), {
@@ -341,7 +341,7 @@ class TomachiePdn:
                 r = mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
                 if r is not None and r > 0:
                     return r, ""
-            return 0.0005, f"{des}: DC resistance not in the file; bridged at 0.5 mOhm"
+            return 0.001, f"{des}: DC resistance not in the file; bridged at 1 mOhm (above the 0.9 mOhm net-merge threshold)"
 
         def add(des: str, values: Dict[str, str]):
             ch = params.setdefault(des, {})
