@@ -366,3 +366,43 @@ def test_input_filter_parts_take_their_dc_resistance_from_the_file():
         assert float(p["C9"]["PDN1_R"]) == pytest.approx(0.001)
         assert any(n.startswith("C9: DC resistance not in the file; bridged") for n in notes)
         assert not any(n.startswith("FB5: DC resistance not in the file") for n in notes)
+
+
+def test_return_named_on_another_ground_with_no_path_is_closed_from_the_board():
+    """J3: the file names its return V- with an empty path; every regulator
+    returns to GND, so V- is joined to GND through the choke's second winding."""
+    pdn = copy.deepcopy(PDN)
+    pdn["ground_nets"] = ["GND", "V-"]
+    pdn["rails"][0]["source"]["return"] = {"pins": ["J1_A1"], "net": "V-", "path": [],
+                                           "ground_net": "V-"}
+    pdn["rails"][2]["series_from_parent"].append(
+        {"refdes": "L9", "class": "inductor", "net_in": "+3V3", "net_out": "+3V3A",
+         "resistance_ohm": "unknown",
+         "datasheet_figures": [{"spec": "dcr", "max": "0.002", "unit": "ohm"}]})
+    reader = TomachiePdn(pdn, "typ")
+    p, _ = reader.parameters()
+    notes = reader.place_on_board(p, _board({"J1": ["VBUS", "V-"], "L9": ["V-", "GND"]}))
+    assert p["J1"]["PDN1_N_NET"] == "V-"
+    winding = {k[5:]: v for k, v in p["L9"].items() if k.startswith("PDN2_")}
+    assert winding == {"ROLE": "SERIES", "R": "0.002", "P_NET": "V-", "N_NET": "GND"}
+    assert any("L9: return winding V- -> GND" in n for n in notes)
+
+
+def test_rails_sourced_from_the_same_output_pins_are_one_regulator():
+    """U9_6 sources DVDD12 and, behind L7, AVDD12: one REGULATOR, not two in
+    parallel (the report counted the shared load once per channel)."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"].append(
+        {"name": "+1V8A", "voltage": {"nominal": 1.8, **V},
+         "source": {"role": "regulator", "refdes": "U3", "pins": ["U3_5"], "output_net": "+1V8",
+                    "output_path": [{"refdes": "L7", "class": "ferrite", "net_in": "+1V8",
+                                     "net_out": "+1V8A", "resistance_ohm": "unknown",
+                                     "datasheet_figures": [{"spec": "dcr", "max": "0.1",
+                                                            "unit": "ohm"}]}]},
+         "loads": []})
+    pdn["regulators"][1]["output_rails"] = ["+1V8", "+1V8A"]
+    p, notes = params(pdn=pdn)
+    assert [k for k in p["U3"] if k.endswith("_ROLE")] == ["PDN1_ROLE"]
+    assert (p["L7"]["PDN1_P_NET"], p["L7"]["PDN1_N_NET"], p["L7"]["PDN1_R"]) == \
+        ("+1V8", "+1V8A", "0.1")
+    assert any("U3 (+1V8A): the same output pins as its REGULATOR for +1V8" in n for n in notes)

@@ -138,6 +138,8 @@ class TomachiePdn:
         # (rail, refdes, SERIES, input rail, SINK or None, output_path)
         self.pending_switches: List[tuple] = []
         self.freewheels: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}  # (reg, rail) -> diode
+        self.closed_returns: set = set()   # sources whose file return reaches self.gnd
+        self.reg_outputs: Dict[Tuple[str, str], str] = {}  # (reg, output pins) -> first rail
 
     # ------------------------------------------------------------ roles
     def _sources(self):
@@ -161,9 +163,12 @@ class TomachiePdn:
                     values["N_NET"] = ret["net"]
                     if ret.get("pins"):
                         values["N_PINS"] = ",".join(_pads(src["refdes"], ret["pins"]))
-                    for e in ret.get("path") or []:
-                        if e.get("net_in") and e.get("net_out"):
-                            self._series(e)
+                    path = [e for e in ret.get("path") or []
+                            if e.get("net_in") and e.get("net_out")]
+                    for e in path:
+                        self._series(e)
+                    if ret["net"] == self.gnd or (path and ret.get("ground_net") == self.gnd):
+                        self.closed_returns.add(src["refdes"].upper())
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 
@@ -340,15 +345,26 @@ class TomachiePdn:
                 self.notes.append(f"{ref} ({rail}): nothing in the file drives its input "
                                   f"({vin_rail}); no REGULATOR")
                 continue
-            self.ch.add(ref, ("REGULATOR", rail), values)
-            fw = self.freewheels.get((ref, rail))
-            if fw is not None:
-                d_ref, fw_values = fw
-                self.ch.add(d_ref, ("FREEWHEEL", ref, rail), fw_values)
-                self.notes.append(f"{d_ref}: freewheel diode of {ref}; its switch pins carry "
-                                  f"D = {fw_values['DUTY']} of {rail}'s current, {d_ref} the rest")
-            if values["IN_P_NET"] != vin_rail:
-                self.reg_inputs.append((ref, values["IN_P_NET"], vin_rail))
+            # One output, one REGULATOR: rails the file sources from the same output
+            # pins (U9_6: DVDD12, AVDD12 behind L7, NetC64_2) are one
+            # element. Three in parallel shared the current in the solve, but the
+            # report counted DVDD12's load once per channel - three times on 5V.
+            out_key = values["OUT_P_PINS"] or rail
+            if self.ch.add(ref, ("REGULATOR", out_key), values):
+                self.reg_outputs[(ref, out_key)] = rail
+                fw = self.freewheels.get((ref, rail))
+                if fw is not None:
+                    d_ref, fw_values = fw
+                    self.ch.add(d_ref, ("FREEWHEEL", ref, rail), fw_values)
+                    self.notes.append(f"{d_ref}: freewheel diode of {ref}; its switch pins carry "
+                                      f"D = {fw_values['DUTY']} of {rail}'s current, {d_ref} the rest")
+                if values["IN_P_NET"] != vin_rail:
+                    self.reg_inputs.append((ref, values["IN_P_NET"], vin_rail))
+            else:
+                first_rail = self.reg_outputs[(ref, out_key)]
+                self.notes.append(f"{ref} ({rail}): the same output pins as its REGULATOR for "
+                                  f"{first_rail}; one element, {rail} reached through its "
+                                  "output path")
             for e in path:
                 if not (e.get("net_in") and e.get("net_out")):
                     continue
@@ -510,13 +526,20 @@ class TomachiePdn:
                     continue
                 nk = k[:-len("ROLE")] + "N_NET"
                 if ch.get(nk) in on:
-                    continue
-                ret = sorted(on & grounds)
-                if not ret:
-                    notes.append(f"{des}: no pad on any ground net of the file; return left as {ch.get(nk)}")
-                    continue
-                ch[nk] = ret[0]
-                notes.append(f"{des}: source return is {ret[0]} (its pads), not {self.gnd}")
+                    # The file named the return. Every regulator and sink returns to
+                    # self.gnd, so one on another ground net with no path to it in
+                    # the file is still closed from the board (J3: V-, path
+                    # [] - left open, the solve's ground-node current was 63 mA).
+                    if ch[nk] == self.gnd or des.upper() in self.closed_returns:
+                        continue
+                    ret = [ch[nk]]
+                else:
+                    ret = sorted(on & grounds)
+                    if not ret:
+                        notes.append(f"{des}: no pad on any ground net of the file; return left as {ch.get(nk)}")
+                        continue
+                    ch[nk] = ret[0]
+                    notes.append(f"{des}: source return is {ret[0]} (its pads), not {self.gnd}")
                 if ret[0] == self.gnd:
                     continue
                 choke = [c for c, nets in pads.items()
