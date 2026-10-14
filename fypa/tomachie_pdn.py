@@ -142,10 +142,37 @@ class TomachiePdn:
         self.reg_outputs: Dict[Tuple[str, str], str] = {}  # (reg, output pins) -> first rail
 
     # ------------------------------------------------------------ roles
+    def _source_volts(self, rail: dict) -> Optional[float]:
+        """A source rail's voltage for this corner: nominal, or in the worst case its
+        ``voltage.min`` when that is a number (spec: a worst-case solve drives each
+        source at voltage.min; V+: 48 V nominal, 21 V min)."""
+        v = rail.get("voltage", {})
+        lo = _number(v.get("min"))
+        return lo if self.corner == "max" and lo is not None else _number(v.get("nominal"))
+
+    def _supply_volts(self, rail_name: Optional[str]) -> Optional[float]:
+        """The voltage a rail sits at in this corner: a branch's is its parent's (up to
+        the source); a source's per :meth:`_source_volts`; a regulator's output stays at
+        its set voltage, so its nominal."""
+        if self.corner != "max" or rail_name not in self.rails:
+            return _number(self.rails.get(rail_name, {}).get("voltage", {}).get("nominal"))
+        seen = set()
+        while rail_name in self.rails and rail_name not in seen:
+            seen.add(rail_name)
+            r = self.rails[rail_name]
+            role = (r.get("source") or {}).get("role")
+            if role in SOURCE_ROLES:
+                return self._source_volts(r)
+            if role == "parent_rail" and r.get("parent_rail") in self.rails:
+                rail_name = r["parent_rail"]
+                continue
+            return _number(r.get("voltage", {}).get("nominal"))
+        return None
+
     def _sources(self):
         for name, r in self.rails.items():
             src = r["source"]
-            v = _number(r.get("voltage", {}).get("nominal"))
+            v = self._source_volts(r)
             if src["role"] == "unresolved":
                 self.notes.append(f"Rail {name}: no source traced in the schematic")
             elif src["role"] in SOURCE_ROLES:
@@ -169,6 +196,9 @@ class TomachiePdn:
                         self._series(e)
                     if ret["net"] == self.gnd or (path and ret.get("ground_net") == self.gnd):
                         self.closed_returns.add(src["refdes"].upper())
+                if v != _number(r.get("voltage", {}).get("nominal")):
+                    self.notes.append(f"Rail {name}: worst case, source {src['refdes']} at its "
+                                      f"minimum {v:g} V (nominal {r['voltage']['nominal']:g} V)")
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 
@@ -283,10 +313,10 @@ class TomachiePdn:
         d_ref = fw.get("refdes")
         anode, cathode = fw.get("anode_pins") or [], fw.get("cathode_pins") or []
         anode_net = fw.get("anode_net")
-        v_in = _number(self.rails.get(vin_rail, {}).get("voltage", {}).get("nominal"))
+        v_in = self._supply_volts(vin_rail)
         missing = [k for k, ok in (("refdes", d_ref), ("anode_pins", anode),
                                    ("cathode_pins", cathode), ("anode_net", anode_net),
-                                   (f"{vin_rail} nominal voltage", v_in)) if not ok]
+                                   (f"{vin_rail} voltage", v_in)) if not ok]
         if missing:
             self.notes.append(f"{ref} ({rail}): non-synchronous, but the file does not give the "
                               f"freewheel diode's {', '.join(missing)}; its switch pins carry "

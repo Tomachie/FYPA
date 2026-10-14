@@ -406,3 +406,21 @@ def test_rails_sourced_from_the_same_output_pins_are_one_regulator():
     assert (p["L7"]["PDN1_P_NET"], p["L7"]["PDN1_N_NET"], p["L7"]["PDN1_R"]) == \
         ("+1V8", "+1V8A", "0.1")
     assert any("U3 (+1V8A): the same output pins as its REGULATOR for +1V8" in n for n in notes)
+
+
+def test_worst_case_drives_a_source_at_its_minimum_voltage():
+    """Spec: a worst-case solve drives each source at voltage.min (V+: 48 V
+    nominal, 21 V min); a regulator output stays at its set voltage, and a buck's
+    duty cycle follows the lower input."""
+    pdn = _with_switch_node(SWITCH_NODE)
+    pdn["rails"][0]["voltage"] = {"nominal": 5.0, "min": 4.0, "max": 5.5, "basis": "user"}
+    nominal, _ = params(pdn=pdn)
+    worst, notes = params("max", pdn=pdn)
+    assert (nominal["J1"]["PDN1_V"], worst["J1"]["PDN1_V"]) == ("5", "4")
+    assert worst["U2"]["PDN1_V"] == "3.3" and worst["U3"]["PDN1_V"] == "1.8"
+    assert (float(nominal["D9"]["PDN1_DUTY"]), float(worst["D9"]["PDN1_DUTY"])) == \
+        (pytest.approx(3.3 / 5.0), pytest.approx(3.3 / 4.0))
+    assert any("Rail VBUS: worst case, source J1 at its minimum 4 V" in n for n in notes)
+    # A minimum that is not a number leaves the source at its nominal.
+    plain, _ = params("max")
+    assert plain["J1"]["PDN1_V"] == "5"
