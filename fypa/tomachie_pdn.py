@@ -453,10 +453,15 @@ class TomachiePdn:
 
     # ------------------------------------------------------------ the board
     def series_elements(self) -> Dict[str, dict]:
-        """Every part the file lists in series, by designator (for its DC resistance)."""
+        """Every part the file lists in series, by designator (for its DC resistance):
+        between rails, on a regulator's output path, and in a load's ``input_filter``
+        (spec revision 6; U12: C69 / L10, U10: C67 / L8)."""
         out: Dict[str, dict] = {}
         for r in self.rails.values():
-            for e in r.get("series_from_parent", []) + (r.get("source") or {}).get("output_path", []):
+            parts = r.get("series_from_parent", []) + (r.get("source") or {}).get("output_path", [])
+            for l in r.get("loads", []):
+                parts = parts + (l.get("input_filter") or [])
+            for e in parts:
                 out.setdefault(e.get("refdes", ""), e)
         return out
 
@@ -562,12 +567,18 @@ class TomachiePdn:
                 if (des, n, back) in placed:     # a filter two regulators share (U29, U30: L26)
                     n = back
                     continue
-                placed.add((des, n, back))
-                r, why = ohms(des)
-                if why:
-                    notes.append(why)
-                add(des, {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": n, "N_NET": back})
-                notes.append(f"{ref}: input filter {des} {n} -> {back}")
+                # Parts the file lists in parallel between the same two nets carry
+                # the current together (U68: L1 and L40, 5V -> NetC253_2).
+                for par in [des] + sorted(d for d, other in edges.get(n, [])
+                                          if other == back and d != des and d in known):
+                    if (par, n, back) in placed and par != des:
+                        continue
+                    placed.add((par, n, back))
+                    r, why = ohms(par)
+                    if why:
+                        notes.append(why)
+                    add(par, {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": n, "N_NET": back})
+                    notes.append(f"{ref}: input filter {par} {n} -> {back}")
                 n = back
         return notes
 
