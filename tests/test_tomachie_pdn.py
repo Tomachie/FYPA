@@ -327,3 +327,42 @@ def test_load_switch_without_an_on_resistance_is_bridged_and_said():
     assert "PDN2_ROLE" not in p["U4"]                    # no quiescent current in the file
     assert any("U4: load switch, on-resistance not in the file; bridged at 1 mOhm" in n
                for n in notes)
+
+
+def _board(parts):
+    """A stand-in for the extracted project: ``{designator: [net of each pad]}``."""
+    from types import SimpleNamespace as NS
+    nets = sorted({n for pads in parts.values() for n in pads})
+    comps = [NS(designator=d, source_designator=d) for d in parts]
+    pads = [NS(component_index=i, net_index=nets.index(n))
+            for i, d in enumerate(parts) for n in parts[d]]
+    return NS(pads=pads, pcb_components=comps, net_name=lambda i: nets[i])
+
+
+def test_input_filter_parts_take_their_dc_resistance_from_the_file():
+    """VBUS -> C9 (feedthrough, no figure) -> VBUS_F1 -> FB5 || FB6 -> VBUS_F2 -> U2."""
+    ferrite = {"class": "ferrite", "resistance_ohm": "unknown",
+               "datasheet_figures": [{"spec": "dcr", "typ": "40", "max": "50", "unit": "mΩ"},
+                                     {"spec": "impedance", "typ": "600", "unit": "ohm"}]}
+    pdn = copy.deepcopy(PDN)
+    pdn["spec_revision"] = 6
+    pdn["rails"][0]["loads"][0].update(input_net="VBUS_F2", input_filter=[
+        {"refdes": "C9", "class": "capacitor", "net_in": "VBUS", "net_out": "VBUS_F1",
+         "resistance_ohm": "unknown", "datasheet_figures": []},
+        dict(ferrite, refdes="FB5", net_in="VBUS_F1", net_out="VBUS_F2"),
+        dict(ferrite, refdes="FB6", net_in="VBUS_F1", net_out="VBUS_F2")])
+    board = _board({"C9": ["VBUS", "VBUS_F1", "GND"], "FB5": ["VBUS_F1", "VBUS_F2"],
+                    "FB6": ["VBUS_F1", "VBUS_F2"], "U2": ["VBUS_F2", "SW", "GND"],
+                    "J1": ["VBUS", "GND"]})
+    for corner, r in (("typ", 0.040), ("max", 0.050)):
+        reader = TomachiePdn(copy.deepcopy(pdn), corner)
+        p, _ = reader.parameters()
+        notes = reader.place_on_board(p, board)
+        # Each ferrite its DCR, never its impedance; the parallel one too.
+        for fb in ("FB5", "FB6"):
+            assert (p[fb]["PDN1_P_NET"], p[fb]["PDN1_N_NET"]) == ("VBUS_F1", "VBUS_F2")
+            assert float(p[fb]["PDN1_R"]) == pytest.approx(r), (corner, fb)
+        # The feedthrough capacitor has no resistance figure: bridged and named.
+        assert float(p["C9"]["PDN1_R"]) == pytest.approx(0.001)
+        assert any(n.startswith("C9: DC resistance not in the file; bridged") for n in notes)
+        assert not any(n.startswith("FB5: DC resistance not in the file") for n in notes)
