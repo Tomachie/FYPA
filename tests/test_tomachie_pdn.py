@@ -424,3 +424,69 @@ def test_worst_case_drives_a_source_at_its_minimum_voltage():
     # A minimum that is not a number leaves the source at its nominal.
     plain, _ = params("max")
     assert plain["J1"]["PDN1_V"] == "5"
+
+
+def _with_isolated(**reg):
+    """VBUS -> U4 (isolated DC/DC, UCC12040-like) -> ISO5 / GND_ISO -> U9."""
+    pdn = copy.deepcopy(PDN)
+    pdn["spec_revision"] = 6
+    pdn["ground_nets"] = ["GND", "GND_ISO"]
+    pdn["rails"][0]["loads"].append({"role": "regulator", "refdes": "U4", "pins": ["U4_1"]})
+    pdn["rails"].append(
+        {"name": "ISO5", "voltage": {"nominal": 5.0, **V},
+         "source": {"role": "regulator", "refdes": "U4", "pins": ["U4_8"],
+                    "output_net": "ISO5", "output_path": []},
+         "loads": [{"role": "ic", "refdes": "U9", "pins": ["U9_1"], "current": {"amps": 0.05}},
+                   {"role": "resistive_path", "refdes": "R20", "pins": ["R20_1"],
+                    "path_parts": ["R20", "R21"], "current": {"amps": 0.001}}]})
+    pdn["regulators"].append({"refdes": "U4", "type": "isolated", "type_basis": "construction",
+                              "input_rails": ["VBUS"], "output_rails": ["ISO5"], **reg})
+    return pdn
+
+
+ISO_BOARD = {"J1": ["VBUS", "GND"], "U4": ["VBUS", "GND", "ISO5", "GND_ISO"],
+             "U9": ["ISO5", "GND_ISO"], "U2": ["VBUS", "SW", "GND"], "L1": ["SW", "+3V3"],
+             "R20": ["ISO5", "MID"], "R21": ["MID", "GND_ISO"]}
+
+
+def _iso(pdn):
+    reader = TomachiePdn(pdn, "typ")
+    p, notes = reader.parameters()
+    return p, notes + reader.place_on_board(p, _board(ISO_BOARD))
+
+
+def test_isolated_converter_returns_on_its_output_side_ground():
+    p, notes = _iso(_with_isolated(efficiency=0.8, quiescent_current={"amps": 0.05}))
+    u4 = p["U4"]
+    assert (u4["PDN1_ROLE"], u4["PDN1_REGULATOR_TYPE"], u4["PDN1_V"]) == ("REGULATOR", "SMPS", "5")
+    assert (u4["PDN1_IN_P_NET"], u4["PDN1_IN_N_NET"]) == ("VBUS", "GND")
+    assert (u4["PDN1_OUT_P_NET"], u4["PDN1_OUT_N_NET"]) == ("ISO5", "GND_ISO")
+    # Pout / (Vin x eff): the efficiency, no no-load current on top.
+    assert u4["PDN1_REGULATOR_EFFICIENCY"] == "0.8" and "PDN1_QUIESCENT" not in u4
+    assert (p["U9"]["PDN1_P_NET"], p["U9"]["PDN1_N_NET"]) == ("ISO5", "GND_ISO")
+    # A resistive path returns through its last part (R21), whose pad is on GND_ISO.
+    assert (p["R20"]["PDN1_N_DES"], p["R20"]["PDN1_N_NET"]) == ("R21", "GND_ISO")
+    assert p["U5"]["PDN1_N_NET"] == "GND"                 # the input side is untouched
+    assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
+
+
+def test_isolated_converter_without_efficiency_uses_its_no_load_input():
+    p, notes = _iso(_with_isolated(efficiency="unknown", quiescent_current={"amps": 0.05}))
+    assert p["U4"]["PDN1_QUIESCENT"] == "0.05" and "PDN1_REGULATOR_EFFICIENCY" not in p["U4"]
+    assert any("losses above no-load are not included" in n for n in notes)
+
+
+def test_isolated_converter_with_neither_is_driven_and_its_input_named_unknown():
+    p, notes = _iso(_with_isolated(efficiency="unknown", quiescent_current="unknown"))
+    assert p["U4"]["PDN1_GAIN"] == "0"                     # draws nothing it could state
+    assert p["U9"]["PDN1_N_NET"] == "GND_ISO"              # ISO5 is still driven
+    assert any("U4 (ISO5): isolated converter, neither efficiency nor no-load input" in n
+               and "VBUS's drop is a lower bound" in n for n in notes)
+
+
+def test_isolated_rail_without_a_stated_voltage_is_not_driven():
+    pdn = _with_isolated(efficiency=0.8)
+    pdn["rails"][-1]["voltage"] = {"nominal": "not_specified", **V}
+    p, notes = params(pdn=pdn)
+    assert "U4" not in p and "U9" not in p
+    assert any("U4 (ISO5): no stated voltage; no REGULATOR" in n for n in notes)
