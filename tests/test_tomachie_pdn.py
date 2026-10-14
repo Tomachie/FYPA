@@ -529,3 +529,30 @@ def test_regulator_with_two_input_rails_follows_a_split_the_file_states():
     assert p["U3"]["PDN1_GAIN"] == "0.0025"
     assert p["U3"]["PDN2_I"] == "0.399"
     assert any("shared as the file states" in n for n in notes)
+
+
+def test_regulator_bias_entry_is_a_sink_and_the_input_stays_whole():
+    """U9 (AP2132): VIN U9_3 on 3V3 carries the input current; VCTRL / EN on
+    5V is a regulator_bias load with its own (control) current - no equal split."""
+    pdn = _two_inputs()
+    vbus = pdn["rails"][0]["loads"][1]
+    assert vbus["refdes"] == "U3"
+    vbus.update(role="regulator_bias", current={"amps": 2.5e-4},
+                current_max={"amps": 5e-4})
+    pdn["regulators"][1]["input_rails"] = ["+3V3", "VBUS"]
+    nominal, notes = params(pdn=pdn)
+    worst, _ = params("max", pdn=pdn)
+    u3 = nominal["U3"]
+    assert (u3["PDN1_ROLE"], u3["PDN1_IN_P_NET"], u3["PDN1_IN_P_PINS"]) == \
+        ("REGULATOR", "+3V3_F", "4")
+    assert "PDN1_GAIN" not in u3                           # the whole input, no split
+    assert not any("input rails" in n for n in notes)
+    bias = {k[5:]: v for k, v in u3.items() if k.startswith("PDN2_")}
+    assert bias == {"ROLE": "SINK", "I": "0.00025", "P_NET": "VBUS", "N_NET": "GND",
+                    "P_PINS": "1"}
+    assert worst["U3"]["PDN2_I"] == "0.0005"
+    # An unknown bias current is named, like any other load's.
+    vbus["current"] = vbus["current_max"] = "unknown"
+    p, notes = params(pdn=pdn)
+    assert not any(k.endswith("_ROLE") and v == "SINK" for k, v in p["U3"].items())
+    assert any("U3 on VBUS: current not known; no SINK" in n for n in notes)
