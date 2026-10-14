@@ -141,6 +141,7 @@ class TomachiePdn:
         self.closed_returns: set = set()   # sources whose file return reaches self.gnd
         self.reg_outputs: Dict[Tuple[str, str], str] = {}  # (reg, output pins) -> first rail
         self.isolated: Dict[str, List[str]] = {}   # isolated converter -> its output rails
+        self.extra_inputs: Dict[Tuple[str, str], list] = {}  # (reg, rail) -> other input rails
 
     # ------------------------------------------------------------ roles
     def _source_volts(self, rail: dict) -> Optional[float]:
@@ -212,6 +213,72 @@ class TomachiePdn:
                             rail)
         return None, [], None
 
+    def _input_entries(self, reg: dict) -> List[Tuple[str, dict]]:
+        """(input rail, load entry) for every input rail the regulator lists."""
+        out = []
+        for rail in reg.get("input_rails", []):
+            for l in self.rails.get(rail, {}).get("loads", []):
+                if l["role"] == "regulator" and l["refdes"] == reg["refdes"] and l.get("pins"):
+                    out.append((rail, l))
+                    break
+        return out
+
+    def _corner_amps(self, obj: dict, key: str) -> Optional[float]:
+        return (_amps(obj.get(key + "_max")) if self.corner == "max" else None)             or _amps(obj.get(key))
+
+    def _split_inputs(self, reg: dict, rail: str, values: Dict[str, str], kind: str,
+                      v_out: float, eff: Optional[float], iq: Optional[float]):
+        """A regulator with more than one input rail (U9: 5V and 3V3, the 3V3
+        entry behind L6). Its input current is shared over the input rails by what
+        the file states - the entries' own currents, when they add up to the
+        regulator's input current - or else equally, and that is said. The first rail
+        keeps the REGULATOR at its share of the gain; every other rail gets a SINK of
+        its share of the file's input current on its own input pins."""
+        ref = reg["refdes"]
+        entries = self._input_entries(reg)
+        if len(entries) < 2:
+            return
+        total = self._corner_amps(reg, "input_current")
+        own = [self._corner_amps(l, "current") for _, l in entries]
+        if total and all(a is not None for a in own) and abs(sum(own) - total) <= 0.01 * total:
+            shares = [a / total for a in own]
+            how = "as the file states"
+        else:
+            shares = [1.0 / len(entries)] * len(entries)
+            how = "equally (the file states no split)"
+        rails = [r for r, _ in entries]
+        self.notes.append(f"{ref} ({rail}): {len(entries)} input rails ({', '.join(rails)}); "
+                          f"its input current is shared {how}: "
+                          + ", ".join(f"{r} {f:.3g}" for r, f in zip(rails, shares)))
+        if kind == "LDO":
+            gain = 1.0
+        else:
+            vin = self._supply_volts(rails[0])
+            gain = v_out / (vin * (eff or 1.0)) if vin else None
+        if gain is not None:
+            values["GAIN"] = f"{gain * shares[0]:.6g}"
+        else:
+            self.notes.append(f"{ref} ({rail}): {rails[0]} voltage not stated; its share of "
+                              "the input current is not set")
+        if iq is not None:
+            values["QUIESCENT"] = f"{iq * shares[0]:g}"
+        if total is None:
+            out = self._corner_amps(reg, "output_current")
+            total = None if out is None or gain is None else gain * out + (iq or 0.0)
+        extra = []
+        for (r, l), f in zip(entries[1:], shares[1:]):
+            net = l.get("input_net") or r
+            if total is None:
+                self.notes.append(f"{ref} on {r}: input current not known; no SINK for its "
+                                  f"share, so {r}'s drop is a lower bound")
+            else:
+                extra.append((("SINK", net), {
+                    "ROLE": "SINK", "I": f"{total * f:g}", "P_NET": net, "N_NET": self.gnd,
+                    "P_PINS": ",".join(_pads(ref, l["pins"])), "RAIL": r}))
+            if l.get("input_net") and l["input_net"] != r:
+                extra.append((("FILTER", net, r), None))
+        self.extra_inputs[(ref, rail)] = extra
+
     def _regulators(self):
         for name, r in self.rails.items():
             src = r["source"]
@@ -254,6 +321,7 @@ class TomachiePdn:
                     values["REGULATOR_EFFICIENCY"] = f"{eff:g}"
             if kind == "SMPS":
                 self._freewheel(reg, name, values, v, vin_rail)
+            self._split_inputs(reg, name, values, kind, v, eff, iq)
             self.pending_regs.append((name, reg["refdes"], values, vin_rail,
                                       src.get("output_path", [])))
 
@@ -412,6 +480,14 @@ class TomachiePdn:
             out_key = values["OUT_P_PINS"] or rail
             if self.ch.add(ref, ("REGULATOR", out_key), values):
                 self.reg_outputs[(ref, out_key)] = rail
+                for key, sink in self.extra_inputs.get((ref, rail), []):
+                    if sink is None:                 # an input behind a filter
+                        self.reg_inputs.append((ref, key[1], key[2]))
+                    elif sink["RAIL"] in self.powered:
+                        self.ch.add(ref, key, {k: v for k, v in sink.items() if k != "RAIL"})
+                    else:
+                        self.notes.append(f"{ref} on {sink['RAIL']}: nothing in the file drives "
+                                          "that input rail; its share is not drawn")
                 fw = self.freewheels.get((ref, rail))
                 if fw is not None:
                     d_ref, fw_values = fw

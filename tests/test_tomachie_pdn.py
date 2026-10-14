@@ -490,3 +490,42 @@ def test_isolated_rail_without_a_stated_voltage_is_not_driven():
     p, notes = params(pdn=pdn)
     assert "U4" not in p and "U9" not in p
     assert any("U4 (ISO5): no stated voltage; no REGULATOR" in n for n in notes)
+
+
+def _two_inputs(entry_currents=None):
+    """U3 (an LDO) takes its input from VBUS (U3_1) and from +3V3 behind FB9 (U3_4)."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"].append(
+        {"role": "regulator", "refdes": "U3", "pins": ["U3_4"], "input_net": "+3V3_F",
+         "input_filter": [{"refdes": "FB9", "class": "ferrite", "net_in": "+3V3",
+                           "net_out": "+3V3_F", "resistance_ohm": "unknown",
+                           "datasheet_figures": [{"spec": "dcr", "max": "0.08", "unit": "ohm"}]}]})
+    reg = pdn["regulators"][1]
+    reg.update(input_rails=["VBUS", "+3V3"], input_current={"amps": 0.4},
+               quiescent_current={"amps": 2e-4})
+    for rail, amps in (entry_currents or {}).items():
+        for r in pdn["rails"]:
+            for l in r["loads"]:
+                if r["name"] == rail and l["refdes"] == "U3":
+                    l["current"] = {"amps": amps}
+    return pdn
+
+
+def test_regulator_with_two_input_rails_shares_its_input_equally_when_the_file_is_silent():
+    reader = TomachiePdn(_two_inputs(), "typ")
+    p, notes = reader.parameters()
+    u3 = p["U3"]
+    assert (u3["PDN1_ROLE"], u3["PDN1_IN_P_NET"], u3["PDN1_IN_P_PINS"]) == ("REGULATOR", "VBUS", "1")
+    assert (u3["PDN1_GAIN"], u3["PDN1_QUIESCENT"]) == ("0.5", "0.0001")
+    assert {k[5:]: v for k, v in u3.items() if k.startswith("PDN2_")} == {
+        "ROLE": "SINK", "I": "0.2", "P_NET": "+3V3_F", "N_NET": "GND", "P_PINS": "4"}
+    assert ("U3", "+3V3_F", "+3V3") in reader.reg_inputs       # FB9 completed from the board
+    assert any("U3 (+1V8): 2 input rails (VBUS, +3V3); its input current is shared equally"
+               in n for n in notes)
+
+
+def test_regulator_with_two_input_rails_follows_a_split_the_file_states():
+    p, notes = params(pdn=_two_inputs({"VBUS": 0.001, "+3V3": 0.399}))
+    assert p["U3"]["PDN1_GAIN"] == "0.0025"
+    assert p["U3"]["PDN2_I"] == "0.399"
+    assert any("shared as the file states" in n for n in notes)
