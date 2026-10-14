@@ -46,7 +46,7 @@ from typing import Dict, List, Optional, Tuple
 SCHEMA = "tomachie-pdn"
 SCHEMA_VERSION = 1
 SOURCE_ROLES = ("board_input", "battery", "generator")
-REGULATOR_TYPE = {"linear": "LDO", "switching": "SMPS"}
+REGULATOR_TYPE = {"linear": "LDO", "switching": "SMPS", "isolated": "SMPS"}
 DC_RESISTANCE_SPECS = ("dcr", "dc_resistance", "resistance", "rds_on", "jumper_resistance",
                        "cold_resistance", "r_dc", "rdc", "on_resistance")
 OHMS = {"ohm": 1.0, "ohms": 1.0, "Ω": 1.0, "mohm": 1e-3, "mΩ": 1e-3,
@@ -140,6 +140,7 @@ class TomachiePdn:
         self.freewheels: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}  # (reg, rail) -> diode
         self.closed_returns: set = set()   # sources whose file return reaches self.gnd
         self.reg_outputs: Dict[Tuple[str, str], str] = {}  # (reg, output pins) -> first rail
+        self.isolated: Dict[str, List[str]] = {}   # isolated converter -> its output rails
 
     # ------------------------------------------------------------ roles
     def _source_volts(self, rail: dict) -> Optional[float]:
@@ -236,9 +237,14 @@ class TomachiePdn:
                       "OUT_P_PINS": ",".join(_pads(reg["refdes"], src.get("pins", []))),
                       "IN_P_PINS": ",".join(vin_pins)}
             iq = _amps(reg.get("quiescent_current"))
+            eff = _number(reg.get("efficiency"))
+            if reg.get("type") == "isolated":
+                self._isolated(reg, name, values, eff, iq)
+                self.pending_regs.append((name, reg["refdes"], values, vin_rail,
+                                          src.get("output_path", [])))
+                continue
             if iq is not None:
                 values["QUIESCENT"] = f"{iq:g}"
-            eff = _number(reg.get("efficiency"))
             if kind == "SMPS":
                 if eff is None:
                     self.notes.append(f"{reg['refdes']} ({name}): efficiency not read from its "
@@ -250,6 +256,30 @@ class TomachiePdn:
                 self._freewheel(reg, name, values, v, vin_rail)
             self.pending_regs.append((name, reg["refdes"], values, vin_rail,
                                       src.get("output_path", [])))
+
+    def _isolated(self, reg: dict, rail: str, values: Dict[str, str],
+                  eff: Optional[float], iq: Optional[float]):
+        """An isolated DC/DC converter (spec revision 6, ``type`` ``isolated``): a
+        switcher at its output rail's nominal whose output side returns on its own
+        ground (set from the board, :meth:`place_on_board`). Its input current is
+        Pout / (Vin x efficiency); without an efficiency, its no-load input
+        (``quiescent_current``) + Pout / Vin, a minimum; with neither, it is driven but
+        draws nothing on its input (PDN_GAIN 0), and that is said."""
+        ref = reg["refdes"]
+        self.isolated.setdefault(ref, []).append(rail)
+        if eff is not None:
+            values["REGULATOR_EFFICIENCY"] = f"{eff:g}"
+        elif iq is not None:
+            values["QUIESCENT"] = f"{iq:g}"
+            self.notes.append(f"{ref} ({rail}): isolated converter, efficiency not in the file; "
+                              f"input = no-load {iq:g} A + Pout / Vin - losses above no-load "
+                              "are not included")
+        else:
+            values["GAIN"] = "0"
+            self.notes.append(f"{ref} ({rail}): isolated converter, neither efficiency nor "
+                              "no-load input current in the file; its input current is not "
+                              f"known (drawn as 0), so {values['IN_P_NET']}'s drop is a lower "
+                              "bound")
 
     def _pick(self, typ: Optional[float], mx: Optional[float]) -> Optional[float]:
         """The resistance for this corner: the maximum in the worst case, else the
@@ -633,6 +663,74 @@ class TomachiePdn:
                     add(par, {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": n, "N_NET": back})
                     notes.append(f"{ref}: input filter {par} {n} -> {back}")
                 n = back
+        notes.extend(self._isolated_grounds(params, pads))
+        return notes
+
+    def _isolated_domain(self, ref: str) -> set:
+        """The nets an isolated converter powers: its output rails, rails branching
+        off them, and the outputs of (non-isolated) regulators fed from them, with
+        the nets their loads' pins and the sources' output pins sit on."""
+        rails = set(self.isolated.get(ref, []))
+        changed = True
+        while changed:
+            changed = False
+            for name, r in self.rails.items():
+                if name not in rails and r.get("parent_rail") in rails:
+                    rails.add(name)
+                    changed = True
+            for g in self.regs.values():
+                if g["refdes"] in self.isolated or not set(g.get("input_rails", [])) & rails:
+                    continue
+                new = set(g.get("output_rails", [])) - rails
+                if new:
+                    rails |= new
+                    changed = True
+        nets = set(rails)
+        for name in rails:
+            r = self.rails.get(name, {})
+            if (r.get("source") or {}).get("output_net"):
+                nets.add(r["source"]["output_net"])
+            nets |= {l["input_net"] for l in r.get("loads", []) if l.get("input_net")}
+        return nets
+
+    def _isolated_grounds(self, params: Dict[str, Dict[str, str]], pads) -> List[str]:
+        """An isolated converter's output side returns on its own ground: the ground
+        net (other than the main one) its pads sit on, else the one its output rails'
+        loads share (Ivy Plus U18: GND_CAN1). Every SINK and REGULATOR terminal in
+        the nets it powers is moved onto that ground."""
+        notes: List[str] = []
+        others = set(self.grounds) - {self.gnd}
+        for ref in sorted(self.isolated):
+            iso = sorted(pads.get(ref.upper(), set()) & others)
+            if len(iso) != 1:
+                loads = {l["refdes"].upper() for rail in self.isolated[ref]
+                         for l in self.rails.get(rail, {}).get("loads", [])}
+                shared = set.intersection(*[pads.get(d, set()) & others for d in loads])                     if loads else set()
+                iso = sorted(shared)
+            if len(iso) != 1:
+                notes.append(f"{ref}: isolated converter, its output-side ground was not found "
+                             f"on the board ({', '.join(iso) or 'none'}); its output returns "
+                             f"on {self.gnd}")
+                continue
+            gnd, domain = iso[0], self._isolated_domain(ref)
+            notes.append(f"{ref}: isolated converter, output side returns on {gnd}")
+            for des, ch in params.items():
+                for k, role in list(ch.items()):
+                    if not k.endswith("_ROLE"):
+                        continue
+                    pre = k[:-len("ROLE")]
+                    sides = (("P_NET", "N_NET"),) if role == "SINK" else                         (("OUT_P_NET", "OUT_N_NET"), ("IN_P_NET", "IN_N_NET"))                         if role == "REGULATOR" else ()
+                    for pk, nk in sides:
+                        if ch.get(pre + pk) not in domain:
+                            continue
+                        # A resistive path returns through its last part (N_DES).
+                        ret_des = ch.get(pre + "N_DES", des) if pk == "P_NET" else des
+                        if gnd not in pads.get(ret_des.upper(), set()):
+                            notes.append(f"{des}: on {ch[pre + pk]} (powered by {ref}) but "
+                                         f"{ret_des} has no pad on {gnd}; return left on "
+                                         f"{ch.get(pre + nk)}")
+                            continue
+                        ch[pre + nk] = gnd
         return notes
 
     # ------------------------------------------------------------ run
