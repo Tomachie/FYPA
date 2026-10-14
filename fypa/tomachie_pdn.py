@@ -27,6 +27,10 @@ Mapping:
 * a non-synchronous buck's freewheel diode (the regulator's ``switch_node`` with
   ``rectifier: "diode"``) -> ``FREEWHEEL`` on the diode, anode pads to cathode pads,
   ``DUTY`` = output rail nominal / input rail nominal, bound to the regulator;
+* a ``regulator_bias`` load (a regulator's control / bias pins on another rail, e.g.
+  an LDO's VCTRL; spec revision 6) -> an ordinary ``SINK`` with its own current, never
+  a share of the regulator's input current, which stays whole on its ``regulator``
+  entry;
 * a load -> ``SINK`` with ``PDN_I`` (typical, or maximum with ``corner="max"``) and
   ``PDN_MIN_V`` from the datasheet minimum supply voltage.
 
