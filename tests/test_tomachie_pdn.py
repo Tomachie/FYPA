@@ -275,3 +275,55 @@ def test_source_return_from_the_file():
     assert (j1["PDN1_N_NET"], j1["PDN1_N_PINS"]) == ("V-", "A1")
     assert p["L9"] == {"PDN1_ROLE": "SERIES", "PDN1_R": "0.002", "PDN1_P_NET": "GND",
                        "PDN1_N_NET": "V-"}
+
+
+def _with_load_switch(**reg):
+    """VBUS -> U4 (a USB power switch, 5 V in, 5 V out) -> U4_OUT -> FB4 -> VBUS_OUT -> U9."""
+    pdn = copy.deepcopy(PDN)
+    pdn["spec_revision"] = 6
+    pdn["rails"][0]["loads"].append({"role": "regulator", "refdes": "U4", "pins": ["U4_2", "U4_3"]})
+    pdn["rails"].append(
+        {"name": "VBUS_OUT", "voltage": {"nominal": 5.0, **V},
+         "source": {"role": "regulator", "refdes": "U4", "pins": ["U4_6", "U4_7"],
+                    "output_net": "U4_OUT", "output_path": [
+                        {"refdes": "FB4", "class": "ferrite", "net_in": "U4_OUT",
+                         "net_out": "VBUS_OUT", "resistance_ohm": "unknown",
+                         "datasheet_figures": [{"spec": "dcr", "typ": "50", "max": "80",
+                                                "unit": "mΩ"}]}]},
+         "loads": [{"role": "ic", "refdes": "U9", "pins": ["U9_1"], "current": {"amps": 0.5},
+                    "current_max": {"amps": 0.9}}]})
+    pdn["regulators"].append({"refdes": "U4", "type": "load_switch", "type_basis": "schematic",
+                              "input_rails": ["VBUS"], "output_rails": ["VBUS_OUT"], **reg})
+    return pdn
+
+
+def test_load_switch_is_a_series_part_with_its_on_resistance():
+    figs = [{"spec": "rds_on", "typ": "89", "max": "120", "unit": "mΩ", "page": 4}]
+    pdn = _with_load_switch(datasheet_resistances=figs,
+                            quiescent_current={"amps": 9e-5, "basis": "typ"})
+    nominal, notes = params(pdn=pdn)
+    worst, _ = params("max", pdn=pdn)
+    u4 = nominal["U4"]
+    # A SERIES from its input pins to its output pins, never a REGULATOR (an LDO
+    # making 5 V from 5 V is out of regulation).
+    assert {k: u4[k] for k in u4 if k.startswith("PDN1_")} == {
+        "PDN1_ROLE": "SERIES", "PDN1_R": "0.089", "PDN1_P_NET": "VBUS",
+        "PDN1_N_NET": "U4_OUT", "PDN1_P_PINS": "2,3", "PDN1_N_PINS": "6,7"}
+    assert float(worst["U4"]["PDN1_R"]) == pytest.approx(0.120)
+    # Its quiescent current is drawn at its input, as an LDO's is.
+    assert (u4["PDN2_ROLE"], u4["PDN2_I"], u4["PDN2_P_NET"], u4["PDN2_P_PINS"]) == \
+        ("SINK", "9e-05", "VBUS", "2,3")
+    assert not any(v == "REGULATOR" for v in u4.values())
+    # The ferrite after it is a real drop (no regulation loop): its DCR, by corner.
+    assert (nominal["FB4"]["PDN1_P_NET"], nominal["FB4"]["PDN1_N_NET"]) == ("U4_OUT", "VBUS_OUT")
+    assert (float(nominal["FB4"]["PDN1_R"]), float(worst["FB4"]["PDN1_R"])) ==         (pytest.approx(0.050), pytest.approx(0.080))
+    assert nominal["U9"]["PDN1_P_NET"] == "VBUS_OUT"     # the rail behind it is driven
+    assert any("U4: load switch, a SERIES" in n for n in notes)
+
+
+def test_load_switch_without_an_on_resistance_is_bridged_and_said():
+    p, notes = params(pdn=_with_load_switch())
+    assert p["U4"]["PDN1_ROLE"] == "SERIES" and float(p["U4"]["PDN1_R"]) == pytest.approx(0.001)
+    assert "PDN2_ROLE" not in p["U4"]                    # no quiescent current in the file
+    assert any("U4: load switch, on-resistance not in the file; bridged at 1 mOhm" in n
+               for n in notes)

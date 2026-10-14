@@ -20,6 +20,10 @@ Mapping:
   ``IN_P_NET`` the net its input pins sit on;
 * a part in series (a fuse, ferrite, sense resistor, pass FET, a switcher's inductor)
   -> ``SERIES`` with its DC resistance; a 0 ohm link is left to FYPA's own auto-bridge;
+* a load switch (a regulator entry of ``type`` ``load_switch``: it passes its input to
+  its output and regulates nothing) -> ``SERIES`` from its input pins to its output
+  pins with its on-resistance, plus a ``SINK`` of its quiescent current on its input
+  pins;
 * a non-synchronous buck's freewheel diode (the regulator's ``switch_node`` with
   ``rectifier: "diode"``) -> ``FREEWHEEL`` on the diode, anode pads to cathode pads,
   ``DUTY`` = output rail nominal / input rail nominal, bound to the regulator;
@@ -131,6 +135,8 @@ class TomachiePdn:
         self.notes: List[str] = []
         self.powered: set = set()          # rails something in the file drives
         self.pending_regs: List[tuple] = []  # (rail, refdes, values, input rail, output_path)
+        # (rail, refdes, SERIES, input rail, SINK or None, output_path)
+        self.pending_switches: List[tuple] = []
         self.freewheels: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}  # (reg, rail) -> diode
 
     # ------------------------------------------------------------ roles
@@ -176,6 +182,9 @@ class TomachiePdn:
             if src["role"] != "regulator":
                 continue
             reg = self.regs.get(src.get("refdes", ""))
+            if reg is not None and reg.get("type") == "load_switch":
+                self._load_switch(reg, name, src)
+                continue
             v = _number(r.get("voltage", {}).get("nominal"))
             kind = REGULATOR_TYPE.get((reg or {}).get("type"))
             vin, vin_pins, vin_rail = self._input(reg) if reg else (None, [], None)
@@ -205,6 +214,47 @@ class TomachiePdn:
             if kind == "SMPS":
                 self._freewheel(reg, name, values, v, vin_rail)
             self.pending_regs.append((name, reg["refdes"], values, vin_rail,
+                                      src.get("output_path", [])))
+
+    def _pick(self, typ: Optional[float], mx: Optional[float]) -> Optional[float]:
+        """The resistance for this corner: the maximum in the worst case, else the
+        typical; the one printed when only one is."""
+        return mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
+
+    def _load_switch(self, reg: dict, rail: str, src: dict):
+        """A power or load switch (spec revision 6, ``type`` ``load_switch``) regulates
+        nothing: its output is its input less I x its on-resistance. A SERIES from its
+        input pins to its output pins, typical on-resistance in the nominal corner and
+        maximum in the worst case; its quiescent current a SINK on its input pins, as an
+        LDO's QUIESCENT is drawn at its input. Modelled as an LDO it read 5 V made from
+        5 V and was flagged out of regulation. The parts between its output pins and its
+        rail (Ivy Plus U14: L17) are a real drop - no regulation loop around them - so
+        they take their DC resistance; an input filter is completed from the board, as
+        a regulator's is."""
+        ref = reg["refdes"]
+        vin, vin_pins, vin_rail = self._input(reg)
+        out_pins = _pads(ref, src.get("pins", []))
+        if vin is None or not vin_pins or not out_pins:
+            self.notes.append(f"{ref} ({rail}): load switch whose "
+                              f"{'input' if vin is None or not vin_pins else 'output'} pins are "
+                              f"not in the file; no SERIES, so {rail} is not driven")
+            return
+        typ, mx = dc_resistance({"datasheet_figures": reg.get("datasheet_resistances") or []})
+        r = self._pick(typ, mx)
+        if r is None or r <= 0:
+            self.notes.append(f"{ref}: load switch, on-resistance not in the file; bridged at "
+                              "1 mOhm")
+            r = 0.001
+        elif self.corner == "max" and mx is None:
+            self.notes.append(f"{ref}: load switch, no maximum on-resistance printed; the "
+                              "typical is used in the worst case")
+        series = {"ROLE": "SERIES", "R": f"{r:g}", "P_NET": vin,
+                  "N_NET": src.get("output_net") or rail,
+                  "P_PINS": ",".join(vin_pins), "N_PINS": ",".join(out_pins)}
+        iq = _amps(reg.get("quiescent_current"))
+        sink = None if iq is None else {"ROLE": "SINK", "I": f"{iq:g}", "P_NET": vin,
+                                        "N_NET": self.gnd, "P_PINS": ",".join(vin_pins)}
+        self.pending_switches.append((rail, ref, series, vin_rail, sink,
                                       src.get("output_path", [])))
 
     def _freewheel(self, reg: dict, rail: str, values: Dict[str, str], v_out: float,
@@ -265,11 +315,26 @@ class TomachiePdn:
                 if name not in self.powered and r.get("parent_rail") in self.powered:
                     self.powered.add(name)
                     changed = True
-            for rail, *_rest in self.pending_regs:
+            for rail, *_rest in self.pending_regs + self.pending_switches:
                 vin_rail = _rest[2]
                 if rail not in self.powered and vin_rail in self.powered:
                     self.powered.add(rail)
                     changed = True
+        for rail, ref, series, vin_rail, sink, path in self.pending_switches:
+            if rail not in self.powered:
+                self.notes.append(f"{ref} ({rail}): load switch; nothing in the file drives "
+                                  f"its input ({vin_rail}); no SERIES")
+                continue
+            self.ch.add(ref, ("SERIES", series["P_NET"], series["N_NET"]), series)
+            self.notes.append(f"{ref}: load switch, a SERIES of {series['R']} Ohm from "
+                              f"{series['P_NET']} to {series['N_NET']} (not a regulator)")
+            if sink is not None:
+                self.ch.add(ref, ("SINK", sink["P_NET"]), sink)
+            if series["P_NET"] != vin_rail:
+                self.reg_inputs.append((ref, series["P_NET"], vin_rail))
+            for e in path:
+                if e.get("net_in") and e.get("net_out"):
+                    self._series(e)
         for rail, ref, values, vin_rail, path in self.pending_regs:
             if rail not in self.powered:
                 self.notes.append(f"{ref} ({rail}): nothing in the file drives its input "
