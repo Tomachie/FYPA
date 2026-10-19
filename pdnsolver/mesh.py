@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Triangular mesher for pdnsolver, ported from padne's CGAL-based mesher.
 
 Upstream (padne) wraps CGAL's Constrained Delaunay + quality refiner in a C++

@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Post-load warnings: missing directives, mesh failures, open loops."""
 from __future__ import annotations
 

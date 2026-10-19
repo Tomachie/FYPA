@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Altium project extractor for FYPA.
 
 Loads a `.PrjPcb` via altium_monkey and produces typed, mm-normalised raw record

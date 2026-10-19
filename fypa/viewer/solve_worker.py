@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Background solve and capacitor-loop workers, and the solve cache."""
 from __future__ import annotations
 

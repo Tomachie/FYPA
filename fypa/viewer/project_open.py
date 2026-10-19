@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Opening projects, solutions and Altium imports into a viewer window."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Tomachie LLC.
 """PDN directives from a Tomachie power-tree file (``<design>.pdn.json``).
 
 Tomachie reads the schematic and the parts' datasheets and writes every rail, its

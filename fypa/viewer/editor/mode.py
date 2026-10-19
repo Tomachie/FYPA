@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Editor mode: entering / leaving it and its viewport buttons."""
 from __future__ import annotations
 

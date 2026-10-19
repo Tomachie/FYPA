@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """FYPA project files (``.fypa``).
 
 A project file is a small JSON document that ties together everything FYPA

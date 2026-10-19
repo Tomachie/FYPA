@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """SMPS stage binding — connect PATH and FREEWHEEL elements to REGULATOR hosts.
 
 Called by :func:`fypa.altium.annotations.parse_annotations` after the main

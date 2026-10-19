@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Tomachie LLC.
 """A notice with a list that can be long: the list scrolls inside a dialog of sensible
 size instead of growing the dialog past the screen (a board can have dozens of
 skipped directives or unannotated bridges)."""

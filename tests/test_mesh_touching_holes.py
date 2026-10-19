@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Tomachie LLC.
 """Regression: copper whose repaired outline has holes touching the exterior.
 
 an Altium board (manufactured), "Top Layer|GND" piece around a

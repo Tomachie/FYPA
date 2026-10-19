@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Tomachie LLC.
 """PDN_* parameters from a Tomachie power-tree file (fypa.tomachie_pdn)."""
 
 import copy

@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """PDN_* annotation parser for FYPA.
 
 Reads :class:`fypa.altium.extract.ExtractedProject` and produces typed lumped-element
@@ -344,7 +345,7 @@ _KNOWN_SUFFIXES_BY_ROLE: dict[str, frozenset[str]] = {
         "SMPS_TOPOLOGY", "SW1_NET", "SW2_NET",
     }) | _PART_WIDE_PIN_FILTER_SUFFIXES,
     "SERIES": frozenset({
-        "R", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
+        "R", "VF", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
     }) | _PART_WIDE_PIN_FILTER_SUFFIXES,
     "PATH": frozenset({
         "R", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
@@ -3497,6 +3498,9 @@ class ResistorSpec(_BaseSpec):
     n: TerminalSpec
     channel_index: int | None = None  # None = legacy unindexed; int = PDN<n>_*
     solve_excluded: bool = False  # see SourceSpec.solve_excluded
+    # A diode (PDN_VF): its forward drop from P (anode) to N when it conducts, volts;
+    # None = a plain resistance. Solved as forward_v + I x resistance (the slope).
+    forward_v: float | None = None
 
 
 @dataclass(frozen=True)
@@ -4476,7 +4480,13 @@ def _parse_two_terminal(comp, proj, enabled_layers, result,
 
 
 def _resistor_spec_factory(*, params, value, result, diag, **kw):
-    return ResistorSpec(resistance=value, **kw)
+    vf_key = _channel_key("VF", kw.get("channel_index"))
+    vf = None
+    if _ci_get(params, vf_key) is not None:
+        parsed = _optional_value(params, vf_key, diag, result)
+        if parsed is not None and parsed > 0:
+            vf = parsed
+    return ResistorSpec(resistance=value, forward_v=vf, **kw)
 
 
 def _path_spec_factory(*, params, value, channel_index, result, diag, **kw):

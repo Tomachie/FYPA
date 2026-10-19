@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Tomachie LLC.
 """Split internal planes (``(Multiple Nets)``): each region floods its own net.
 
 Altium keeps a split plane's regions as ``Polygons6`` records of type

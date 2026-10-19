@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """Altium copper geometry builder for FYPA.
 
 Consumes an :class:`fypa.altium.extract.ExtractedProject` and produces one

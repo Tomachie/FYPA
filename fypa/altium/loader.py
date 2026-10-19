@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """FYPA loader — orchestrates extract + geometry + annotations.
 
 Public entry: :func:`load_project`. Returns a :class:`LoadedProject` bundle
@@ -929,6 +930,11 @@ def _directive_to_network(
             (d.p, node_a, COUPLING_RESISTANCE_OHM, "P"),
             (d.n, node_b, COUPLING_RESISTANCE_OHM, "N"),
         )
+        if getattr(d, "forward_v", None):
+            # A conducting diode, I = (Va - Vb - Vf) / R: the resistor plus Vf / R
+            # carried back from N to P, with no new solver element.
+            aux.append(_pp.CurrentSource(f=node_b, t=node_a,
+                                         current=d.forward_v / d.resistance))
     elif isinstance(d, RegulatorSpec):
         node_vp, node_vn = _pp.NodeID(), _pp.NodeID()
         node_sf, node_st = _pp.NodeID(), _pp.NodeID()

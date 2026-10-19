@@ -1,3 +1,4 @@
+# Portions Copyright (c) 2026 Tomachie LLC.
 """The launcher window shown before a project is open."""
 from __future__ import annotations
 
