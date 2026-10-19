@@ -46,6 +46,10 @@ from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 
+# A part on a rail by a signal pin only (detect, enable, reference): 0 A, not a load.
+# "signal_pin_only" since Tomachie 7710456a; "not_a_supply" in files written before.
+NOT_A_LOAD = ("signal_pin_only", "not_a_supply")
+
 SCHEMA = "tomachie-pdn"
 SCHEMA_VERSION = 1
 SOURCE_ROLES = ("board_input", "battery", "generator")
@@ -566,7 +570,7 @@ class TomachiePdn:
                 if l["role"] == "regulator":
                     continue                # carried by the regulator's input
                 current = l.get("current")
-                if isinstance(current, dict) and current.get("basis") == "not_a_supply":
+                if isinstance(current, dict) and current.get("basis") in NOT_A_LOAD:
                     # On the rail by a detect, enable or reference pin only: it draws nothing.
                     not_supplied.append(f"{l['refdes']} ({name})")
                     continue
