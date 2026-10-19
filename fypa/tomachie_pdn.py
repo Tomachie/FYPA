@@ -585,12 +585,21 @@ class TomachiePdn:
     def _sink_current(self, l: dict) -> float | None:
         if l.get("load_dependent"):
             return None
-        pick = (_amps(l.get("current_max")) if self.corner == "max" else None) \
-            or _amps(l.get("current"))
+        pick = self._corner_or_max(l, "current")
         if pick is not None and l["role"] == "ic_with_regulator":
-            reg = (_amps(l.get("regulator_input_max")) if self.corner == "max" else None) \
-                or _amps(l.get("regulator_input"))
+            reg = self._corner_or_max(l, "regulator_input")
             pick = None if reg is None else pick + reg
+        return pick
+
+    def _corner_or_max(self, l: dict, key: str) -> float | None:
+        """The corner's value of ``key``; with no typical but a maximum, the maximum,
+        said once (a load left out entirely would read the rail's drop too low)."""
+        mx = _amps(l.get(f"{key}_max"))
+        pick = (mx if self.corner == "max" else None) or _amps(l.get(key))
+        if pick is None and mx is not None:
+            self.notes.append(f"{l['refdes']}: only a maximum {key.replace('_', ' ')} is "
+                              f"known; {mx * 1e3:g} mA is used")
+            pick = mx
         return pick
 
     def _sink(self, rail: str, l: dict):

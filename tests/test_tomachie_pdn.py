@@ -568,3 +568,14 @@ def test_a_part_on_a_rail_by_no_supply_pin_gets_no_sink(basis):
     p, notes = params(pdn=pdn)
     assert "U9" not in p
     assert any(n.startswith("On a rail by a detect") and "U9 (+3V3)" in n for n in notes)
+
+
+def test_only_a_maximum_current_is_used_in_the_typical_corner():
+    """A load whose file gives a maximum current but no typical is solved at the maximum,
+    said once; left out, the rail's drop would read too low."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"][1]["current_max"] = {"amps": 0.025, "basis": "max"}   # U6
+    p, notes = params(pdn=pdn)
+    assert p["U6"]["PDN1_I"] == "0.025"
+    assert any(n.startswith("U6: only a maximum current is known; 25 mA is used")
+               for n in notes)
