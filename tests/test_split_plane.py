@@ -49,28 +49,28 @@ def _proj(**overrides) -> ExtractedProject:
                         dielectric_thickness_mm=0.0, next_layer_id=0,
                         is_plane=False, plane_net_name=None, mech_enabled=True),
     )
-    base = dict(
-        prjpcb_path=Path("s.PrjPcb"), pcbdoc_path=Path("s.PcbDoc"),
-        tracks=(), arcs=(), pads=(), regions=(), shape_based_regions=(),
-        fills=(), pcb_components=(),
-        nets=(RawNet("GND"), RawNet("AGND"), RawNet("+5V"), RawNet("AGND2")),
-        stackup=stackup, sch_components=(),
-        board_outline=_rect(0, 0, 20, 10),
-        vias=(
+    base = {
+        "prjpcb_path": Path("s.PrjPcb"), "pcbdoc_path": Path("s.PcbDoc"),
+        "tracks": (), "arcs": (), "pads": (), "regions": (), "shape_based_regions": (),
+        "fills": (), "pcb_components": (),
+        "nets": (RawNet("GND"), RawNet("AGND"), RawNet("+5V"), RawNet("AGND2")),
+        "stackup": stackup, "sch_components": (),
+        "board_outline": _rect(0, 0, 20, 10),
+        "vias": (
             RawVia(Pt2D(2, 5), 0.6, 0.3, 1, 32, GND),
             RawVia(Pt2D(8, 5), 0.6, 0.3, 1, 32, GND),
             RawVia(Pt2D(15, 5), 0.6, 0.3, 1, 32, AGND),
         ),
-        split_planes=(
+        "split_planes": (
             # GND on the left with a +5V island inside it, AGND on the right,
             # 0.25 mm split line between them.
             RawSplitPlane(PLANE, GND, _rect(0.5, 0.5, 9.875, 9.5)),
             RawSplitPlane(PLANE, V5, _rect(4, 3, 6, 7)),
             RawSplitPlane(PLANE, AGND, _rect(10.125, 0.5, 19.5, 9.5)),
         ),
-        plane_clearance_mm=0.25, plane_relief_air_gap_mm=0.2,
-        plane_relief_conductor_width_mm=0.25, plane_relief_entries=4,
-    )
+        "plane_clearance_mm": 0.25, "plane_relief_air_gap_mm": 0.2,
+        "plane_relief_conductor_width_mm": 0.25, "plane_relief_entries": 4,
+    }
     base.update(overrides)
     return ExtractedProject(**base)
 

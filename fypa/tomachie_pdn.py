@@ -45,7 +45,6 @@ import json
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 SCHEMA = "tomachie-pdn"
 SCHEMA_VERSION = 1
@@ -61,22 +60,22 @@ class PdnImportError(ValueError):
     pass
 
 
-def _number(v) -> Optional[float]:
+def _number(v) -> float | None:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def _amps(current) -> Optional[float]:
+def _amps(current) -> float | None:
     return _number(current.get("amps")) if isinstance(current, dict) else None
 
 
-def _pads(refdes: str, pins: List[str]) -> List[str]:
+def _pads(refdes: str, pins: list[str]) -> list[str]:
     """``("U5", ["U5_10", "U5_A1"])`` -> ``["10", "A1"]``: the part's own reference and
     the underscore after it come off the front, so a pad name may hold underscores."""
     prefix = f"{refdes}_"
     return [p[len(prefix):] if p.startswith(prefix) else p.rpartition("_")[2] for p in pins]
 
 
-def _printed_ohms(fig: dict, column: str) -> Optional[float]:
+def _printed_ohms(fig: dict, column: str) -> float | None:
     unit = str(fig.get("unit", "")).strip()
     scale = OHMS.get(unit, OHMS.get(unit.lower()))
     try:
@@ -86,7 +85,7 @@ def _printed_ohms(fig: dict, column: str) -> Optional[float]:
     return None if scale is None else abs(value) * scale
 
 
-def dc_resistance(element: dict) -> Tuple[Optional[float], Optional[float]]:
+def dc_resistance(element: dict) -> tuple[float | None, float | None]:
     """(typical, maximum) DC resistance of a series part, ohms. Only figures that ARE a
     DC resistance count: a ferrite's impedance at 100 MHz is in ohms too."""
     own = _number(element.get("resistance_ohm"))
@@ -103,11 +102,11 @@ class _Channels:
     """Indexed PDN parameters per designator: PDN1_ROLE, PDN1_V, ... PDN2_ROLE ..."""
 
     def __init__(self):
-        self.params: Dict[str, Dict[str, str]] = defaultdict(dict)
-        self.count: Dict[str, int] = defaultdict(int)
-        self.keys: Dict[str, set] = defaultdict(set)
+        self.params: dict[str, dict[str, str]] = defaultdict(dict)
+        self.count: dict[str, int] = defaultdict(int)
+        self.keys: dict[str, set] = defaultdict(set)
 
-    def add(self, designator: str, key: tuple, values: Dict[str, str]) -> bool:
+    def add(self, designator: str, key: tuple, values: dict[str, str]) -> bool:
         """One channel; a channel already added under the same key is not repeated."""
         if key in self.keys[designator]:
             return False
@@ -132,23 +131,23 @@ class TomachiePdn:
         self.gnd = grounds[0]
         self.grounds = list(grounds)
         # (regulator, net its input pins sit on, its input rail) - joined on the board
-        self.reg_inputs: List[Tuple[str, str, str]] = []
+        self.reg_inputs: list[tuple[str, str, str]] = []
         self.rails = {r["name"]: r for r in pdn.get("rails", [])}
         self.regs = {g["refdes"]: g for g in pdn.get("regulators", [])}
         self.ch = _Channels()
-        self.notes: List[str] = []
+        self.notes: list[str] = []
         self.powered: set = set()          # rails something in the file drives
-        self.pending_regs: List[tuple] = []  # (rail, refdes, values, input rail, output_path)
+        self.pending_regs: list[tuple] = []  # (rail, refdes, values, input rail, output_path)
         # (rail, refdes, SERIES, input rail, SINK or None, output_path)
-        self.pending_switches: List[tuple] = []
-        self.freewheels: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}  # (reg, rail) -> diode
+        self.pending_switches: list[tuple] = []
+        self.freewheels: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}  # (reg, rail) -> diode
         self.closed_returns: set = set()   # sources whose file return reaches self.gnd
-        self.reg_outputs: Dict[Tuple[str, str], str] = {}  # (reg, output pins) -> first rail
-        self.isolated: Dict[str, List[str]] = {}   # isolated converter -> its output rails
-        self.extra_inputs: Dict[Tuple[str, str], list] = {}  # (reg, rail) -> other input rails
+        self.reg_outputs: dict[tuple[str, str], str] = {}  # (reg, output pins) -> first rail
+        self.isolated: dict[str, list[str]] = {}   # isolated converter -> its output rails
+        self.extra_inputs: dict[tuple[str, str], list] = {}  # (reg, rail) -> other input rails
 
     # ------------------------------------------------------------ roles
-    def _source_volts(self, rail: dict) -> Optional[float]:
+    def _source_volts(self, rail: dict) -> float | None:
         """A source rail's voltage for this corner: nominal, or in the worst case its
         ``voltage.min`` when that is a number (spec: a worst-case solve drives each
         source at voltage.min; V+: 48 V nominal, 21 V min)."""
@@ -156,7 +155,7 @@ class TomachiePdn:
         lo = _number(v.get("min"))
         return lo if self.corner == "max" and lo is not None else _number(v.get("nominal"))
 
-    def _supply_volts(self, rail_name: Optional[str]) -> Optional[float]:
+    def _supply_volts(self, rail_name: str | None) -> float | None:
         """The voltage a rail sits at in this corner: a branch's is its parent's (up to
         the source); a source's per :meth:`_source_volts`; a regulator's output stays at
         its set voltage, so its nominal."""
@@ -208,7 +207,7 @@ class TomachiePdn:
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 
-    def _input(self, reg: dict) -> Tuple[Optional[str], List[str], Optional[str]]:
+    def _input(self, reg: dict) -> tuple[str | None, list[str], str | None]:
         """The net the regulator's input pins sit on, those pins, and the input rail."""
         for rail in reg.get("input_rails", []):
             for l in self.rails.get(rail, {}).get("loads", []):
@@ -217,7 +216,7 @@ class TomachiePdn:
                             rail)
         return None, [], None
 
-    def _input_entries(self, reg: dict) -> List[Tuple[str, dict]]:
+    def _input_entries(self, reg: dict) -> list[tuple[str, dict]]:
         """(input rail, load entry) for every input rail the regulator lists."""
         out = []
         for rail in reg.get("input_rails", []):
@@ -227,11 +226,11 @@ class TomachiePdn:
                     break
         return out
 
-    def _corner_amps(self, obj: dict, key: str) -> Optional[float]:
+    def _corner_amps(self, obj: dict, key: str) -> float | None:
         return (_amps(obj.get(key + "_max")) if self.corner == "max" else None)             or _amps(obj.get(key))
 
-    def _split_inputs(self, reg: dict, rail: str, values: Dict[str, str], kind: str,
-                      v_out: float, eff: Optional[float], iq: Optional[float]):
+    def _split_inputs(self, reg: dict, rail: str, values: dict[str, str], kind: str,
+                      v_out: float, eff: float | None, iq: float | None):
         """A regulator with more than one input rail (U9: 5V and 3V3, the 3V3
         entry behind L6). Its input current is shared over the input rails by what
         the file states - the entries' own currents, when they add up to the
@@ -329,8 +328,8 @@ class TomachiePdn:
             self.pending_regs.append((name, reg["refdes"], values, vin_rail,
                                       src.get("output_path", [])))
 
-    def _isolated(self, reg: dict, rail: str, values: Dict[str, str],
-                  eff: Optional[float], iq: Optional[float]):
+    def _isolated(self, reg: dict, rail: str, values: dict[str, str],
+                  eff: float | None, iq: float | None):
         """An isolated DC/DC converter (spec revision 6, ``type`` ``isolated``): a
         switcher at its output rail's nominal whose output side returns on its own
         ground (set from the board, :meth:`place_on_board`). Its input current is
@@ -353,7 +352,7 @@ class TomachiePdn:
                               f"known (drawn as 0), so {values['IN_P_NET']}'s drop is a lower "
                               "bound")
 
-    def _pick(self, typ: Optional[float], mx: Optional[float]) -> Optional[float]:
+    def _pick(self, typ: float | None, mx: float | None) -> float | None:
         """The resistance for this corner: the maximum in the worst case, else the
         typical; the one printed when only one is."""
         return mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
@@ -394,7 +393,7 @@ class TomachiePdn:
         self.pending_switches.append((rail, ref, series, vin_rail, sink,
                                       src.get("output_path", [])))
 
-    def _freewheel(self, reg: dict, rail: str, values: Dict[str, str], v_out: float,
+    def _freewheel(self, reg: dict, rail: str, values: dict[str, str], v_out: float,
                    vin_rail: str):
         """A non-synchronous buck's freewheel diode, from the regulator's ``switch_node``
         (spec revision 6). Its switch pins conduct D = Vout / Vin of the period and the
@@ -579,7 +578,7 @@ class TomachiePdn:
             self.notes.append("On a rail by a detect, enable or reference pin, not a supply pin, "
                               "so no SINK: " + ", ".join(not_supplied))
 
-    def _sink_current(self, l: dict) -> Optional[float]:
+    def _sink_current(self, l: dict) -> float | None:
         if l.get("load_dependent"):
             return None
         pick = (_amps(l.get("current_max")) if self.corner == "max" else None) \
@@ -617,11 +616,11 @@ class TomachiePdn:
         self.ch.add(l["refdes"], ("SINK", net), values)
 
     # ------------------------------------------------------------ the board
-    def series_elements(self) -> Dict[str, dict]:
+    def series_elements(self) -> dict[str, dict]:
         """Every part the file lists in series, by designator (for its DC resistance):
         between rails, on a regulator's output path, and in a load's ``input_filter``
         (spec revision 6; U12: C69 / L10, U10: C67 / L8)."""
-        out: Dict[str, dict] = {}
+        out: dict[str, dict] = {}
         for r in self.rails.values():
             parts = r.get("series_from_parent", []) + (r.get("source") or {}).get("output_path", [])
             for l in r.get("loads", []):
@@ -630,7 +629,7 @@ class TomachiePdn:
                 out.setdefault(e.get("refdes", ""), e)
         return out
 
-    def place_on_board(self, params: Dict[str, Dict[str, str]], extracted) -> List[str]:
+    def place_on_board(self, params: dict[str, dict[str, str]], extracted) -> list[str]:
         """What only the board can answer, applied to ``params`` in place:
 
         * a source's return is the ground net its pads are on (J3: V-, not GND);
@@ -639,7 +638,7 @@ class TomachiePdn:
         * a regulator whose input pins sit behind an input filter (U12: VIN -> C69 -> L10
           -> its VIN pin) gets the filter's parts as SERIES, so the solve reaches its input.
         """
-        notes: List[str] = []
+        notes: list[str] = []
         pads = defaultdict(set)        # designator -> nets its pads are on
         for pad in extracted.pads:
             if pad.component_index < 0:
@@ -650,7 +649,7 @@ class TomachiePdn:
         grounds = set(self.grounds)
         known = {k.upper(): v for k, v in self.series_elements().items()}
 
-        def ohms(des: str) -> Tuple[float, str]:
+        def ohms(des: str) -> tuple[float, str]:
             e = known.get(des)
             if e is not None:
                 typ, mx = dc_resistance(e)
@@ -659,7 +658,7 @@ class TomachiePdn:
                     return r, ""
             return 0.001, f"{des}: DC resistance not in the file; bridged at 1 mOhm (above the 0.9 mOhm net-merge threshold)"
 
-        def add(des: str, values: Dict[str, str]):
+        def add(des: str, values: dict[str, str]):
             ch = params.setdefault(des, {})
             used = [int(k[3:].split("_", 1)[0]) for k in ch
                     if k.startswith("PDN") and k[3:].split("_", 1)[0].isdigit()]
@@ -782,12 +781,12 @@ class TomachiePdn:
             nets |= {l["input_net"] for l in r.get("loads", []) if l.get("input_net")}
         return nets
 
-    def _isolated_grounds(self, params: Dict[str, Dict[str, str]], pads) -> List[str]:
+    def _isolated_grounds(self, params: dict[str, dict[str, str]], pads) -> list[str]:
         """An isolated converter's output side returns on its own ground: the ground
         net (other than the main one) its pads sit on, else the one its output rails'
         loads share (U18: GND_CAN1). Every SINK and REGULATOR terminal in
         the nets it powers is moved onto that ground."""
-        notes: List[str] = []
+        notes: list[str] = []
         others = set(self.grounds) - {self.gnd}
         for ref in sorted(self.isolated):
             iso = sorted(pads.get(ref.upper(), set()) & others)
@@ -823,7 +822,7 @@ class TomachiePdn:
         return notes
 
     # ------------------------------------------------------------ run
-    def parameters(self) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    def parameters(self) -> tuple[dict[str, dict[str, str]], list[str]]:
         self._sources()
         self._regulators()
         self._power()
@@ -832,13 +831,13 @@ class TomachiePdn:
         return dict(self.ch.params), self.notes
 
 
-def read_pdn_parameters(path, corner: str = "typ") -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+def read_pdn_parameters(path, corner: str = "typ") -> tuple[dict[str, dict[str, str]], list[str]]:
     """``{designator: {PDNn_*: value}}`` and notes, from a Tomachie ``.pdn.json``."""
     pdn = json.loads(Path(path).read_text(encoding="utf-8"))
     return TomachiePdn(pdn, corner).parameters()
 
 
-def read_pdn_for_board(path, corner: str, extracted) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+def read_pdn_for_board(path, corner: str, extracted) -> tuple[dict[str, dict[str, str]], list[str]]:
     """As :func:`read_pdn_parameters`, then completed from the board itself
     (:meth:`TomachiePdn.place_on_board`)."""
     pdn = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -847,14 +846,14 @@ def read_pdn_for_board(path, corner: str, extracted) -> Tuple[Dict[str, Dict[str
     return params, notes + reader.place_on_board(params, extracted)
 
 
-def _has_pdn(params: Dict[str, str]) -> bool:
+def _has_pdn(params: dict[str, str]) -> bool:
     return any(k.upper().startswith("PDN") for k in params)
 
 
-def apply_to_project(extracted, params: Dict[str, Dict[str, str]]):
+def apply_to_project(extracted, params: dict[str, dict[str, str]]):
     """A copy of ``extracted`` whose schematic components carry the file's parameters.
     Returns (project, notes). A component with its own PDN_* parameters keeps them."""
-    notes: List[str] = []
+    notes: list[str] = []
     wanted = {d.upper(): (d, p) for d, p in params.items()}
     placed = set()
     comps = []
@@ -876,7 +875,7 @@ def apply_to_project(extracted, params: Dict[str, Dict[str, str]]):
     return replace(extracted, sch_components=tuple(comps)), notes
 
 
-def applied_designators(params: Dict[str, Dict[str, str]], extracted) -> set:
+def applied_designators(params: dict[str, dict[str, str]], extracted) -> set:
     """Upper-cased designators whose directives came from the file (not those that
     kept their own schematic annotation)."""
     own = {c.designator.upper() for c in extracted.sch_components if _has_pdn(c.parameters)}
