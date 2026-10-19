@@ -1,5 +1,13 @@
 # FYPA - FEM Y-parameter Power Analyser
 
+> **This is a fork of [anarthrous-eda/FYPA](https://github.com/anarthrous-eda/FYPA).** It
+> follows its `main` and adds a Tomachie power-tree import: `--pdn-json <design>.pdn.json`
+> (with `--pdn-corner typ|max`) sets PDN_* sources, regulators, series parts and sinks for
+> every component the schematic does not annotate itself, from the board's datasheet
+> values. How FYPA's results compare with KiPI's on the same board, and why they differ
+> where they do: [docs/kipi-fypa-comparison.md](docs/kipi-fypa-comparison.md). The rest of
+> this README is the original project's.
+
 Power-Delivery-Network (PDN) analysis for Altium and Gerber PCB designs.
 Extracts copper geometry directly from a `.PrjPcb` project or from a Gerber
 fabrication package, runs a 2-D FEM Laplace solver per copper layer to compute
