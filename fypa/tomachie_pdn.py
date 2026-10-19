@@ -555,6 +555,7 @@ class TomachiePdn:
                     self._series(e)
 
     def _loads(self):
+        not_supplied = []
         for name, r in self.rails.items():
             if name not in self.powered:
                 drawn = [l["refdes"] for l in r.get("loads", []) if l["role"] != "regulator"]
@@ -565,10 +566,18 @@ class TomachiePdn:
             for l in r.get("loads", []):
                 if l["role"] == "regulator":
                     continue                # carried by the regulator's input
+                current = l.get("current")
+                if isinstance(current, dict) and current.get("basis") == "not_a_supply":
+                    # On the rail by a detect, enable or reference pin only: it draws nothing.
+                    not_supplied.append(f"{l['refdes']} ({name})")
+                    continue
                 self._sink(name, l)
             for pin in r.get("offboard_pins", []):
                 self.notes.append(f"{name}: power leaves the board at {pin}; that load is not "
                                   "in the file, so the rail's drop is a lower bound")
+        if not_supplied:
+            self.notes.append("On a rail by a detect, enable or reference pin, not a supply pin, "
+                              "so no SINK: " + ", ".join(not_supplied))
 
     def _sink_current(self, l: dict) -> Optional[float]:
         if l.get("load_dependent"):

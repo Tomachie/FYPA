@@ -556,3 +556,14 @@ def test_regulator_bias_entry_is_a_sink_and_the_input_stays_whole():
     p, notes = params(pdn=pdn)
     assert not any(k.endswith("_ROLE") and v == "SINK" for k, v in p["U3"].items())
     assert any("U3 on VBUS: current not known; no SINK" in n for n in notes)
+
+
+def test_a_part_on_a_rail_by_no_supply_pin_gets_no_sink():
+    """A part on the rail only by a detect, enable or reference pin (basis not_a_supply,
+    0 A; Tomachie f6f07acb) is no SINK, and is named once in the notes."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"].append({"role": "ic", "refdes": "U9", "pins": ["U9_4"],
+                                     "current": {"amps": 0.0, "basis": "not_a_supply"}})
+    p, notes = params(pdn=pdn)
+    assert "U9" not in p
+    assert any(n.startswith("On a rail by a detect") and "U9 (+3V3)" in n for n in notes)
