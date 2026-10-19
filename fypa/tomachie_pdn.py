@@ -211,6 +211,21 @@ class TomachiePdn:
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
 
+    def _ideal_source(self, ref: str, rail: str, src: dict, v: float, why: str):
+        """A regulator FYPA cannot model as one (its type or its input pins are not in the
+        file) still drives its rail: a SOURCE at its output pins, drawing nothing from its
+        input rail, said once. Left out, every rail behind it went undriven (U14:
+        5V_VIN, and the PMIC and 3V3 regulator fed from it)."""
+        self.notes.append(f"{ref} ({rail}): {why}; modeled as an ideal source, drawing "
+                          "nothing from its input rail")
+        self.ch.add(ref, ("SOURCE", rail), {
+            "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": src.get("output_net") or rail,
+            "N_NET": self.gnd, "P_PINS": ",".join(_pads(ref, src["pins"]))})
+        self.powered.add(rail)
+        for e in src.get("output_path", []):
+            if e.get("net_in") and e.get("net_out"):
+                self._series(e)
+
     def _input(self, reg: dict) -> tuple[str | None, list[str], str | None]:
         """The net the regulator's input pins sit on, those pins, and the input rail."""
         for rail in reg.get("input_rails", []):
@@ -298,6 +313,11 @@ class TomachiePdn:
             v = _number(r.get("voltage", {}).get("nominal"))
             kind = REGULATOR_TYPE.get((reg or {}).get("type"))
             vin, vin_pins, vin_rail = self._input(reg) if reg else (None, [], None)
+            if reg is not None and v is not None and src.get("pins") and (
+                    kind is None or vin is None):
+                self._ideal_source(reg["refdes"], name, src, v, "not known whether linear or "
+                                   "switching" if kind is None else "input pins not found")
+                continue
             if reg is None or v is None or kind is None or vin is None:
                 why = ("no regulator entry" if reg is None else "no stated voltage" if v is None
                        else "not known whether linear or switching" if kind is None

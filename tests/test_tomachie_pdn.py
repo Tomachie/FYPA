@@ -579,3 +579,16 @@ def test_only_a_maximum_current_is_used_in_the_typical_corner():
     assert p["U6"]["PDN1_I"] == "0.025"
     assert any(n.startswith("U6: only a maximum current is known; 25 mA is used")
                for n in notes)
+
+
+def test_a_regulator_of_unknown_type_is_an_ideal_source_at_its_output():
+    """A regulator whose type the file does not give still drives its rail, as a SOURCE
+    at its output pins drawing nothing from its input, said once - left out, every rail
+    behind it went undriven."""
+    pdn = copy.deepcopy(PDN)
+    pdn["regulators"][1]["type"] = "unknown"                          # U3, +1V8
+    p, notes = params(pdn=pdn)
+    assert p["U3"] == {"PDN1_ROLE": "SOURCE", "PDN1_V": "1.8", "PDN1_P_NET": "+1V8",
+                       "PDN1_N_NET": "GND", "PDN1_P_PINS": "5"}
+    assert any(n.startswith("U3 (+1V8): not known whether linear or switching; modeled "
+                            "as an ideal source") for n in notes)
