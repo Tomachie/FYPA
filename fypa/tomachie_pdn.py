@@ -883,7 +883,12 @@ class TomachiePdn:
         notes: list[str] = []
         others = set(self.grounds) - {self.gnd}
         for ref in sorted(self.isolated):
-            iso = sorted(pads.get(ref.upper(), set()) & others)
+            # The ground its output rails return on, as the file states it (spec revision
+            # 7), when the converter has a pad there; else found from the board.
+            stated = {self.rails.get(rail, {}).get("ground") for rail in self.isolated[ref]}
+            iso = sorted(stated & others & pads.get(ref.upper(), set()))
+            if len(iso) != 1:
+                iso = sorted(pads.get(ref.upper(), set()) & others)
             if len(iso) != 1:
                 loads = {l["refdes"].upper() for rail in self.isolated[ref]
                          for l in self.rails.get(rail, {}).get("loads", [])}

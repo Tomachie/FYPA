@@ -614,3 +614,21 @@ def test_a_series_diode_carries_its_forward_drop():
     p, notes = params(pdn=pdn)
     assert "PDN1_VF" not in p["D1"] and p["D1"]["PDN1_R"] == "0.001"
     assert any("no forward voltage in the file" in n for n in notes)
+
+
+def test_isolated_converter_takes_the_ground_its_rail_is_stated_to_return_on():
+    """With pads on two isolated grounds, the board alone cannot say which one the output
+    side returns on; the rail's ground in the file (spec revision 7) does."""
+    board = dict(ISO_BOARD, U4=ISO_BOARD["U4"] + ["GND_X"], U9=ISO_BOARD["U9"] + ["GND_X"])
+    pdn = _with_isolated(efficiency=0.8)
+    pdn["ground_nets"] = list(pdn.get("ground_nets", ["GND"])) + ["GND_ISO", "GND_X"]
+    reader = TomachiePdn(copy.deepcopy(pdn), "typ")
+    p, notes = reader.parameters()
+    notes += reader.place_on_board(p, _board(board))
+    assert any("output-side ground was not found" in n for n in notes)
+    next(r for r in pdn["rails"] if r["name"] == "ISO5")["ground"] = "GND_ISO"
+    reader = TomachiePdn(copy.deepcopy(pdn), "typ")
+    p, notes = reader.parameters()
+    notes += reader.place_on_board(p, _board(board))
+    assert p["U4"]["PDN1_OUT_N_NET"] == "GND_ISO"
+    assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
