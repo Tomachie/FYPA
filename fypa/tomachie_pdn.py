@@ -122,6 +122,35 @@ def _test_amps(text) -> float | None:
     return float(m.group(1)) * _AMPS_PER_UNIT[m.group(2).lower()] if m else None
 
 
+_AT_25C = re.compile(r"(?<![\d.])25\s*°?\s*C\b", re.I)
+
+
+def _curve_fit(element: dict) -> tuple[float, float, str] | None:
+    """(drop, slope, how) fitted on the element's Vf-vs-If curve (``vf_curves``): the
+    25 C curve if one is labelled so, else the first; a straight line through the points
+    above a tenth of its highest current, where the diode conducts. None without a curve."""
+    curves = [c for c in element.get("vf_curves") or [] if len(c.get("points") or []) >= 2]
+    if not curves:
+        return None
+    curve = next((c for c in curves if _AT_25C.search(str(c.get("label", "")))), curves[0])
+    pts = sorted((float(i), float(v)) for i, v in curve["points"])
+    top = pts[-1][0]
+    on = [(i, v) for i, v in pts if i >= 0.1 * top] or pts
+    if len(on) < 2:
+        on = pts[-2:]
+    n = len(on)
+    mi = sum(i for i, _ in on) / n
+    mv = sum(v for _, v in on) / n
+    sxx = sum((i - mi) ** 2 for i, _ in on)
+    slope = max(sum((i - mi) * (v - mv) for i, v in on) / sxx, 0.0) if sxx > 0 else 0.0
+    drop = mv - slope * mi
+    label = f" ({curve['label']})" if curve.get("label") else ""
+    page = f", page {curve['page']}" if curve.get("page") else ""
+    how = (f"forward drop {drop:.3g} V + {slope * 1e3:.3g} mOhm slope, fitted on the "
+           f"Vf-vs-If curve{label}{page} from {on[0][0]:g} A to {on[-1][0]:g} A")
+    return drop, slope, how
+
+
 def forward_drop(element: dict) -> tuple[float | None, float | None, float, str]:
     """(forward voltage, its maximum, slope resistance in ohms, how it was read) of a series
     diode from its datasheet's forward-voltage figures; (None, None, 0, "") when none is
@@ -134,6 +163,15 @@ def forward_drop(element: dict) -> tuple[float | None, float | None, float, str]
     cols = {c: [(_test_amps(f.get("if")), _printed_volts(f, c)) for f in figs]
             for c in ("typ", "max")}
     cols = {c: [(i, v) for i, v in pts if v is not None] for c, pts in cols.items()}
+    fitted = _curve_fit(element)
+    if fitted is not None:
+        drop, slope, how = fitted
+        # The curve is typical; a printed maximum lifts it for the worst case.
+        vf_max = None
+        if cols["max"]:
+            i_m, v_m = max(cols["max"], key=lambda p: p[1])
+            vf_max = max(v_m - (i_m or 0.0) * slope, drop)
+        return drop, vf_max, slope, how
     if not cols["typ"] and not cols["max"]:
         return None, None, 0.0, ""
     fit_col = "typ" if cols["typ"] else "max"

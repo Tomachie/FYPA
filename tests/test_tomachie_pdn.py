@@ -632,3 +632,17 @@ def test_isolated_converter_takes_the_ground_its_rail_is_stated_to_return_on():
     notes += reader.place_on_board(p, _board(board))
     assert p["U4"]["PDN1_OUT_N_NET"] == "GND_ISO"
     assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
+
+
+def test_a_series_diode_with_a_vf_curve_is_fitted_on_it():
+    """The 25 C curve, a line through its points above a tenth of its highest current."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][2]["series_from_parent"].append({
+        "refdes": "D1", "class": "diode", "net_in": "+3V3", "net_out": "+3V3A",
+        "resistance_ohm": "unknown", "datasheet_figures": [],
+        "vf_curves": [{"label": "TJ=125C", "points": [[0.1, 0.20], [1, 0.30], [3, 0.40]]},
+                      {"label": "TJ=25C", "points": [[0.01, 0.15], [0.5, 0.375], [1, 0.40],
+                                                     [3, 0.50]]}]})
+    p, notes = params(pdn=pdn)
+    assert (p["D1"]["PDN1_VF"], p["D1"]["PDN1_R"]) == ("0.35", "0.05")
+    assert any("Vf-vs-If curve (TJ=25C)" in n for n in notes)
