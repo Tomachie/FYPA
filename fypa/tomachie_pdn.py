@@ -43,6 +43,7 @@ user sees that the affected rail's drop is a lower bound.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
@@ -101,6 +102,58 @@ def dc_resistance(element: dict) -> tuple[float | None, float | None]:
     typs = [v for v in (_printed_ohms(f, "typ") for f in figs) if v is not None]
     maxs = [v for v in (_printed_ohms(f, "max") for f in figs) if v is not None]
     return (max(typs) if typs else None), (max(maxs) if maxs else None)
+
+
+# A diode's forward-voltage figures, under whatever key the datasheet read gave them.
+_FORWARD_V_SPEC = re.compile(r"(?i)^(v_?f\w*|v_?forward\w*|forward_voltage\w*)$")
+_AMPS_PER_UNIT = {"a": 1.0, "ma": 1e-3, "ua": 1e-6, "µa": 1e-6}
+
+
+def _printed_volts(fig: dict, column: str) -> float | None:
+    try:
+        return float(str(fig.get(column, "")).strip().lstrip("<>~"))
+    except ValueError:
+        return None
+
+
+def _test_amps(text) -> float | None:
+    """The test current printed with a figure ("5A", "500 mA"), in amps."""
+    m = re.match(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([mµu]?A)\b", str(text or ""))
+    return float(m.group(1)) * _AMPS_PER_UNIT[m.group(2).lower()] if m else None
+
+
+def forward_drop(element: dict) -> tuple[float | None, float | None, float, str]:
+    """(forward voltage, its maximum, slope resistance in ohms, how it was read) of a series
+    diode from its datasheet's forward-voltage figures; (None, None, 0, "") when none is
+    printed. Two figures at different test currents give a drop and a slope (V = Vf +
+    I x R), fitted on the typical figures, else the maximum ones; one figure is a constant
+    drop, which reads high below its test current."""
+    figs = [f for f in element.get("datasheet_figures", [])
+            if _FORWARD_V_SPEC.match(str(f.get("spec", "")))
+            and str(f.get("unit", "")).strip().upper() == "V"]
+    cols = {c: [(_test_amps(f.get("if")), _printed_volts(f, c)) for f in figs]
+            for c in ("typ", "max")}
+    cols = {c: [(i, v) for i, v in pts if v is not None] for c, pts in cols.items()}
+    if not cols["typ"] and not cols["max"]:
+        return None, None, 0.0, ""
+    fit_col = "typ" if cols["typ"] else "max"
+    pts = sorted((i, v) for i, v in cols[fit_col] if i is not None)
+    if len(pts) >= 2 and pts[-1][0] > pts[0][0]:
+        (i1, v1), (i2, v2) = pts[0], pts[-1]
+        slope = max((v2 - v1) / (i2 - i1), 0.0)
+        drop = v1 - i1 * slope
+        how = (f"forward drop {drop:.3g} V + {slope * 1e3:.3g} mOhm slope, from the "
+               f"{fit_col} figures at {i1:g} A and {i2:g} A")
+    else:
+        i_at, drop = max(cols[fit_col], key=lambda p: p[1])
+        slope = 0.0
+        at = f" at {i_at:g} A" if i_at is not None else ""
+        how = (f"forward drop {drop:g} V ({fit_col}{at}) as a constant: below that "
+               "current it drops less, so the rail after it reads somewhat low")
+    vf_max = None
+    if fit_col == "typ" and cols["max"]:
+        vf_max = drop + max(v for _, v in cols["max"]) - max(v for _, v in cols["typ"])
+    return drop, vf_max, slope, how
 
 
 class _Channels:
@@ -551,14 +604,21 @@ class TomachiePdn:
         typ, mx = dc_resistance(e)
         r = mx if self.corner == "max" and mx is not None else (typ if typ is not None else mx)
         if e.get("class") == "diode":
-            # FYPA has no forward-voltage element. Bridged so the solve reaches what is
-            # behind it (D2, the reverse-polarity diode ahead of U12); the rail
-            # behind it then sits one forward drop higher than on the board.
-            self.notes.append(f"{ref}: series diode - its forward voltage is not modelled "
-                              "(bridged at 1 mOhm); the rail after it reads one forward "
-                              "drop high")
-            self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), {
-                "ROLE": "SERIES", "R": "0.001", "P_NET": e["net_in"], "N_NET": e["net_out"]})
+            vf, vf_max, slope, how = forward_drop(e)
+            values = {"ROLE": "SERIES", "R": f"{max(slope, 0.001):g}", "P_NET": e["net_in"],
+                      "N_NET": e["net_out"]}
+            if vf is None:
+                # Bridged so the solve reaches what is behind it; the rail behind it then
+                # sits one forward drop higher than on the board.
+                self.notes.append(f"{ref}: series diode with no forward voltage in the file "
+                                  "(bridged at 1 mOhm); the rail after it reads one forward "
+                                  "drop high")
+            else:
+                # Anode on the side the power comes from (net_in): PDN_VF from P to N.
+                pick = vf_max if self.corner == "max" and vf_max is not None else vf
+                values["VF"] = f"{pick:g}"
+                self.notes.append(f"{ref}: series diode, {how}")
+            self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), values)
             return
         if r is None:
             # Dropping it would cut the rail off from its source (F1, the input

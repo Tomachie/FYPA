@@ -593,3 +593,24 @@ def test_a_regulator_of_unknown_type_is_an_ideal_source_at_its_output():
                        "PDN1_N_NET": "GND", "PDN1_P_PINS": "5"}
     assert any(n.startswith("U3 (+1V8): not known whether linear or switching; modeled "
                             "as an ideal source") for n in notes)
+
+
+def test_a_series_diode_carries_its_forward_drop():
+    """A series diode is a SERIES with PDN_VF from its datasheet, not a 1 mOhm bridge; the
+    worst-case corner takes the maximum. With no forward voltage it stays bridged, said."""
+    pdn = copy.deepcopy(PDN)
+    diode = {"refdes": "D1", "class": "diode", "net_in": "+3V3", "net_out": "+3V3A",
+             "resistance_ohm": "unknown",
+             "datasheet_figures": [{"spec": "vf", "typ": "0.40", "unit": "V", "if": "1A"},
+                                   {"spec": "vf", "typ": "0.50", "unit": "V", "if": "3A"},
+                                   {"spec": "vfm", "max": "0.60", "unit": "V", "if": "3A"}]}
+    pdn["rails"][2]["series_from_parent"].append(diode)
+    p, notes = params(pdn=pdn)
+    assert (p["D1"]["PDN1_VF"], p["D1"]["PDN1_R"]) == ("0.35", "0.05")
+    assert any(n.startswith("D1: series diode, forward drop 0.35 V + 50 mOhm") for n in notes)
+    p, _ = params("max", pdn=pdn)
+    assert p["D1"]["PDN1_VF"] == "0.45"
+    diode["datasheet_figures"] = []
+    p, notes = params(pdn=pdn)
+    assert "PDN1_VF" not in p["D1"] and p["D1"]["PDN1_R"] == "0.001"
+    assert any("no forward voltage in the file" in n for n in notes)
