@@ -11,6 +11,7 @@ from fypa.viewer.assets import (
     _set_window_aumid,
     _set_windows_app_user_model_id,
 )
+from fypa.viewer import background
 from fypa.viewer.diagnostics import _maybe_show_mesh_failures
 from fypa.viewer.launcher import LauncherWindow
 from fypa.viewer.prefs import _apply_performance_prefs
@@ -78,7 +79,9 @@ def main(solution, warnings_list=None, metadata=None,
             )
     else:
         win = PdnViewer(solution, metadata=metadata)
-    win.show()
+    if (altium_import_target or {}).get("background"):
+        background.enable()
+    background.show(win)
     # Belt and braces: also push the .ico directly via WM_SETICON in
     # case Qt's icon path doesn't reach the taskbar, and bind our AUMID
     # to the window so Windows uses our icon for the taskbar grouping.

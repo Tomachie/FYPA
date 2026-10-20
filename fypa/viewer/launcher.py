@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from fypa.viewer import background
 from fypa.viewer.app_menus import _build_help_menu, _build_recent_projects_menu
 from fypa.viewer.assets import (
     _force_native_window_icon,
@@ -477,7 +478,7 @@ class LauncherWindow(_SettingsTabMixin, QMainWindow):
             box.setDetailedText(message)
         else:
             box.setText(message)
-        box.exec()
+        background.when_opened(self, box.exec)
 
     def _on_solve_finished(self, new_solution, metadata: dict,
                            loaded_project, new_settings) -> None:
@@ -489,18 +490,23 @@ class LauncherWindow(_SettingsTabMixin, QMainWindow):
         if new_win is not None:
             _record_recent_altium_from_metadata(metadata)
         _clear_pending_altium_recent(self)
-        # An Altium project with no SOURCE/REGULATOR loads as an editor-mode
-        # stub instead of failing — let the user know it's set up for manual
-        # marker placement rather than a finished solve.
-        _maybe_warn_needs_directives(new_win or self, new_solution)
-        _maybe_show_annotation_errors(new_win or self, metadata)
-        _maybe_show_mesh_failures(new_win or self, metadata)
-        # Rails with only sources or only sinks were skipped — tell the user.
-        _maybe_warn_open_loop_rails(new_win or self, metadata)
-        # Nets whose source & sink landed on disconnected copper — tell the user.
-        _maybe_warn_connectivity_breaks(new_win or self, metadata)
-        # Parts joining a solved rail to copper outside the FEM — advisory.
-        _maybe_warn_unannotated_bridges(new_win or self, metadata)
+        win = new_win or self
+        # Started in the background: these wait until the user opens the window.
+        background.when_opened(
+            win,
+            # An Altium project with no SOURCE/REGULATOR loads as an editor-mode
+            # stub instead of failing — let the user know it's set up for manual
+            # marker placement rather than a finished solve.
+            lambda: _maybe_warn_needs_directives(win, new_solution),
+            lambda: _maybe_show_annotation_errors(win, metadata),
+            lambda: _maybe_show_mesh_failures(win, metadata),
+            # Rails with only sources or only sinks were skipped — tell the user.
+            lambda: _maybe_warn_open_loop_rails(win, metadata),
+            # Nets whose source & sink landed on disconnected copper — tell the user.
+            lambda: _maybe_warn_connectivity_breaks(win, metadata),
+            # Parts joining a solved rail to copper outside the FEM — advisory.
+            lambda: _maybe_warn_unannotated_bridges(win, metadata),
+        )
 
     def _on_menu_open_solution(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
@@ -567,7 +573,10 @@ class LauncherWindow(_SettingsTabMixin, QMainWindow):
         # next event-loop tick (by which time new_win is fully shown).
         prev_quit = app.quitOnLastWindowClosed()
         app.setQuitOnLastWindowClosed(False)
-        new_win.show()
+        if background.active(self):
+            background.show(new_win)        # minimized, as the launcher still is
+        else:
+            new_win.show()
         _force_native_window_icon(new_win)
         _set_window_aumid(new_win)
         self.hide()

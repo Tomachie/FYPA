@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
+from fypa.viewer import background
 from fypa.viewer.diagnostics import _maybe_warn_connectivity_breaks, _maybe_warn_open_loop_rails
 from fypa.viewer.prefs import (
     _remove_recent_project_entry,
@@ -327,7 +328,13 @@ def _start_launcher_altium_solve(
     dlg.setAutoReset(False)
     dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
     dlg.canceled.connect(window._on_solve_cancelled)
-    dlg.show()
+    if background.active(window):
+        # Started in the background: the dialog would pop up over what the user is
+        # doing. Never shown (its progress updates would show it after the minimum
+        # duration).
+        dlg.setMinimumDuration(2**31 - 1)
+    else:
+        dlg.show()
     QApplication.processEvents()
     _sz = dlg.size()
     dlg.setFixedSize(int(_sz.width() * 1.44), _sz.height())
@@ -403,6 +410,10 @@ def _schedule_cli_altium_import(window, target: dict) -> None:
     adaptive = target.get("adaptive_regulator_gain")
     if adaptive is not None:
         window._cli_adaptive_regulator_gain = bool(adaptive)
+    if target.get("pdn_json"):
+        # The power tree the import loads (what Tomachie > Use pdn.json would set).
+        window._tomachie_pdn = (Path(target["pdn_json"]).resolve(),
+                                target.get("pdn_corner") or "typ")
     pcbdoc = target.get("pcbdoc_path")
     window._cli_import_pending = True
     _open_altium_project_at(

@@ -121,7 +121,8 @@ def build_report(
 
     if fypa_version is None:
         try:
-            from fypa.cli import __version__ as fypa_version
+            from fypa.fork import version
+            fypa_version = version()
         except Exception:
             fypa_version = "?"
 

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from fypa import fork
 from fypa.viewer.assets import _load_app_icon, _load_fypa_fangs_pixmap
 from fypa.viewer.prefs import (
     clear_recent_projects,
@@ -72,7 +73,8 @@ def _show_about_dialog(parent: QWidget) -> None:
     """Help > About — a small themed dialog showing the version and a
     clickable link to the project's GitHub page."""
     try:
-        from fypa.cli import __version__ as fypa_version
+        from fypa.fork import version
+        fypa_version = version()
     except Exception:
         fypa_version = "unknown"
     t = _T()
@@ -103,6 +105,10 @@ def _show_about_dialog(parent: QWidget) -> None:
         f"<p style='margin:12px 0 2px 0;'>"
         f"<a href='{_GITHUB_URL}' style='color:{t['accent']};'>{_GITHUB_URL}</a>"
         "</p>"
+        f"<p style='color:{t['fg_muted']}; margin:8px 0 2px 0;'>"
+        f"Fork with changes by {fork.BY}</p>"
+        f"<p style='margin:2px 0;'>"
+        f"<a href='{fork.REPO}' style='color:{t['accent']};'>{fork.REPO}</a></p>"
         "</div>"
     )
     body.setTextFormat(Qt.RichText)

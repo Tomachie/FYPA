@@ -107,6 +107,7 @@ else:
 
 
 __version__ = "0.1.0-dev"
+from fypa.fork import TAG as _FORK_TAG  # noqa: E402 - beside the version it is added to
 
 
 # --- argparse setup -----------------------------------------------------------
@@ -120,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-d", "--debug", action="store_true",
                    help="Enable DEBUG-level logging")
     p.add_argument("--version", action="version",
-                   version=f"FYPA {__version__}")
+                   version=f"FYPA {__version__}+{_FORK_TAG}")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -238,6 +239,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(Clean).")
     _add_mesh_args(sp, optional=True)
     _add_pcbdoc_arg(sp)
+    _add_pdn_json_arg(sp)
+    sp.add_argument("--background", action="store_true",
+                    help="Open minimized without taking the focus from what you are "
+                         "typing in; the import's dialogs wait until you open the window")
 
     sp = sub.add_parser("paraview", help="Export a pickled solution to ParaView VTK")
     sp.add_argument("solution", type=Path)
@@ -1345,6 +1350,9 @@ def do_gui(args: argparse.Namespace) -> int:
         # counterpart was passed; the launcher then uses the persisted
         # Settings-tab preference (same as File > Import).
         "adaptive_regulator_gain": adaptive,
+        "background": bool(getattr(args, "background", False)),
+        "pdn_json": getattr(args, "pdn_json", None),
+        "pdn_corner": getattr(args, "pdn_corner", "typ"),
     }
     # Only override Settings-tab mesh values when the user passed the flags.
     if getattr(args, "mesh_angle", None) is not None:
