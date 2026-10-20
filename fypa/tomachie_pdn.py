@@ -86,6 +86,19 @@ def _pads(refdes: str, pins: list[str]) -> list[str]:
     return [p[len(prefix):] if p.startswith(prefix) else p.rpartition("_")[2] for p in pins]
 
 
+def _return_part(load: dict) -> str | None:
+    """The part a load's current returns to ground through: a resistive path's last
+    part, the part a pull resistor pulls (``pull_to``, ``<refdes>_<pin>``), else the
+    load itself. None when the file names no such part."""
+    if load.get("role") == "resistive_path":
+        path = load.get("path_parts") or []
+        return path[-1] if path else None
+    if load.get("role") == "pull_resistor":
+        pin = load.get("pull_to") or ""
+        return pin.rsplit("_", 1)[0] if "_" in pin else None
+    return load["refdes"]
+
+
 def _printed_ohms(fig: dict, column: str) -> float | None:
     unit = str(fig.get("unit", "")).strip()
     scale = OHMS.get(unit, OHMS.get(unit.lower()))
@@ -810,6 +823,12 @@ class TomachiePdn:
         return pick
 
     def _sink(self, rail: str, l: dict):
+        # A load behind a ferrite / filter (input_net, spec revision 7): the parts
+        # between the rail and its pins are the rail's copper, solved whether or not
+        # the load's current is known.
+        for e in l.get("input_filter") or []:
+            if e.get("net_in") and e.get("net_out"):
+                self._series(e)
         amps = self._sink_current(l)
         if amps is None:
             why = l.get("load_dependent_reason") if l.get("load_dependent") else "current not known"
@@ -820,16 +839,17 @@ class TomachiePdn:
         pins = ",".join(_pads(l["refdes"], l.get("pins", [])))
         values = {"ROLE": "SINK", "I": f"{amps:g}", "P_NET": net, "N_NET": self.gnd,
                   "P_PINS": pins}
-        if l["role"] == "resistive_path":
-            # A resistor / LED chain reaches ground through its LAST part, not the one
-            # on the rail: the return terminal is that part's ground pads (PDN_N_DES).
-            # Two-terminal like every other sink - FYPA does not mix modes on a rail.
-            path = l.get("path_parts") or []
-            if not path:
-                self.notes.append(f"{l['refdes']} on {rail}: resistive path with no parts "
-                                  "listed to ground; no SINK")
+        if l["role"] in ("resistive_path", "pull_resistor"):
+            # A resistor / LED chain reaches ground through its LAST part, and a pull
+            # resistor through the part whose pin it pulls, not the one on the rail: the
+            # return terminal is that part's ground pads (PDN_N_DES). Two-terminal like
+            # every other sink - FYPA does not mix modes on a rail.
+            ret = _return_part(l)
+            if ret is None:
+                self.notes.append(f"{l['refdes']} on {rail}: {l['role'].replace('_', ' ')} "
+                                  "with no part listed it returns through; no SINK")
                 return
-            values["N_DES"] = path[-1]
+            values["N_DES"] = ret
         sm = l.get("supply_min")
         if isinstance(sm, dict) and _number(sm.get("volts")) is not None:
             values["MIN_V"] = f"{_number(sm['volts']):g}"
@@ -1033,7 +1053,7 @@ class TomachiePdn:
             if len(iso) != 1:
                 iso = sorted(pads.get(ref.upper(), set()) & others)
             if len(iso) != 1:
-                loads = {l["refdes"].upper() for rail in self.isolated[ref]
+                loads = {(_return_part(l) or l["refdes"]).upper() for rail in self.isolated[ref]
                          for l in self.rails.get(rail, {}).get("loads", [])}
                 shared = set.intersection(*[pads.get(d, set()) & others for d in loads])                     if loads else set()
                 iso = sorted(shared)

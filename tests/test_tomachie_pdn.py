@@ -619,7 +619,8 @@ def test_a_series_diode_carries_its_forward_drop():
 def test_isolated_converter_takes_the_ground_its_rail_is_stated_to_return_on():
     """With pads on two isolated grounds, the board alone cannot say which one the output
     side returns on; the rail's ground in the file (spec revision 7) does."""
-    board = dict(ISO_BOARD, U4=ISO_BOARD["U4"] + ["GND_X"], U9=ISO_BOARD["U9"] + ["GND_X"])
+    board = dict(ISO_BOARD, U4=ISO_BOARD["U4"] + ["GND_X"], U9=ISO_BOARD["U9"] + ["GND_X"],
+                 R21=ISO_BOARD["R21"] + ["GND_X"])
     pdn = _with_isolated(efficiency=0.8)
     pdn["ground_nets"] = list(pdn.get("ground_nets", ["GND"])) + ["GND_ISO", "GND_X"]
     reader = TomachiePdn(copy.deepcopy(pdn), "typ")
@@ -632,6 +633,37 @@ def test_isolated_converter_takes_the_ground_its_rail_is_stated_to_return_on():
     notes += reader.place_on_board(p, _board(board))
     assert p["U4"]["PDN1_OUT_N_NET"] == "GND_ISO"
     assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
+
+
+def test_a_pull_resistor_returns_through_the_part_it_pulls():
+    """R20 pulls U9_3 up: its current returns through U9, so U9's ground is its return
+    and an isolated rail's ground is still found from the loads."""
+    pdn = _with_isolated(efficiency=0.8)
+    iso5 = next(r for r in pdn["rails"] if r["name"] == "ISO5")
+    iso5["loads"][1] = {"role": "pull_resistor", "refdes": "R20", "pins": ["R20_1"],
+                        "pull_to": "U9_3", "current": {"amps": 0.0005}}
+    board = dict(ISO_BOARD, U4=["VBUS", "GND", "ISO5"], R20=["ISO5", "PULLED"])
+    reader = TomachiePdn(copy.deepcopy(pdn), "typ")
+    p, notes = reader.parameters()
+    notes += reader.place_on_board(p, _board(board))
+    assert (p["R20"]["PDN1_N_DES"], p["R20"]["PDN1_N_NET"]) == ("U9", "GND_ISO")
+    assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
+
+
+def test_a_load_behind_a_ferrite_solves_the_ferrite():
+    """U9's supply pin sits behind FB3 (input_net / input_filter): FB3 is a SERIES at its
+    DC resistance, also when U9's current is not known."""
+    pdn = _with_isolated(efficiency=0.8)
+    iso5 = next(r for r in pdn["rails"] if r["name"] == "ISO5")
+    fb3 = {"refdes": "FB3", "class": "ferrite", "net_in": "ISO5", "net_out": "NetC9_2",
+           "resistance_ohm": "unknown",
+           "datasheet_figures": [{"spec": "dcr", "max": "0.080", "unit": "ohm"}]}
+    for current in ({"amps": 0.05}, "unknown"):
+        iso5["loads"][0] = {"role": "ic", "refdes": "U9", "pins": ["U9_1"], "current": current,
+                            "input_net": "NetC9_2", "input_filter": [fb3]}
+        p, _ = params(pdn=copy.deepcopy(pdn))
+        assert (p["FB3"]["PDN1_ROLE"], p["FB3"]["PDN1_P_NET"], p["FB3"]["PDN1_N_NET"]) ==             ("SERIES", "ISO5", "NetC9_2")
+        assert p["FB3"]["PDN1_R"] == "0.08"
 
 
 def test_a_series_diode_with_a_vf_curve_is_fitted_on_it():
