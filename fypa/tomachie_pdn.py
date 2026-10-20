@@ -33,11 +33,16 @@ Mapping:
   a share of the regulator's input current, which stays whole on its ``regulator``
   entry;
 * a load -> ``SINK`` with ``PDN_I`` (typical, or maximum with ``corner="max"``) and
-  ``PDN_MIN_V`` from the datasheet minimum supply voltage.
+  ``PDN_MIN_V`` from the datasheet minimum supply voltage; a load that draws what it
+  drives -> its own (static) datasheet current, the least it draws;
+* with ``corner="max"`` a regulator's ``PDN_V`` is the low end of its output band
+  (``regulator_band``: its datasheet accuracy with its feedback divider's tolerance,
+  at the board's temperature grade where given), as a source is driven at its minimum.
 
 Nothing is guessed. A load whose current the file does not know gets no SINK (FYPA
 has no "not known" current), and every such omission is returned as a note, so the
-user sees that the affected rail's drop is a lower bound.
+user sees that the affected rail's drop is a lower bound. A load already out of its
+supply range before any copper (the file's ``copper_margin``) is named.
 """
 
 from __future__ import annotations
@@ -91,14 +96,47 @@ def _printed_ohms(fig: dict, column: str) -> float | None:
     return None if scale is None else abs(value) * scale
 
 
+# A 0 ohm jumper's own figure: the most it may measure.
+JUMPER_SPECS = ("jumper_resistance",)
+
+
+def _prefix(spec, names=DC_RESISTANCE_SPECS) -> str | None:
+    """"" when a figure's spec is one of ``names``; the prefix when it is one after a
+    prefix ("BLM18PG121SH1_dc_resistance": a series datasheet's figure for one part of
+    it), never the bare "resistance" after one ("insulation_resistance"); else None."""
+    spec = str(spec or "").lower()
+    if spec in names:
+        return ""
+    for s in names:
+        if s != "resistance" and spec.endswith("_" + s):
+            return spec[:-len(s) - 1]
+    return None
+
+
+def _own_figures(element: dict, names=DC_RESISTANCE_SPECS) -> list[dict]:
+    """The DC-resistance figures for this part: a series datasheet's figures named after
+    another part of the series are left out when one is named after this part."""
+    figs = [(f, _prefix(f.get("spec"), names)) for f in element.get("datasheet_figures", [])]
+    figs = [(f, p) for f, p in figs if p is not None]
+    pn = str(element.get("part_number") or "").lower()
+    if len({p for _, p in figs if p}) > 1 and pn:
+        own = [(f, p) for f, p in figs if not p or p in pn or pn in p]
+        figs = own if any(p for _, p in own) else figs
+    return [f for f, _ in figs]
+
+
 def dc_resistance(element: dict) -> tuple[float | None, float | None]:
     """(typical, maximum) DC resistance of a series part, ohms. Only figures that ARE a
-    DC resistance count: a ferrite's impedance at 100 MHz is in ohms too."""
+    DC resistance count: a ferrite's impedance at 100 MHz is in ohms too. A 0 ohm
+    jumper's maximum is its datasheet's jumper resistance, where printed."""
     own = _number(element.get("resistance_ohm"))
     if own is not None:
-        return own, None
-    figs = [f for f in element.get("datasheet_figures", [])
-            if str(f.get("spec", "")).lower() in DC_RESISTANCE_SPECS]
+        if own != 0:
+            return own, None
+        jumper = [v for f in _own_figures(element, JUMPER_SPECS) for c in ("max", "typ")
+                  if (v := _printed_ohms(f, c)) is not None]
+        return 0.0, (max(jumper) if jumper else None)
+    figs = _own_figures(element)
     typs = [v for v in (_printed_ohms(f, "typ") for f in figs) if v is not None]
     maxs = [v for v in (_printed_ohms(f, "max") for f in figs) if v is not None]
     return (max(typs) if typs else None), (max(maxs) if maxs else None)
@@ -253,8 +291,8 @@ class TomachiePdn:
 
     def _supply_volts(self, rail_name: str | None) -> float | None:
         """The voltage a rail sits at in this corner: a branch's is its parent's (up to
-        the source); a source's per :meth:`_source_volts`; a regulator's output stays at
-        its set voltage, so its nominal."""
+        the source); a source's per :meth:`_source_volts`; a regulator's per
+        :meth:`_regulated_volts`."""
         if self.corner != "max" or rail_name not in self.rails:
             return _number(self.rails.get(rail_name, {}).get("voltage", {}).get("nominal"))
         seen = set()
@@ -267,8 +305,26 @@ class TomachiePdn:
             if role == "parent_rail" and r.get("parent_rail") in self.rails:
                 rail_name = r["parent_rail"]
                 continue
+            if role == "regulator":
+                return self._regulated_volts(r)
             return _number(r.get("voltage", {}).get("nominal"))
         return None
+
+    def _regulated_volts(self, rail: dict) -> float | None:
+        """A regulator's output for this corner: its set voltage (nominal), or in the
+        worst case the low end of its output band - at the board's temperature grade,
+        else at 25 C - when the file gives one."""
+        nominal = _number(rail.get("voltage", {}).get("nominal"))
+        band = rail.get("regulator_band")
+        if self.corner != "max" or not isinstance(band, dict) or nominal is None:
+            return nominal
+        for key in ("at_grade", "at_25c"):
+            b = band.get(key)
+            ends = [x for x in (_number(b.get("min_v")), _number(b.get("max_v")))
+                    if x is not None] if isinstance(b, dict) else []
+            if ends:
+                return min(ends + [nominal], key=abs)
+        return nominal
 
     def _sources(self):
         for name, r in self.rails.items():
@@ -417,7 +473,11 @@ class TomachiePdn:
                 self.notes.append(f"{src.get('refdes')} ({name}): {why}; no REGULATOR, so "
                                   f"{name} is not driven")
                 continue
-            values = {"ROLE": "REGULATOR", "V": f"{v:g}", "REGULATOR_TYPE": kind,
+            v_set = self._regulated_volts(r)
+            if v_set != v:
+                self.notes.append(f"Rail {name}: worst case, regulator {reg['refdes']} at the "
+                                  f"low end of its output band {v_set:.4g} V (set {v:g} V)")
+            values = {"ROLE": "REGULATOR", "V": f"{v_set:g}", "REGULATOR_TYPE": kind,
                       "OUT_P_NET": src.get("output_net") or name, "OUT_N_NET": self.gnd,
                       "IN_P_NET": vin, "IN_N_NET": self.gnd,
                       "OUT_P_PINS": ",".join(_pads(reg["refdes"], src.get("pins", []))),
@@ -702,9 +762,16 @@ class TomachiePdn:
                               "so no SINK: " + ", ".join(not_supplied))
 
     def _sink_current(self, l: dict) -> float | None:
-        if l.get("load_dependent"):
-            return None
         pick = self._corner_or_max(l, "current")
+        if l.get("load_dependent"):
+            # Its datasheet current is its own (static) one: the least it draws, with what
+            # it drives on top. Solved, never left out.
+            if pick is not None:
+                self.notes.append(f"{l['refdes']}: draws what it drives "
+                                  f"({l.get('load_dependent_reason', 'no reason given')}); its "
+                                  f"own current {pick * 1e6:.4g} uA is used, so the rail's drop "
+                                  "is a lower bound")
+            return pick
         if pick is not None and l["role"] == "ic_with_regulator":
             reg = self._corner_or_max(l, "regulator_input")
             pick = None if reg is None else pick + reg
@@ -745,7 +812,24 @@ class TomachiePdn:
         sm = l.get("supply_min")
         if isinstance(sm, dict) and _number(sm.get("volts")) is not None:
             values["MIN_V"] = f"{_number(sm['volts']):g}"
+        self._out_before_copper(rail, l)
         self.ch.add(l["refdes"], ("SINK", net), values)
+
+    def _out_before_copper(self, rail: str, l: dict):
+        """Name a load the file finds out of its supply range before any copper: its
+        rail's lowest output, less the series parts, below its minimum supply, or its
+        rail's highest output above its maximum."""
+        cm = l.get("copper_margin")
+        if not isinstance(cm, dict):
+            return
+        low, high = _number(cm.get("v")), _number(cm.get("high_room_v"))
+        if low is not None and low < 0:
+            self.notes.append(f"{l['refdes']} on {rail}: {-low * 1e3:.4g} mV below its minimum "
+                              "supply before any copper (its regulator's output band against "
+                              "its datasheet)")
+        if high is not None and high < 0:
+            self.notes.append(f"{l['refdes']} on {rail}: {-high * 1e3:.4g} mV above its maximum "
+                              "supply at its rail's highest output")
 
     # ------------------------------------------------------------ the board
     def series_elements(self) -> dict[str, dict]:

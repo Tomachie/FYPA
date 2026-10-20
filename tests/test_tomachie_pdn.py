@@ -646,3 +646,58 @@ def test_a_series_diode_with_a_vf_curve_is_fitted_on_it():
     p, notes = params(pdn=pdn)
     assert (p["D1"]["PDN1_VF"], p["D1"]["PDN1_R"]) == ("0.35", "0.05")
     assert any("Vf-vs-If curve (TJ=25C)" in n for n in notes)
+
+
+def test_worst_case_runs_a_regulator_at_the_low_end_of_its_band():
+    """U2's +3V3 at 3.21 V in the worst case (its band at the temperature grade), at 3.3 V
+    nominally; a rail with no band stays at its set voltage."""
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["regulator_band"] = {
+        "basis": "divider", "at_25c": {"min_v": 3.25, "max_v": 3.35},
+        "at_grade": {"min_v": 3.21, "max_v": 3.39}, "grade_c": 85.0}
+    nominal, _ = params(pdn=pdn)
+    worst, notes = params("max", pdn=pdn)
+    assert (nominal["U2"]["PDN1_V"], worst["U2"]["PDN1_V"]) == ("3.3", "3.21")
+    assert worst["U3"]["PDN1_V"] == "1.8"
+    assert any("Rail +3V3: worst case, regulator U2 at the low end of its output band "
+               "3.21 V (set 3.3 V)" in n for n in notes)
+
+
+def test_a_0_ohm_jumper_takes_its_jumper_resistance_in_the_worst_case():
+    pdn = copy.deepcopy(PDN)
+    r9 = pdn["rails"][2]["series_from_parent"][1]
+    r9["datasheet_figures"] = [{"spec": "jumper_resistance", "max": "20", "unit": "mohm"},
+                               {"spec": "resistance", "max": "100M", "unit": "ohm"}]
+    nominal, _ = params(pdn=pdn)
+    worst, _ = params("max", pdn=pdn)
+    assert "R9" not in nominal                      # a 0 ohm link: FYPA bridges it
+    assert worst["R9"]["PDN1_R"] == "0.02"
+
+
+def test_a_dc_resistance_named_after_its_part_is_taken_and_its_siblings_are_not():
+    figs = [{"spec": "BLM18PG121SH1_dc_resistance", "max": "0.05", "unit": "ohm"},
+            {"spec": "BLM18PG221SN1_dc_resistance", "max": "0.10", "unit": "ohm"},
+            {"spec": "BLM18PG121SH1_impedance_100MHz", "typ": "120", "unit": "ohm"},
+            {"spec": "insulation_resistance", "typ": "10", "unit": "Mohm"}]
+    assert dc_resistance({"resistance_ohm": "unknown", "part_number": "BLM18PG121SH1D",
+                          "datasheet_figures": figs}) == (None, pytest.approx(0.05))
+
+
+def test_a_part_that_draws_what_it_drives_sinks_its_own_current():
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"][3].update(current={"amps": 6e-6, "basis": "max"},
+                                       load_dependent=True,
+                                       load_dependent_reason="static figure")
+    p, notes = params(pdn=pdn)
+    assert p["U8"]["PDN1_I"] == "6e-06"
+    assert any("U8: draws what it drives (static figure); its own current 6 uA is used" in n
+               for n in notes)
+
+
+def test_a_load_out_of_range_before_any_copper_is_named():
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"][0]["copper_margin"] = {"v": -0.05, "high_room_v": -0.02}
+    _, notes = params(pdn=pdn)
+    assert any("U5 on +3V3: 50 mV below its minimum supply before any copper" in n
+               for n in notes)
+    assert any("U5 on +3V3: 20 mV above its maximum supply" in n for n in notes)
