@@ -307,6 +307,7 @@ class TomachiePdn:
         self.closed_returns: set = set()   # sources whose file return reaches self.gnd
         self.reg_outputs: dict[tuple[str, str], str] = {}  # (reg, output pins) -> first rail
         self.isolated: dict[str, list[str]] = {}   # isolated converter -> its output rails
+        self.pull_sinks: dict[str, str] = {}       # pull resistor -> the rail it pulls from
         self.extra_inputs: dict[tuple[str, str], list] = {}  # (reg, rail) -> other input rails
 
     # ------------------------------------------------------------ roles
@@ -855,6 +856,8 @@ class TomachiePdn:
             values["MIN_V"] = f"{_number(sm['volts']):g}"
         self._out_before_copper(rail, l)
         self.ch.add(l["refdes"], ("SINK", net), values)
+        if l["role"] == "pull_resistor":
+            self.pull_sinks[l["refdes"].upper()] = rail
 
     def _out_before_copper(self, rail: str, l: dict):
         """Name a load the file finds out of its supply range before any copper: its
@@ -1009,6 +1012,32 @@ class TomachiePdn:
                     notes.append(f"{ref}: input filter {par} {n} -> {back}")
                 n = back
         notes.extend(self._isolated_grounds(params, pads))
+        notes.extend(self._unknown_pull_returns(params, pads))
+        return notes
+
+    def _unknown_pull_returns(self, params: dict[str, dict[str, str]], pads) -> list[str]:
+        """A pull resistor's current returns through whatever drives the part it pulls:
+        when that part has no pad on the return ground (a solid-state relay's or an
+        opto's LED input), the return is not known and the SINK is left out."""
+        notes: list[str] = []
+        for des, ch in params.items():
+            rail = self.pull_sinks.get(des.upper())
+            if rail is None:
+                continue
+            for k, role in list(ch.items()):
+                if not (k.endswith("_ROLE") and role == "SINK"):
+                    continue
+                pre = k[:-len("ROLE")]
+                ret, gnd = ch.get(pre + "N_DES", des), ch.get(pre + "N_NET")
+                if gnd in pads.get(ret.upper(), set()):
+                    continue
+                for key in [x for x in ch if x.startswith(pre)]:
+                    del ch[key]
+                notes.append(f"{des}: pulls {ret}, which has no pad on {gnd}; its current "
+                             f"returns through what drives {ret}, not known, so no SINK and "
+                             f"{rail}'s drop is a lower bound")
+        for des in [d for d, ch in params.items() if not ch]:
+            del params[des]
         return notes
 
     def _isolated_domain(self, ref: str) -> set:

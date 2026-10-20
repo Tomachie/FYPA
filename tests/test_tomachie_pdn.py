@@ -650,6 +650,21 @@ def test_a_pull_resistor_returns_through_the_part_it_pulls():
     assert any("U4: isolated converter, output side returns on GND_ISO" in n for n in notes)
 
 
+def test_a_pull_into_a_part_with_no_ground_pad_has_an_unknown_return():
+    """R20 drives a solid-state relay's LED input (K1_1): the current comes back through
+    what drives K1, which the file does not say - no SINK, and a note, not an error."""
+    pdn = _with_isolated(efficiency=0.8)
+    iso5 = next(r for r in pdn["rails"] if r["name"] == "ISO5")
+    iso5["loads"][1] = {"role": "pull_resistor", "refdes": "R20", "pins": ["R20_1"],
+                        "pull_to": "K1_1", "current": {"amps": 0.005}}
+    board = dict(ISO_BOARD, R20=["ISO5", "LED_A"], K1=["LED_A", "LED_K", "OUT_A", "OUT_B"])
+    reader = TomachiePdn(copy.deepcopy(pdn), "typ")
+    p, notes = reader.parameters()
+    notes += reader.place_on_board(p, _board(board))
+    assert "R20" not in p
+    assert any("R20: pulls K1, which has no pad on" in n and "lower bound" in n for n in notes)
+
+
 def test_a_load_behind_a_ferrite_solves_the_ferrite():
     """U9's supply pin sits behind FB3 (input_net / input_filter): FB3 is a SERIES at its
     DC resistance, also when U9's current is not known."""
