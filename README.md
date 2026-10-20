@@ -1,12 +1,9 @@
 # FYPA - FEM Y-parameter Power Analyser
 
-> **This is a fork of [anarthrous-eda/FYPA](https://github.com/anarthrous-eda/FYPA).** It
-> follows its `main` and adds a Tomachie power-tree import: `--pdn-json <design>.pdn.json`
-> (with `--pdn-corner typ|max`) sets PDN_* sources, regulators, series parts and sinks for
-> every component the schematic does not annotate itself, from the board's datasheet
-> values. How FYPA's results compare with KiPI's on the same board, and why they differ
-> where they do: [docs/kipi-fypa-comparison.md](docs/kipi-fypa-comparison.md). The rest of
-> this README is the original project's.
+> **This is a fork of [anarthrous-eda/FYPA](https://github.com/anarthrous-eda/FYPA)**,
+> with changes by Tomachie LLC: an import of Tomachie power-tree files
+> (`--pdn-json <design>.pdn.json`) and fixes. It follows its `main`; the rest of this
+> README is the original project's.
 
 Power-Delivery-Network (PDN) analysis for Altium and Gerber PCB designs.
 Extracts copper geometry directly from a `.PrjPcb` project or from a Gerber
@@ -55,23 +52,8 @@ or voltage), point this tool at the `.PrjPcb`, and it:
 
 ## Download (prebuilt Windows binary)
 
-If you just want to run the tool — no Python install, no git clone — grab the
-latest packaged build from the
-[Releases page](https://github.com/anarthrous-eda/FYPA/releases/latest):
-
-1. Download `FYPA_v<version>.zip` from the latest release's *Assets*.
-2. Extract it anywhere permanent (e.g. `C:\Tools\FYPA\`).
-3. Double-click `FYPA.exe` inside the extracted folder.
-
-On first launch Windows SmartScreen will show a blue warning — click
-**"More info"** then **"Run anyway"** (the exe is unsigned; this is a
-one-time prompt per machine).
-
-> **Keep `FYPA.exe` and the `_internal\` folder together** — moving the exe
-> alone will break it. Create a desktop shortcut rather than moving the exe.
-
-To build the executable yourself, see
-[Building a standalone executable](#building-a-standalone-executable).
+This fork publishes no prebuilt build. Run it from source (below); the original
+project's builds do not have this fork's changes.
 
 ## Installation (from source)
 
