@@ -765,3 +765,17 @@ def test_a_load_out_of_range_before_any_copper_is_named():
     assert any("U5 on +3V3: 50 mV below its minimum supply before any copper" in n
                for n in notes)
     assert any("U5 on +3V3: 20 mV above its maximum supply" in n for n in notes)
+
+
+def test_a_figure_named_for_another_pin_is_not_the_parts_resistance():
+    """A load switch's FLAG FET (flg_on_resistance, 30 ohm) is not its switch (rds_on);
+    a relay's contact resistance is its DC resistance, its coil's is not."""
+    from fypa.tomachie_pdn import dc_resistance
+    switch = {"resistance_ohm": "unknown", "datasheet_figures": [
+        {"spec": "flg_on_resistance", "typ": "30", "max": "60", "unit": "Ω"},
+        {"spec": "rds_on", "typ": "75", "max": "95", "unit": "mΩ"}]}
+    assert dc_resistance(switch) == (pytest.approx(0.075), pytest.approx(0.095))
+    relay = {"resistance_ohm": "unknown", "datasheet_figures": [
+        {"spec": "coil_resistance", "typ": "208", "unit": "ohm"},
+        {"spec": "contact_resistance", "max": "100", "unit": "mΩ"}]}
+    assert dc_resistance(relay) == (None, pytest.approx(0.1))
