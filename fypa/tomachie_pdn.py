@@ -61,6 +61,9 @@ SCHEMA = "tomachie-pdn"
 SCHEMA_VERSION = 1
 SOURCE_ROLES = ("board_input", "battery", "generator")
 REGULATOR_TYPE = {"linear": "LDO", "switching": "SMPS", "isolated": "SMPS"}
+# A part the file lists as not fitted whose footprint is still on the board: an open.
+NOT_FITTED_OHMS = 5e8
+OPEN_CLASSES = ("capacitor", "device", "connector")
 DC_RESISTANCE_SPECS = ("dcr", "dc_resistance", "resistance", "rds_on", "jumper_resistance",
                        "cold_resistance", "r_dc", "rdc", "on_resistance")
 OHMS = {"ohm": 1.0, "ohms": 1.0, "Ω": 1.0, "mohm": 1e-3, "mΩ": 1e-3,
@@ -1119,7 +1122,30 @@ class TomachiePdn:
         self._power()
         self._branches()
         self._loads()
+        self._not_fitted()
         return dict(self.ch.params), self.notes
+
+    def _not_fitted(self):
+        """A part the file lists as not fitted (spec revision 7, ``not_fitted``) still has
+        its footprint on the board: a two-net resistor, inductor or jumper is an open,
+        a SERIES of NOT_FITTED_OHMS; a capacitor, or a part on more nets, stays open."""
+        opened, left = [], []
+        for e in self.pdn.get("not_fitted") or []:
+            ref, nets = e.get("refdes", ""), e.get("nets") or []
+            if not ref:
+                continue
+            if e.get("class") in OPEN_CLASSES or len(nets) != 2 or nets[0] == nets[1]:
+                left.append(ref)
+                continue
+            self.ch.add(ref, ("SERIES", nets[0], nets[1]), {
+                "ROLE": "SERIES", "R": f"{NOT_FITTED_OHMS:g}", "P_NET": nets[0],
+                "N_NET": nets[1]})
+            opened.append(ref)
+        if opened:
+            self.notes.append(f"Not fitted, solved as open ({NOT_FITTED_OHMS:g} Ohm): "
+                              + ", ".join(opened))
+        if left:
+            self.notes.append("Not fitted, left out: " + ", ".join(left))
 
 
 def read_pdn_parameters(path, corner: str = "typ") -> tuple[dict[str, dict[str, str]], list[str]]:

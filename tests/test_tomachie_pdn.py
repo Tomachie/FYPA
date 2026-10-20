@@ -665,6 +665,23 @@ def test_a_pull_into_a_part_with_no_ground_pad_has_an_unknown_return():
     assert any("R20: pulls K1, which has no pad on" in n and "lower bound" in n for n in notes)
 
 
+def test_a_part_not_fitted_is_an_open():
+    """not_fitted (spec revision 7): a two-net resistor is a 500 Mohm SERIES; a capacitor
+    and a part on more nets are left out."""
+    pdn = copy.deepcopy(PDN)
+    pdn["not_fitted"] = [
+        {"refdes": "R9", "class": "resistor", "value": "", "nets": ["+3V3", "SIG"],
+         "basis": "adhoc"},
+        {"refdes": "C9", "class": "capacitor", "value": "1uF", "nets": ["+3V3", "GND"],
+         "basis": "variant"},
+        {"refdes": "U9", "class": "device", "value": "", "nets": ["+3V3", "GND", "SIG"],
+         "basis": "variant"}]
+    p, notes = params(pdn=pdn)
+    assert (p["R9"]["PDN1_ROLE"], p["R9"]["PDN1_R"]) == ("SERIES", "5e+08")
+    assert "C9" not in p and "U9" not in p
+    assert any("Not fitted, left out: C9, U9" in n for n in notes)
+
+
 def test_a_load_behind_a_ferrite_solves_the_ferrite():
     """U9's supply pin sits behind FB3 (input_net / input_filter): FB3 is a SERIES at its
     DC resistance, also when U9's current is not known."""
