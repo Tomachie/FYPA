@@ -380,9 +380,9 @@ def test_advisory_names_the_net_that_is_missing_not_the_live_rail():
     """The excluded copper is whichever end is *not* already solved."""
     import dataclasses
     proj = _bridge_proj("FB1", {})
-    # A second ferrite from SHIELD back to VBUS: the excluded copper carries
-    # current in parallel, so it is an advisory (one ferrite alone is a dead
-    # end and is not).
+    # A second ferrite from SHIELD to GND: the excluded copper joins two solved
+    # nets and carries current, so it is an advisory (one ferrite alone, or two
+    # back to the same net, is a dead end and is not).
     proj = dataclasses.replace(
         proj,
         sch_components=proj.sch_components + (RawSchComponent(
@@ -391,7 +391,7 @@ def test_advisory_names_the_net_that_is_missing_not_the_live_rail():
         pcb_components=proj.pcb_components + (RawPcbComponent(
             designator="FB2", center=Pt2D(5, 0), rotation_deg=0.0,
             layer_name="TOP", footprint="0603", source_designator="FB2"),),
-        pads=proj.pads + (_pad(2, "1", 1, 5.0), _pad(2, "2", 2, 6.0)),
+        pads=proj.pads + (_pad(2, "1", 1, 5.0), _pad(2, "2", 0, 6.0)),
     )
     loaded, rec = _one_candidate(proj, "FB1")
 
@@ -482,3 +482,11 @@ def test_copper_rejoining_the_rail_is_still_reported():
             _rec("FB1", 5, 6, active)]
     _clear_dead_end_impacts(recs, active)
     assert recs[0]["impact"] and recs[1]["impact"]
+
+
+def test_two_resistors_from_one_node_to_the_same_ground_are_a_dead_end():
+    from fypa.altium.loader import _clear_dead_end_impacts
+    active = {0}
+    recs = [_rec("R33", 5, 0, active), _rec("R34", 5, 0, active)]
+    _clear_dead_end_impacts(recs, active)
+    assert not recs[0]["impact"] and not recs[1]["impact"]

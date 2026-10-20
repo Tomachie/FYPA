@@ -3988,9 +3988,10 @@ def _clear_dead_end_impacts(records: list[dict], active) -> None:
 
     Copper left out of the FEM only changes the rail's answer when current
     can flow through it and back: the excluded nets, joined to one another by
-    unmodelled parts, must reach solved rails through two or more parts. A
-    filtered branch behind a single ferrite carries no parallel current, so
-    leaving it out changes nothing and the row is not an advisory.
+    unmodelled parts, must reach two or more different solved nets. A filtered
+    branch behind a single ferrite, or resistors from one node to the same
+    ground, carry no parallel current, so leaving them out changes nothing and
+    the row is not an advisory.
     """
     parent: dict[int, int] = {}
 
@@ -4005,17 +4006,17 @@ def _clear_dead_end_impacts(records: list[dict], active) -> None:
         a, b = rec["_pair"]
         if rec["state"] == "unmodelled" and a not in active and b not in active:
             parent[find(a)] = find(b)
-    links: dict[int, int] = {}
+    links: dict[int, set] = {}
     for rec in records:
         if rec["excluded_net"]:
             a, b = rec["_pair"]
             island = find(b if a in active else a)
-            links[island] = links.get(island, 0) + 1
+            links.setdefault(island, set()).add(a if a in active else b)
     for rec in records:
         if not rec["excluded_net"]:
             continue
         a, b = rec["_pair"]
-        if links[find(b if a in active else a)] < 2:
+        if len(links[find(b if a in active else a)]) < 2:
             rec["impact"] = ""
             rec["excluded_net"] = ""
             rec["why"] = ("joins a solved rail to a dead-end branch - no "
