@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QMessageBox
 
 from fypa.viewer.list_dialog import show_list_notice
+from fypa.viewer.prefs import load_show_bridge_notice, save_show_bridge_notice
 
 from fypa.viewer.overlays import _overlay_circle_ring
 
@@ -328,7 +329,7 @@ def _maybe_warn_unannotated_bridges(parent_win, metadata) -> None:
     if not isinstance(metadata, dict):
         return
     bridges = metadata.get("unannotated_bridges") or []
-    if not bridges:
+    if not bridges or not load_show_bridge_notice():
         return
     show_list_notice(
         parent_win, "Unannotated net bridges",
@@ -340,4 +341,5 @@ def _maybe_warn_unannotated_bridges(parent_win, metadata) -> None:
         "This is advisory \u2014 nothing was changed. If a part conducts "
         "at DC, annotate it in Altium with PDN_ROLE=SERIES and PDN_R set to "
         "its real DC resistance, then re-import. Genuine 0 \u03a9 links and "
-        "Net Ties are already bridged automatically.")
+        "Net Ties are already bridged automatically.",
+        on_dont_show=lambda: save_show_bridge_notice(False))

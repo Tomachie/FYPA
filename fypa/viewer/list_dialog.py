@@ -6,7 +6,7 @@ skipped directives or unannotated bridges)."""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QStyle, QVBoxLayout,
 )
 
@@ -15,7 +15,9 @@ WIDTH_PX = 760
 
 
 def show_list_notice(parent, title: str, intro: str, items: list[str], outro: str = "",
-                     warning: bool = False) -> None:
+                     warning: bool = False, on_dont_show=None) -> None:
+    """``on_dont_show`` adds a "Don't show this again" box; it is called with
+    no arguments when the box is ticked and the dialog is closed."""
     dlg = QDialog(parent)
     dlg.setWindowTitle(title)
     outer = QVBoxLayout(dlg)
@@ -41,6 +43,10 @@ def show_list_notice(parent, title: str, intro: str, items: list[str], outro: st
         tail = QLabel(outro)
         tail.setWordWrap(True)
         outer.addWidget(tail)
+    dont_show = None
+    if on_dont_show is not None:
+        dont_show = QCheckBox("Don't show this again (Settings > General options)")
+        outer.addWidget(dont_show)
     buttons = QDialogButtonBox(QDialogButtonBox.Ok)
     buttons.accepted.connect(dlg.accept)
     outer.addWidget(buttons)
@@ -59,6 +65,8 @@ def show_list_notice(parent, title: str, intro: str, items: list[str], outro: st
     lst.setFixedHeight(list_h)
     dlg.resize(WIDTH_PX, others + list_h)
     dlg.exec()
+    if dont_show is not None and dont_show.isChecked():
+        on_dont_show()
 
 
 __all__ = ["show_list_notice"]

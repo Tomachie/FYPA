@@ -3973,10 +3973,54 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
             "x_mm": float(anchor.center.x),
             "y_mm": float(anchor.center.y),
             "layer_id": int(anchor.layer_id),
+            "_pair": (pair[0], pair[1]),
         })
 
+    _clear_dead_end_impacts(out, active)
+    for rec in out:
+        del rec["_pair"]
     out.sort(key=lambda r: (not r["impact"], r["designator"]))
     return out
+
+
+def _clear_dead_end_impacts(records: list[dict], active) -> None:
+    """Drop the impact of a bridge whose excluded copper is a dead end.
+
+    Copper left out of the FEM only changes the rail's answer when current
+    can flow through it and back: the excluded nets, joined to one another by
+    unmodelled parts, must reach solved rails through two or more parts. A
+    filtered branch behind a single ferrite carries no parallel current, so
+    leaving it out changes nothing and the row is not an advisory.
+    """
+    parent: dict[int, int] = {}
+
+    def find(n: int) -> int:
+        parent.setdefault(n, n)
+        while parent[n] != n:
+            parent[n] = parent[parent[n]]
+            n = parent[n]
+        return n
+
+    for rec in records:
+        a, b = rec["_pair"]
+        if rec["state"] == "unmodelled" and a not in active and b not in active:
+            parent[find(a)] = find(b)
+    links: dict[int, int] = {}
+    for rec in records:
+        if rec["excluded_net"]:
+            a, b = rec["_pair"]
+            island = find(b if a in active else a)
+            links[island] = links.get(island, 0) + 1
+    for rec in records:
+        if not rec["excluded_net"]:
+            continue
+        a, b = rec["_pair"]
+        if links[find(b if a in active else a)] < 2:
+            rec["impact"] = ""
+            rec["excluded_net"] = ""
+            rec["why"] = ("joins a solved rail to a dead-end branch - no "
+                          "current returns through it, so the solve is "
+                          "unchanged")
 
 
 def _flag_unannotated_bridges(loaded: LoadedProject) -> list[str]:
