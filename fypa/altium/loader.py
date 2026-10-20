@@ -59,6 +59,8 @@ from fypa.altium_geometry import (
 )
 from pdnsolver import problem as _pp
 
+from fypa.altium import diode_curve as _diode_curve
+
 
 # Via barrel resistance is computed per-via, per-hop from physical geometry:
 #
@@ -2184,6 +2186,9 @@ def solve_problem_adaptive(
         bool(adaptive_regulator_gain)
         and has_adaptive_smps_regulators(loaded)
     )
+    # Diodes with a Vf-vs-If curve are moved onto it between solves, in the same loop.
+    curves = any(_diode_curve.has_curve(d) for d in loaded.annotations.directives)
+    adaptive_info["diodes"] = {}
     # Full steps until a residual is seen to alternate sign repeatedly — see
     # ``_ADAPTIVE_GAIN_BLEND``. Latches on once tripped: a design that
     # oscillated is not going to stop part-way through.
@@ -2214,7 +2219,7 @@ def solve_problem_adaptive(
             exc.built_per_net_layers = per_net_layers
             raise
 
-    if not use_adaptive:
+    if not use_adaptive and not curves:
         solution = _solve_once(
             f"Meshing + solving ({len(problem.layers)} (layer, net) "
             f"slabs, {len(problem.networks)} networks)…"
@@ -2226,8 +2231,10 @@ def solve_problem_adaptive(
     solution = None
     converged = False
     for iteration in range(_ADAPTIVE_GAIN_MAX_ITERATIONS):
+        what = " + ".join(w for w, on in (("adaptive SMPS gain", use_adaptive),
+                                          ("diode curves", curves)) if on)
         msg = (
-            f"Meshing + solving (adaptive SMPS gain, iteration "
+            f"Meshing + solving ({what}, iteration "
             f"{iteration + 1}/{_ADAPTIVE_GAIN_MAX_ITERATIONS}, "
             f"{len(problem.layers)} slabs)…"
         )
@@ -2235,6 +2242,23 @@ def solve_problem_adaptive(
         # this solution is consistent with those gains.
         solution = _solve_once(msg)
         adaptive_info["iterations"] = iteration + 1
+        # Diodes: their lines onto their curves at the currents just solved, patched
+        # into ``problem`` for the next solve (their specs in ``loaded`` with them).
+        diode_gap = 0.0
+        if curves:
+            diode_gap, adaptive_info["diodes"] = _diode_curve.retune(
+                solution, loaded, getattr(loaded, "diode_networks", {}),
+                lambda d: _channel_label(d.designator, d.channel_index),
+                _sample_voltage_at_pin)
+        if not use_adaptive:
+            if diode_gap < _diode_curve.CURVE_TOL_V:
+                converged = True
+                break
+            if iteration + 1 >= _ADAPTIVE_GAIN_MAX_ITERATIONS:
+                log.warning("Diode curves did not converge within %d iterations",
+                            _ADAPTIVE_GAIN_MAX_ITERATIONS)
+                break
+            continue
 
         # Pass 1 — sample Vin and derive each regulator's undamped target gain.
         targets: dict[tuple[str, int | None], tuple[RegulatorSpec, float | None]] = {}
@@ -2304,7 +2328,7 @@ def solve_problem_adaptive(
             converged = False
             break
 
-        if max_rel_change < _ADAPTIVE_GAIN_REL_TOL:
+        if max_rel_change < _ADAPTIVE_GAIN_REL_TOL and diode_gap < _diode_curve.CURVE_TOL_V:
             # Converged: adopt the refined gains (within tolerance of what the
             # returned solution used, so metadata stays consistent with it).
             _replace_regulator_gains(loaded, new_gains)
@@ -4601,6 +4625,8 @@ def build_problem(
     # Every SINK is a copper-sensitivity target, keyed by the same label the
     # solve metadata gives it ("U5", "U7#1") so the viewer can match them.
     sensitivity_targets: list[tuple[str, _pp.BaseLumped]] = []
+    # Each diode with a curve's network, so the solve can move it onto its curve.
+    diode_networks: dict[str, _pp.Network] = {}
     for d in loaded.annotations.directives:
         if getattr(d, "solve_excluded", False):
             # Single-type rail (only sources or only sinks) — kept for display
@@ -4615,6 +4641,9 @@ def build_problem(
         if isinstance(d, SinkSpec) and isinstance(
                 net.elements[0], _pp.CurrentSource):
             sensitivity_targets.append((directive_label(d), net.elements[0]))
+        if _diode_curve.has_curve(d):
+            diode_networks[_channel_label(d.designator, d.channel_index)] = net
+    loaded.diode_networks = diode_networks
 
     # Warn when a REGULATOR draws input current from a net that is also
     # downstream of a SERIES element (ferrite bead, inductor DCR, etc.).

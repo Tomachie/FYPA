@@ -163,14 +163,29 @@ def _test_amps(text) -> float | None:
 _AT_25C = re.compile(r"(?<![\d.])25\s*°?\s*C\b", re.I)
 
 
-def _curve_fit(element: dict) -> tuple[float, float, str] | None:
-    """(drop, slope, how) fitted on the element's Vf-vs-If curve (``vf_curves``): the
-    25 C curve if one is labelled so, else the first; a straight line through the points
-    above a tenth of its highest current, where the diode conducts. None without a curve."""
+def _curve(element: dict) -> dict | None:
+    """The element's Vf-vs-If curve to solve on (``vf_curves``): the 25 C one if one is
+    labelled so, else the first; None without one."""
     curves = [c for c in element.get("vf_curves") or [] if len(c.get("points") or []) >= 2]
     if not curves:
         return None
-    curve = next((c for c in curves if _AT_25C.search(str(c.get("label", "")))), curves[0])
+    return next((c for c in curves if _AT_25C.search(str(c.get("label", "")))), curves[0])
+
+
+def curve_points(element: dict) -> list[tuple[float, float]] | None:
+    """That curve's points, [(amps, volts), ...]; None without one."""
+    curve = _curve(element)
+    return None if curve is None else [(float(i), float(v)) for i, v in curve["points"]]
+
+
+def _curve_fit(element: dict) -> tuple[float, float, str] | None:
+    """(drop, slope, how) fitted on the element's Vf-vs-If curve (:func:`_curve`): a
+    straight line through the points above a tenth of its highest current, where the
+    diode conducts - where the solve starts; it then follows the curve itself
+    (``PDN_VF_CURVE``). None without a curve."""
+    curve = _curve(element)
+    if curve is None:
+        return None
     pts = sorted((float(i), float(v)) for i, v in curve["points"])
     top = pts[-1][0]
     on = [(i, v) for i, v in pts if i >= 0.1 * top] or pts
@@ -184,8 +199,9 @@ def _curve_fit(element: dict) -> tuple[float, float, str] | None:
     drop = mv - slope * mi
     label = f" ({curve['label']})" if curve.get("label") else ""
     page = f", page {curve['page']}" if curve.get("page") else ""
-    how = (f"forward drop {drop:.3g} V + {slope * 1e3:.3g} mOhm slope, fitted on the "
-           f"Vf-vs-If curve{label}{page} from {on[0][0]:g} A to {on[-1][0]:g} A")
+    how = (f"solved on its Vf-vs-If curve{label}{page} at the current it carries "
+           f"(starting from {drop:.3g} V + {slope * 1e3:.3g} mOhm, fitted from "
+           f"{on[0][0]:g} A to {on[-1][0]:g} A)")
     return drop, slope, how
 
 
@@ -715,6 +731,11 @@ class TomachiePdn:
                 # Anode on the side the power comes from (net_in): PDN_VF from P to N.
                 pick = vf_max if self.corner == "max" and vf_max is not None else vf
                 values["VF"] = f"{pick:g}"
+                curve = curve_points(e)
+                if curve:
+                    # The curve is typical: the worst case lifts it as much as the line.
+                    values["VF_CURVE"] = ";".join(f"{i:g}:{v + pick - vf:g}"
+                                                  for i, v in curve)
                 self.notes.append(f"{ref}: series diode, {how}")
             self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), values)
             return

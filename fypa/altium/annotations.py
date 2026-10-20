@@ -345,7 +345,7 @@ _KNOWN_SUFFIXES_BY_ROLE: dict[str, frozenset[str]] = {
         "SMPS_TOPOLOGY", "SW1_NET", "SW2_NET",
     }) | _PART_WIDE_PIN_FILTER_SUFFIXES,
     "SERIES": frozenset({
-        "R", "VF", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
+        "R", "VF", "VF_CURVE", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
     }) | _PART_WIDE_PIN_FILTER_SUFFIXES,
     "PATH": frozenset({
         "R", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
@@ -3501,6 +3501,9 @@ class ResistorSpec(_BaseSpec):
     # A diode (PDN_VF): its forward drop from P (anode) to N when it conducts, volts;
     # None = a plain resistance. Solved as forward_v + I x resistance (the slope).
     forward_v: float | None = None
+    # Its datasheet Vf-vs-If curve (PDN_VF_CURVE, "amps:volts;amps:volts..."): the solve
+    # moves the line onto the curve at the current it carries (fypa.altium.diode_curve).
+    vf_curve: tuple[tuple[float, float], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -4486,7 +4489,27 @@ def _resistor_spec_factory(*, params, value, result, diag, **kw):
         parsed = _optional_value(params, vf_key, diag, result)
         if parsed is not None and parsed > 0:
             vf = parsed
-    return ResistorSpec(resistance=value, forward_v=vf, **kw)
+    curve = _vf_curve(params, _channel_key("VF_CURVE", kw.get("channel_index")), diag,
+                      result) if vf is not None else None
+    return ResistorSpec(resistance=value, forward_v=vf, vf_curve=curve, **kw)
+
+
+def _vf_curve(params, key: str, diag: str,
+              result: AnnotationResult) -> tuple[tuple[float, float], ...] | None:
+    """A diode's Vf-vs-If curve, "amps:volts;amps:volts...", two points at least."""
+    raw = _ci_get(params, key)
+    if raw is None:
+        return None
+    try:
+        pts = tuple((float(i), float(v)) for i, v in
+                    (p.split(":") for p in str(raw).split(";") if p.strip()))
+    except ValueError:
+        pts = ()
+    if len(pts) < 2 or any(i <= 0 for i, _ in pts):
+        _append_error_once(result, f"{diag}: {key}={raw!r} - expected two or more "
+                                   "amps:volts points with positive currents")
+        return None
+    return pts
 
 
 def _path_spec_factory(*, params, value, channel_index, result, diag, **kw):
