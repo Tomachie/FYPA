@@ -1243,7 +1243,7 @@ def _plane_net_sheets(
 
     Read as one net, a split plane is no copper at all (``(Multiple Nets)`` is
     not a net), and every via that reaches its net only through the plane is
-    an island: GND on P1-GND / P2-GND solved as 35 islands."""
+    an island: one board's GND on P1-GND / P2-GND solved as 35 islands."""
     regions = _split_plane_regions(proj, stackup)
     if not regions:
         net = _net_index_by_name(proj, stackup.plane_net_name)

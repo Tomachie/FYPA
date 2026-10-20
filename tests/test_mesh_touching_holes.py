@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Tomachie LLC.
 """Regression: copper whose repaired outline has holes touching the exterior.
 
-an Altium board (manufactured), "Top Layer|GND" piece around a
+An Altium board (manufactured), "Top Layer|GND" piece around a
 2x8 connector: the pour outline is one ring that touches itself between
 the pads (zero-width copper pinches). ``buffer(0)`` repairs it into a
 valid polygon with 14 holes, each touching the exterior at one point.
@@ -25,7 +25,7 @@ from pdnsolver.mesh import (
 
 # Exterior ring of the copper piece as the loader builds it (mm, invalid:
 # self-touching at 14 points between the connector pads).
-CRICKET_GND_RING = [
+PINCHED_GND_RING = [
     (-1.093, -1.138), (-1.046, -1.124), (-1.002, -1.1), (-0.963, -1.069), (-0.932, -1.03),
     (-0.908, -0.986), (-0.894, -0.939), (-0.889, -0.889), (-0.894, -0.839), (-0.908, -0.792),
     (-0.927, -0.757), (-0.927, 0.757), (-0.908, 0.792), (-0.894, 0.839), (-0.889, 0.889),
@@ -97,14 +97,14 @@ CRICKET_GND_RING = [
 ]
 
 # Directive / via seeds on the first pad (as the solver passes them).
-CRICKET_SEEDS = np.array([
+PINCHED_SEEDS = np.array([
     (-1.143, -0.889), (-1.118, -0.889), (-1.12532233, -0.87132233),
     (-1.143, -0.864), (-1.16067767, -0.87132233), (-1.168, -0.889),
     (-1.16067767, -0.90667767), (-1.143, -0.914), (-1.12532233, -0.90667767),
 ])
 
 # Switches the solver used for this piece (width-aware max size).
-CRICKET_SWITCHES = "pq20a0.0140594Q"
+PINCHED_SWITCHES = "pq20a0.0140594Q"
 
 
 def _mesh_area(vertices: np.ndarray, triangles: np.ndarray) -> float:
@@ -125,41 +125,41 @@ def _assert_segments_valid(vertices: np.ndarray, segments: np.ndarray) -> None:
     assert np.all(segments[:, 0] != segments[:, 1])
 
 
-def test_cricket_gnd_pinched_pour_prepares_without_duplicate_vertices():
-    poly = shapely.geometry.Polygon(CRICKET_GND_RING)
+def test_altium_gnd_pinched_pour_prepares_without_duplicate_vertices():
+    poly = shapely.geometry.Polygon(PINCHED_GND_RING)
     assert not poly.is_valid  # the loader hands the mesher this ring
     repaired = repair_polygon_for_triangulation(poly)
     assert repaired.geom_type == "Polygon"
     assert len(repaired.interiors) == 14
     vertices, segments, holes = _prepare_polygon_for_triangle_arrays(
-        poly, CRICKET_SEEDS)
+        poly, PINCHED_SEEDS)
     # Checked BEFORE triangulating: a regression here would segfault Triangle.
     _assert_no_coincident_vertices(vertices)
     _assert_segments_valid(vertices, segments)
     assert holes.shape == (14, 2)
 
 
-def test_cricket_gnd_pinched_pour_meshes_and_keeps_its_area():
-    poly = shapely.geometry.Polygon(CRICKET_GND_RING)
+def test_altium_gnd_pinched_pour_meshes_and_keeps_its_area():
+    poly = shapely.geometry.Polygon(PINCHED_GND_RING)
     copper_area = repair_polygon_for_triangulation(poly).area
     assert abs(copper_area - 8.718776) < 1e-6
     vertices, segments, holes = _prepare_polygon_for_triangle_arrays(
-        poly, CRICKET_SEEDS)
+        poly, PINCHED_SEEDS)
     _assert_no_coincident_vertices(vertices)
     out_v, out_t = _triangulate_arrays(
-        vertices, segments, holes, CRICKET_SWITCHES)
+        vertices, segments, holes, PINCHED_SWITCHES)
     assert out_t.shape[0] > 0
     assert abs(_mesh_area(out_v, out_t) - copper_area) < 1e-9 * max(1.0, copper_area)
     # Every seed is still a mesh node.
-    d, _ = scipy.spatial.cKDTree(out_v).query(CRICKET_SEEDS)
+    d, _ = scipy.spatial.cKDTree(out_v).query(PINCHED_SEEDS)
     assert d.max() < 1e-9
 
 
-def test_cricket_gnd_pinched_pour_meshes_adaptive():
-    poly = shapely.geometry.Polygon(CRICKET_GND_RING)
+def test_altium_gnd_pinched_pour_meshes_adaptive():
+    poly = shapely.geometry.Polygon(PINCHED_GND_RING)
     copper_area = repair_polygon_for_triangulation(poly).area
     out_v, out_t = _triangulate_adaptive(
-        poly, CRICKET_SEEDS, (20.0, 0.6, 4.0, 0.75, 5.0))
+        poly, PINCHED_SEEDS, (20.0, 0.6, 4.0, 0.75, 5.0))
     assert abs(_mesh_area(out_v, out_t) - copper_area) < 1e-9 * max(1.0, copper_area)
 
 

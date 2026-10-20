@@ -246,7 +246,7 @@ class TomachiePdn:
     def _source_volts(self, rail: dict) -> float | None:
         """A source rail's voltage for this corner: nominal, or in the worst case its
         ``voltage.min`` when that is a number (spec: a worst-case solve drives each
-        source at voltage.min; V+: 48 V nominal, 21 V min)."""
+        source at voltage.min; e.g. V+: 48 V nominal, 21 V min)."""
         v = rail.get("voltage", {})
         lo = _number(v.get("min"))
         return lo if self.corner == "max" and lo is not None else _number(v.get("nominal"))
@@ -286,7 +286,7 @@ class TomachiePdn:
                     "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))}
                 ret = src.get("return")
                 if isinstance(ret, dict) and ret.get("net"):
-                    # The file names the return (J3: on V-, closed to GND
+                    # The file names the return (e.g. J3: on V-, closed to GND
                     # through L12's second winding); place_on_board then leaves it.
                     values["N_NET"] = ret["net"]
                     if ret.get("pins"):
@@ -306,7 +306,7 @@ class TomachiePdn:
     def _ideal_source(self, ref: str, rail: str, src: dict, v: float, why: str):
         """A regulator FYPA cannot model as one (its type or its input pins are not in the
         file) still drives its rail: a SOURCE at its output pins, drawing nothing from its
-        input rail, said once. Left out, every rail behind it went undriven (U14:
+        input rail, said once. Left out, every rail behind it went undriven (e.g. U14:
         5V_VIN, and the PMIC and 3V3 regulator fed from it)."""
         self.notes.append(f"{ref} ({rail}): {why}; modeled as an ideal source, drawing "
                           "nothing from its input rail")
@@ -342,7 +342,7 @@ class TomachiePdn:
 
     def _split_inputs(self, reg: dict, rail: str, values: dict[str, str], kind: str,
                       v_out: float, eff: float | None, iq: float | None):
-        """A regulator with more than one input rail (U9: 5V and 3V3, the 3V3
+        """A regulator with more than one input rail (e.g. U9: 5V and 3V3, the 3V3
         entry behind L6). Its input current is shared over the input rails by what
         the file states - the entries' own currents, when they add up to the
         regulator's input current - or else equally, and that is said. The first rail
@@ -480,7 +480,7 @@ class TomachiePdn:
         maximum in the worst case; its quiescent current a SINK on its input pins, as an
         LDO's QUIESCENT is drawn at its input. Modelled as an LDO it read 5 V made from
         5 V and was flagged out of regulation. The parts between its output pins and its
-        rail (U14: L17) are a real drop - no regulation loop around them - so
+        rail (e.g. U14: L17) are a real drop - no regulation loop around them - so
         they take their DC resistance; an input filter is completed from the board, as
         a regulator's is."""
         ref = reg["refdes"]
@@ -593,7 +593,7 @@ class TomachiePdn:
                                   f"({vin_rail}); no REGULATOR")
                 continue
             # One output, one REGULATOR: rails the file sources from the same output
-            # pins (U9_6: DVDD12, AVDD12 behind L7, NetC64_2) are one
+            # pins (e.g. U9_6: DVDD12, AVDD12 behind L7, NetC64_2) are one
             # element. Three in parallel shared the current in the solve, but the
             # report counted DVDD12's load once per channel - three times on 5V.
             out_key = values["OUT_P_PINS"] or rail
@@ -627,7 +627,7 @@ class TomachiePdn:
                     # A switcher regulates its rail AFTER the output inductor (the
                     # feedback divider sits on the rail), so the inductor's DC
                     # resistance does not lower the rail - its loss is in the
-                    # efficiency. U12/L14: 2 A x 24.7 mOhm read as a 50 mV
+                    # efficiency. A switcher's U12/L14: 2 A x 24.7 mOhm read as a 50 mV
                     # rail drop that the LM5013's feedback removes.
                     self.notes.append(f"{e['refdes']}: inside {ref}'s regulation loop; bridged "
                                       "(its loss is in the efficiency)")
@@ -659,7 +659,7 @@ class TomachiePdn:
             self.ch.add(ref, ("SERIES", e.get("net_in"), e.get("net_out")), values)
             return
         if r is None:
-            # Dropping it would cut the rail off from its source (F1, the input
+            # Dropping it would cut the rail off from its source (e.g. F1, the input
             # fuse); bridged and named, so the drop across it is visibly not modelled.
             self.notes.append(f"{ref}: DC resistance not in the file; bridged at 1 mOhm")
             r = 0.001
@@ -751,7 +751,7 @@ class TomachiePdn:
     def series_elements(self) -> dict[str, dict]:
         """Every part the file lists in series, by designator (for its DC resistance):
         between rails, on a regulator's output path, and in a load's ``input_filter``
-        (spec revision 6; U12: C69 / L10, U10: C67 / L8)."""
+        (spec revision 6; e.g. U12: C69 / L10, U10: C67 / L8)."""
         out: dict[str, dict] = {}
         for r in self.rails.values():
             parts = r.get("series_from_parent", []) + (r.get("source") or {}).get("output_path", [])
@@ -764,7 +764,7 @@ class TomachiePdn:
     def place_on_board(self, params: dict[str, dict[str, str]], extracted) -> list[str]:
         """What only the board can answer, applied to ``params`` in place:
 
-        * a source's return is the ground net its pads are on (J3: V-, not GND);
+        * a source's return is the ground net its pads are on (e.g. J3: V-, not GND);
           when that is not the main ground, the common-mode choke the file lists in series
           carries the return through its second winding, at the same DC resistance;
         * a regulator whose input pins sit behind an input filter (U12: VIN -> C69 -> L10
@@ -808,7 +808,7 @@ class TomachiePdn:
                 if ch.get(nk) in on:
                     # The file named the return. Every regulator and sink returns to
                     # self.gnd, so one on another ground net with no path to it in
-                    # the file is still closed from the board (J3: V-, path
+                    # the file is still closed from the board (e.g. J3: V-, path
                     # [] - left open, the solve's ground-node current was 63 mA).
                     if ch[nk] == self.gnd or des.upper() in self.closed_returns:
                         continue
@@ -871,7 +871,7 @@ class TomachiePdn:
                     n = back
                     continue
                 # Parts the file lists in parallel between the same two nets carry
-                # the current together (U68: L1 and L40, 5V -> NetC253_2).
+                # the current together (e.g. U68: L1 and L40, 5V -> NetC253_2).
                 for par in [des] + sorted(d for d, other in edges.get(n, [])
                                           if other == back and d != des and d in known):
                     if (par, n, back) in placed and par != des:
@@ -916,7 +916,7 @@ class TomachiePdn:
     def _isolated_grounds(self, params: dict[str, dict[str, str]], pads) -> list[str]:
         """An isolated converter's output side returns on its own ground: the ground
         net (other than the main one) its pads sit on, else the one its output rails'
-        loads share (U18: GND_CAN1). Every SINK and REGULATOR terminal in
+        loads share (e.g. U18: GND_CAN1). Every SINK and REGULATOR terminal in
         the nets it powers is moved onto that ground."""
         notes: list[str] = []
         others = set(self.grounds) - {self.gnd}

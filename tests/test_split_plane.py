@@ -5,7 +5,7 @@ Altium keeps a split plane's regions as ``Polygons6`` records of type
 ``Split Plane``, each with its net; the stackup's plane net name is the
 literal ``(Multiple Nets)``, which is no net. Read as one net, the layer had
 no copper at all, so every via that reached its net only through the plane
-was an island (a board: GND on P1-GND / P2-GND in 35 pieces).
+was an island (one board: GND on P1-GND / P2-GND in 35 pieces).
 """
 from __future__ import annotations
 

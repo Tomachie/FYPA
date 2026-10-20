@@ -370,7 +370,7 @@ def test_input_filter_parts_take_their_dc_resistance_from_the_file():
 
 
 def test_return_named_on_another_ground_with_no_path_is_closed_from_the_board():
-    """J3: the file names its return V- with an empty path; every regulator
+    """An input connector J3: the file names its return V- with an empty path; every regulator
     returns to GND, so V- is joined to GND through the choke's second winding."""
     pdn = copy.deepcopy(PDN)
     pdn["ground_nets"] = ["GND", "V-"]
@@ -410,7 +410,7 @@ def test_rails_sourced_from_the_same_output_pins_are_one_regulator():
 
 
 def test_worst_case_drives_a_source_at_its_minimum_voltage():
-    """Spec: a worst-case solve drives each source at voltage.min (V+: 48 V
+    """Spec: a worst-case solve drives each source at voltage.min (e.g. V+: 48 V
     nominal, 21 V min); a regulator output stays at its set voltage, and a buck's
     duty cycle follows the lower input."""
     pdn = _with_switch_node(SWITCH_NODE)
@@ -533,7 +533,7 @@ def test_regulator_with_two_input_rails_follows_a_split_the_file_states():
 
 
 def test_regulator_bias_entry_is_a_sink_and_the_input_stays_whole():
-    """U9 (AP2132): VIN U9_3 on 3V3 carries the input current; VCTRL / EN on
+    """An AP2132 (U9): VIN U9_3 on 3V3 carries the input current; VCTRL / EN on
     5V is a regulator_bias load with its own (control) current - no equal split."""
     pdn = _two_inputs()
     vbus = pdn["rails"][0]["loads"][1]
