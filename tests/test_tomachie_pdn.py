@@ -823,3 +823,15 @@ def test_a_switched_path_is_a_source_series_parts_and_a_sink_on_its_return():
 def test_a_switched_path_it_cannot_solve_is_said(over, why):
     p, notes = params(pdn=_switched(**over))
     assert "H8" not in p and any(why in n for n in notes)
+
+
+def test_a_part_not_fitted_is_modeled_as_the_file_says():
+    pdn = copy.deepcopy(PDN)
+    pdn["not_fitted"] = [
+        {"refdes": "F9", "class": "fuse", "nets": ["+3V3", "SIG"], "basis": "variant",
+         "model_as": {"resistance_ohm": 5e8}},
+        {"refdes": "C9", "class": "capacitor", "nets": ["+3V3", "GND"], "basis": "variant",
+         "model_as": {"capacitance_f": 0.0}}]
+    p, _ = params(pdn=pdn)
+    assert (p["F9"]["PDN1_ROLE"], p["F9"]["PDN1_R"]) == ("SERIES", "5e+08")
+    assert "C9" not in p

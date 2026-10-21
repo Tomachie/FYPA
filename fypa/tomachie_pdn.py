@@ -1182,12 +1182,18 @@ class TomachiePdn:
             ref, nets = e.get("refdes", ""), e.get("nets") or []
             if not ref:
                 continue
-            if e.get("class") in OPEN_CLASSES or len(nets) != 2 or nets[0] == nets[1]:
+            # The file says how to model it (model_as); a file written before it did, by
+            # the part's class.
+            model = e.get("model_as") if isinstance(e.get("model_as"), dict) else None
+            ohms = (_number(model.get("resistance_ohm")) if model is not None
+                    else None if e.get("class") in OPEN_CLASSES else NOT_FITTED_OHMS)
+            if "model_as" in e and model is None:
+                ohms = None
+            if ohms is None or len(nets) != 2 or nets[0] == nets[1]:
                 left.append(ref)
                 continue
             self.ch.add(ref, ("SERIES", nets[0], nets[1]), {
-                "ROLE": "SERIES", "R": f"{NOT_FITTED_OHMS:g}", "P_NET": nets[0],
-                "N_NET": nets[1]})
+                "ROLE": "SERIES", "R": f"{ohms:g}", "P_NET": nets[0], "N_NET": nets[1]})
             opened.append(ref)
         if opened:
             self.notes.append(f"Not fitted, solved as open ({NOT_FITTED_OHMS:g} Ohm): "
