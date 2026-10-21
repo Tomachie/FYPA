@@ -779,3 +779,47 @@ def test_a_figure_named_for_another_pin_is_not_the_parts_resistance():
         {"spec": "coil_resistance", "typ": "208", "unit": "ohm"},
         {"spec": "contact_resistance", "max": "100", "unit": "mΩ"}]}
     assert dc_resistance(relay) == (None, pytest.approx(0.1))
+
+
+def _switched(**over):
+    pdn = copy.deepcopy(PDN)
+    pdn["ground_nets"] = list(pdn.get("ground_nets", ["GND"])) + ["PGND"]
+    sp = {"net": "PSU_P", "in": {"net": "PSU_P", "terminals": ["H8"]},
+          "out": {"net": "LOAD_P", "terminals": ["H9"]},
+          "return": {"net": "PGND", "terminals": ["H10", "H11"]},
+          "switched_by": "K1", "contact_only": False,
+          "series": [{"refdes": "R25", "class": "resistor", "net_in": "PSU_P",
+                      "net_out": "SNT_N", "resistance_ohm": 0.01, "datasheet_figures": []},
+                     {"refdes": "K1", "class": "relay", "net_in": "SNT_N", "net_out": "LOAD_P",
+                      "resistance_ohm": "unknown", "datasheet_figures": [
+                          {"spec": "coil_resistance", "typ": "208", "unit": "ohm"},
+                          {"spec": "contact_resistance", "max": "100", "unit": "mΩ"}]}],
+          "voltage": {"nominal": 10.0, "min": 0.0, "max": 25.0, "basis": "user"},
+          "load_current_max": {"amps": 2.5, "basis": "user"}}
+    sp.update(over)
+    pdn["switched_paths"] = [sp]
+    return pdn
+
+
+def test_a_switched_path_is_a_source_series_parts_and_a_sink_on_its_return():
+    reader = TomachiePdn(_switched(), "typ")
+    p, notes = reader.parameters()
+    board = dict(ISO_BOARD, H8=["PSU_P"], H9=["LOAD_P"], H10=["PGND"], H11=["PGND"],
+                 R25=["PSU_P", "SNT_N"], K1=["SNT_N", "LOAD_P"])
+    notes += reader.place_on_board(p, _board(board))
+    h8, h9 = p["H8"], p["H9"]
+    assert (h8["PDN1_ROLE"], h8["PDN1_V"], h8["PDN1_P_NET"], h8["PDN1_N_NET"],
+            h8["PDN1_N_DES"]) == ("SOURCE", "10", "PSU_P", "PGND", "H10")
+    assert (h9["PDN1_ROLE"], h9["PDN1_I"], h9["PDN1_N_NET"], h9["PDN1_N_DES"]) ==         ("SINK", "2.5", "PGND", "H11")
+    assert (p["R25"]["PDN1_R"], p["K1"]["PDN1_R"]) == ("0.01", "0.1")
+    assert not any("H8: no pad on any ground" in n for n in notes)
+
+
+@pytest.mark.parametrize("over,why", [
+    ({"contact_only": True}, "contacts only"),
+    ({"return": None}, "names no return"),
+    ({"voltage": "not_stated"}, "voltage is not stated"),
+])
+def test_a_switched_path_it_cannot_solve_is_said(over, why):
+    p, notes = params(pdn=_switched(**over))
+    assert "H8" not in p and any(why in n for n in notes)

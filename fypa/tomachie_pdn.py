@@ -935,11 +935,12 @@ class TomachiePdn:
 
         # 1) source returns
         for des, ch in list(params.items()):
-            on = pads.get(des.upper(), set())
             for k, v in list(ch.items()):
                 if not (k.endswith("_ROLE") and v == "SOURCE"):
                     continue
                 nk = k[:-len("ROLE")] + "N_NET"
+                # A return on another part (a switched path's minus terminal, PDN_N_DES).
+                on = pads.get(ch.get(k[:-len("ROLE")] + "N_DES", des).upper(), set())
                 if ch.get(nk) in on:
                     # The file named the return. Every regulator and sink returns to
                     # self.gnd, so one on another ground net with no path to it in
@@ -1127,7 +1128,50 @@ class TomachiePdn:
         self._branches()
         self._loads()
         self._not_fitted()
+        self._switched_paths()
         return dict(self.ch.params), self.notes
+
+    def _switched_paths(self):
+        """Power the board carries between its terminals and runs nothing from (a relay
+        switching a bench supply through a shunt; spec revision 7, switched_paths): a
+        SOURCE at its IN terminal at the designer's voltage, its series parts as SERIES,
+        and a SINK at its OUT terminal drawing the designer's load current, both
+        returning on the path's return terminals (the first for the source, the last
+        for the load: the file does not say which is which)."""
+        for sp in self.pdn.get("switched_paths") or []:
+            what = f"Switched path {sp.get('net') or '?'}" + (
+                f" ({sp['switched_by']})" if sp.get("switched_by") else "")
+            inp, out, ret = sp.get("in"), sp.get("out"), sp.get("return")
+            if sp.get("contact_only") or not isinstance(inp, dict) or not isinstance(out, dict):
+                self.notes.append(f"{what}: contacts only, no source or load side on the "
+                                  "board; not solved")
+                continue
+            if not isinstance(ret, dict) or not ret.get("terminals"):
+                self.notes.append(f"{what}: the file names no return; not solved")
+                continue
+            volts = sp.get("voltage") if isinstance(sp.get("voltage"), dict) else {}
+            v, amps = _number(volts.get("nominal")), _amps(sp.get("load_current_max"))
+            if v is None or amps is None:
+                self.notes.append(f"{what}: its {'voltage' if v is None else 'load current'} "
+                                  "is not stated; not solved")
+                continue
+            src, dst = (inp.get("terminals") or [None])[0], (out.get("terminals") or [None])[0]
+            if not src or not dst:
+                self.notes.append(f"{what}: no terminal named at its "
+                                  f"{'input' if not src else 'output'}; not solved")
+                continue
+            self.ch.add(src, ("SOURCE", inp["net"]), {
+                "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": inp["net"], "N_NET": ret["net"],
+                "N_DES": ret["terminals"][0]})
+            self.closed_returns.add(src.upper())      # its load returns on the same net
+            for e in sp.get("series") or []:
+                if e.get("net_in") and e.get("net_out"):
+                    self._series(e)
+            self.ch.add(dst, ("SINK", out["net"]), {
+                "ROLE": "SINK", "I": f"{amps:g}", "P_NET": out["net"], "N_NET": ret["net"],
+                "N_DES": ret["terminals"][-1]})
+            self.notes.append(f"{what}: {inp['net']} -> {out['net']} at {v:g} V, {amps:g} A "
+                              f"load, returning on {ret['net']} (the designer's figures)")
 
     def _not_fitted(self):
         """A part the file lists as not fitted (spec revision 7, ``not_fitted``) still has
