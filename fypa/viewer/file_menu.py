@@ -1090,6 +1090,8 @@ class _FileMenuMixin:
             },
             pdn_json=_tomachie_pdn_choice(self)[0],
             pdn_corner=_tomachie_pdn_choice(self)[1],
+            auto_series_max_ohm=getattr(
+                getattr(self, "_project", None), "auto_series_max_ohm", None),
             parent=self,
         )
         if is_import:

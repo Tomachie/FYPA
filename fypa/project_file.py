@@ -303,6 +303,11 @@ class ProjectFile:
     # ("typ" / "max") it is solved at (File > Load Tomachie pdn.json…).
     pdn_json: str | None = None
     pdn_corner: str = "typ"
+    # Unannotated resistors whose value is at or below this many ohms are
+    # modelled as SERIES with their own value (current-sense shunts). 0 turns
+    # it off. Mirrors fypa.altium.annotations.DEFAULT_AUTO_SERIES_MAX_OHM —
+    # not imported, so loading a .fypa never pulls in the Altium parser.
+    auto_series_max_ohm: float = 0.1
     viewer_settings: dict[str, Any] = field(default_factory=dict)
 
     # ---- Gerber-import fields (schema v2) --------------------------------
@@ -346,6 +351,7 @@ class ProjectFile:
             "no_auto_bridge": list(self.no_auto_bridge),
             "pdn_json": _rel(self.pdn_json, base),
             "pdn_corner": self.pdn_corner,
+            "auto_series_max_ohm": float(self.auto_series_max_ohm),
             "viewer_settings": dict(self.viewer_settings),
             "source_kind": self.source_kind,
             "gerber_files": [_rel(p, base) for p in self.gerber_files],
@@ -396,6 +402,8 @@ class ProjectFile:
             no_auto_bridge=[str(d) for d in doc.get("no_auto_bridge", [])],
             pdn_json=_abs(doc.get("pdn_json"), base),
             pdn_corner=str(doc.get("pdn_corner", "typ")),
+            # Additive like cap_overrides; older files get the default.
+            auto_series_max_ohm=float(doc.get("auto_series_max_ohm", 0.1)),
             net_renames=dict(doc.get("net_renames", {})),
             viewer_settings=dict(doc.get("viewer_settings", {})),
             source_kind=str(doc.get("source_kind", "altium")),
