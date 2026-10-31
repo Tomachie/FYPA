@@ -835,3 +835,73 @@ def test_a_part_not_fitted_is_modeled_as_the_file_says():
     p, _ = params(pdn=pdn)
     assert (p["F9"]["PDN1_ROLE"], p["F9"]["PDN1_R"]) == ("SERIES", "5e+08")
     assert "C9" not in p
+
+
+def _rail(name, volts, src, loads):
+    return {"name": name, "voltage": {"nominal": volts, **V}, "source": src, "loads": loads}
+
+
+def _board_input_pdn():
+    pdn = copy.deepcopy(PDN)
+    fuse = {"refdes": "F1", "class": "fuse", "net_in": "VIN", "net_out": "VBAT",
+            "resistance_ohm": 0.02, "datasheet_figures": []}
+    pdn["rails"] = [
+        _rail("VBAT", 12.0, {"role": "board_input", "refdes": "J5", "pins": ["J5_1"],
+                             "output_net": "VIN", "output_path": [fuse]}, []),
+        _rail("VIN", 12.0, {"role": "board_input", "refdes": "J5", "pins": ["J5_1"],
+                            "output_net": "VIN", "output_path": []}, [])]
+    pdn["regulators"] = []
+    return pdn
+
+
+def test_a_board_inputs_series_parts_carry_its_current():
+    p, _ = params(pdn=_board_input_pdn())
+    assert (p["F1"]["PDN1_ROLE"], p["F1"]["PDN1_R"]) == ("SERIES", "0.02")
+    assert (p["F1"]["PDN1_P_NET"], p["F1"]["PDN1_N_NET"]) == ("VIN", "VBAT")
+
+
+def test_two_rails_from_one_connector_pin_are_one_source():
+    p, notes = params(pdn=_board_input_pdn())
+    assert [k for k, v in p["J5"].items() if k.endswith("_ROLE") and v == "SOURCE"] == ["PDN1_ROLE"]
+    assert any("J5's output, placed with VBAT" in n for n in notes)
+
+
+def test_a_cable_allowance_is_named_in_the_worst_case():
+    pdn = _board_input_pdn()
+    pdn["rails"][0]["source"]["cable"] = {"resistance_ohm": 0.25}
+    _, notes = params(pdn=pdn, corner="max")
+    assert any("cable allowance 250 mOhm" in n for n in notes)
+    _, notes = params(pdn=pdn)
+    assert not any("cable allowance" in n for n in notes)
+
+
+def _motor_pdn(driver):
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][0]["loads"].append(
+        {"role": "motor_output", "refdes": "J8", "pins": ["J8_1", "J8_2"],
+         "current": {"amps": 1.5, "basis": "user"}, "driver": driver})
+    return pdn
+
+
+def test_a_motor_leaves_the_rail_at_its_drivers_pins():
+    p, _ = params(pdn=_motor_pdn({"refdes": "U9", "supply_pins": ["U9_4", "U9_5"],
+                                  "return_pins": ["U9_7"], "output_nets": ["M1A", "M1B"]}))
+    assert "J8" not in p
+    assert p["U9"] == {"PDN1_ROLE": "SINK", "PDN1_I": "1.5", "PDN1_P_NET": "VBUS",
+                       "PDN1_N_NET": "GND", "PDN1_P_PINS": "4,5", "PDN1_N_PINS": "7"}
+
+
+def test_a_motor_with_no_driver_pins_is_named_and_left_out():
+    p, notes = params(pdn=_motor_pdn({}))
+    assert "J8" not in p
+    assert any("J8 on VBUS: motor with no driver supply pins" in n for n in notes)
+
+
+def test_an_led_a_driver_sinks_returns_at_the_drivers_ground_pins():
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["loads"].append(
+        {"role": "resistive_path", "refdes": "J6", "pins": ["J6_11"], "path_parts": ["J6", "R30"],
+         "current": {"amps": 0.004, "basis": "v_over_r"},
+         "driver": {"refdes": "U4", "supply_pins": [], "return_pins": ["U4_9"]}})
+    p, _ = params(pdn=pdn)
+    assert (p["J6"]["PDN1_N_DES"], p["J6"]["PDN1_N_PINS"]) == ("U4", "9")

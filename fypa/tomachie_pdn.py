@@ -316,6 +316,7 @@ class TomachiePdn:
         self.isolated: dict[str, list[str]] = {}   # isolated converter -> its output rails
         self.pull_sinks: dict[str, str] = {}       # pull resistor -> the rail it pulls from
         self.extra_inputs: dict[tuple[str, str], list] = {}  # (reg, rail) -> other input rails
+        self.source_outputs: dict[tuple[str, str], str] = {}  # (source, output net) -> first rail
 
     # ------------------------------------------------------------ roles
     def _source_volts(self, rail: dict) -> float | None:
@@ -374,6 +375,20 @@ class TomachiePdn:
                     self.notes.append(f"Rail {name}: source {src.get('refdes')} has no stated "
                                       "voltage or pins; no SOURCE")
                     continue
+                # The parts between the connector's pin and the rail carry its current.
+                for e in src.get("output_path") or []:
+                    if e.get("net_in") and e.get("net_out"):
+                        self._series(e)
+                self._cable_note(name, src)
+                out = (src["refdes"], src.get("output_net") or name)
+                if out in self.source_outputs:
+                    # A second rail from the same connector pin: behind the source
+                    # already placed, through its own parts. One source, not two.
+                    self.notes.append(f"Rail {name}: {src['refdes']}'s output, placed with "
+                                      f"{self.source_outputs[out]}")
+                    self.powered.add(name)
+                    continue
+                self.source_outputs[out] = name
                 values = {
                     "ROLE": "SOURCE", "V": f"{v:g}", "P_NET": src.get("output_net") or name,
                     "N_NET": self.gnd, "P_PINS": ",".join(_pads(src["refdes"], src["pins"]))}
@@ -395,6 +410,14 @@ class TomachiePdn:
                                       f"minimum {v:g} V (nominal {r['voltage']['nominal']:g} V)")
                 self.ch.add(src["refdes"], ("SOURCE", name), values)
                 self.powered.add(name)
+
+    def _cable_note(self, rail: str, src: dict):
+        """A USB Type-C receptacle's cable allowance is off the board: not in the solve."""
+        cable = src.get("cable")
+        ohms = _number(cable.get("resistance_ohm")) if isinstance(cable, dict) else None
+        if ohms and self.corner == "max":
+            self.notes.append(f"Rail {rail}: {src['refdes']}'s cable allowance {ohms * 1e3:g} mOhm "
+                              "is not in the solve; the rail reads that much high")
 
     def _ideal_source(self, ref: str, rail: str, src: dict, v: float, why: str):
         """A regulator FYPA cannot model as one (its type or its input pins are not in the
@@ -847,7 +870,28 @@ class TomachiePdn:
         pins = ",".join(_pads(l["refdes"], l.get("pins", [])))
         values = {"ROLE": "SINK", "I": f"{amps:g}", "P_NET": net, "N_NET": self.gnd,
                   "P_PINS": pins}
-        if l["role"] in ("resistive_path", "pull_resistor"):
+        driver = l.get("driver") if isinstance(l.get("driver"), dict) else {}
+        drv_ref = driver.get("refdes")
+        drv_return = _pads(drv_ref, driver.get("return_pins") or []) if drv_ref else []
+        if l["role"] == "motor_output":
+            # Driven off the board: the connector's terminals sit on the motor phases, not
+            # on the rail. The current leaves at the driver's supply pins and returns at
+            # its ground pins, as a channel of the driver's own.
+            supply = _pads(drv_ref, driver.get("supply_pins") or []) if drv_ref else []
+            if not supply:
+                self.notes.append(f"{l['refdes']} on {rail}: motor with no driver supply pins in "
+                                  f"the file; no SINK, so {rail}'s drop is a lower bound")
+                return
+            values["P_PINS"] = ",".join(supply)
+            if drv_return:
+                values["N_PINS"] = ",".join(drv_return)
+            self.ch.add(drv_ref, ("SINK", net, l["refdes"]), values)
+            return
+        if l["role"] == "resistive_path" and drv_return:
+            # An LED a driver sinks: its current returns at the driver's ground pins.
+            values["N_DES"] = drv_ref
+            values["N_PINS"] = ",".join(drv_return)
+        elif l["role"] in ("resistive_path", "pull_resistor"):
             # A resistor / LED chain reaches ground through its LAST part, and a pull
             # resistor through the part whose pin it pulls, not the one on the rail: the
             # return terminal is that part's ground pads (PDN_N_DES). Two-terminal like
