@@ -7,7 +7,7 @@ with this fork's tag as a local version ("0.1.0-dev+tomachie.1"). Raise the tag'
 with every change this fork ships.
 """
 
-TAG = "tomachie.2"
+TAG = "tomachie.3"
 BY = "Tomachie LLC"
 REPO = "https://github.com/Tomachie/FYPA"
 
