@@ -921,3 +921,36 @@ def test_a_file_with_no_grounds_list_takes_the_first_ground_net():
     pdn["ground_nets"] = ["GND", "V-"]
     p, _ = params(pdn=pdn)
     assert p["J1"]["PDN1_N_NET"] == "GND"
+
+
+def _sensed(sense):
+    pdn = copy.deepcopy(PDN)
+    pdn["rails"][1]["source"]["sense"] = sense
+    return params(pdn=pdn)
+
+
+def test_a_regulator_regulates_at_its_feedback_divider_on_its_output_net():
+    p, notes = _sensed({"pins": ["U2_5"], "pin_names": ["FB"], "net": "FB",
+                        "at": {"pins": ["R20_2"], "net": "SW"}})
+    assert (p["U2"]["PDN1_SENSE_DES"], p["U2"]["PDN1_SENSE_PINS"]) == ("R20", "2")
+    assert "PDN1_SENSE_N_DES" not in p["U2"]
+    assert any("U2 (+3V3): regulated at its feedback point, R20_2 on SW" in n for n in notes)
+
+
+def test_a_feedback_point_past_the_output_inductor_is_not_a_sense():
+    # +3V3 is the far side of L1, a separate net in FYPA: a sense must be on OUT_P.
+    p, notes = _sensed({"pins": ["U2_5"], "net": "FB", "at": {"pins": ["R20_2"], "net": "+3V3"}})
+    assert "PDN1_SENSE_DES" not in p["U2"]
+    assert any("R20_2 on +3V3, not on its output net SW" in n for n in notes)
+
+
+def test_a_return_sense_on_the_ground():
+    p, _ = _sensed({"pins": ["U2_5"], "net": "SW", "return": {"pins": ["U2_6"], "net": "GND"}})
+    assert (p["U2"]["PDN1_SENSE_DES"], p["U2"]["PDN1_SENSE_PINS"]) == ("U2", "5")
+    assert (p["U2"]["PDN1_SENSE_N_DES"], p["U2"]["PDN1_SENSE_N_PINS"]) == ("U2", "6")
+
+
+def test_a_feedback_point_off_the_output_copper_is_not_a_sense():
+    p, notes = _sensed({"pins": ["U2_5"], "net": "FB", "at": {"pins": ["R20_2"], "net": "+3V3A"}})
+    assert "PDN1_SENSE_DES" not in p["U2"]
+    assert any("R20_2 on +3V3A, not on its output net SW" in n for n in notes)
