@@ -356,6 +356,7 @@ _PIN_FILTER_MODIFIER_SUFFIXES: frozenset[str] = (
 # pins) the + and − sense lines land on. Modifiers, not channel-defining.
 _REMOTE_SENSE_SUFFIXES: frozenset[str] = frozenset({
     "SENSE_DES", "SENSE_PINS", "SENSE_N_DES", "SENSE_N_PINS",
+    "SENSE_NET", "SENSE_N_NET",
 })
 _COMMON_TERMINAL_SUFFIXES: frozenset[str] = frozenset({
     "NET", "PINS", "P_NET", "N_NET", "P_PINS", "N_PINS", "IGNORE_PINS",
@@ -3806,16 +3807,19 @@ def _resolve_remote_sense(
     ``PDN_SENSE_N_DES`` / ``PDN_SENSE_N_PINS`` likewise on the output N net
     for the − sense. Either may be omitted: that side senses locally, at the
     output pins themselves. A single-net SOURCE has no copper N terminal, so
-    it can only sense +.
+    it can only sense +. ``PDN_SENSE_NET`` / ``PDN_SENSE_N_NET`` name another
+    net for the sense pads: a feedback divider on the rail past a switcher's
+    output inductor, which is a SERIES part between OUT_P and the rail.
 
     Returns ``(sense_p, sense_n)`` (either ``None`` = local), or ``None``
     when a sense parameter is set but cannot be resolved (error recorded)."""
     out: list[TerminalSpec | None] = []
-    for side, term, des_key, pins_key in (
-        ("+", out_p, "SENSE_DES", "SENSE_PINS"),
-        ("−", out_n, "SENSE_N_DES", "SENSE_N_PINS"),
+    for side, term, des_key, pins_key, net_key in (
+        ("+", out_p, "SENSE_DES", "SENSE_PINS", "SENSE_NET"),
+        ("−", out_n, "SENSE_N_DES", "SENSE_N_PINS", "SENSE_N_NET"),
     ):
         des_k, pins_k = _channel_key(des_key, idx), _channel_key(pins_key, idx)
+        sense_net = (_ci_get(params, _channel_key(net_key, idx)) or "").strip() or None
         des = _split_pin_list(_ci_get(params, des_k))
         pins = _split_pin_list(_ci_get(params, pins_k))
         if des is None:
@@ -3832,7 +3836,7 @@ def _resolve_remote_sense(
                 f"source has no copper return to sense; use PDN_P_NET / "
                 f"PDN_N_NET to sense the return")
             return None
-        net = _terminal_net_name(proj, term)
+        net = sense_net or _terminal_net_name(proj, term)
         spec, errs, _tier = _resolve_terminal_multi(
             proj, des, net, pins, enabled_layers,
             f"{role_diag} {side}sense", warnings=result.warnings,

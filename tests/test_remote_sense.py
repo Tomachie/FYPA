@@ -129,3 +129,24 @@ def test_regulator_output_senses_remotely():
     assert [(p.component_designator, p.pad_designator)
             for p in r.out_sense_p.pins] == [("U6", "1")]
     assert r.out_sense_n is None
+
+
+def test_sense_on_another_net_named_by_sense_net():
+    # The source's output is +3V3; the sense pads (U1's) are on +5V, joined to
+    # it through a series part: PDN_SENSE_NET names the net they are on.
+    src = ("J1", {"PDN_ROLE": "SOURCE", "PDN_V": "5", "PDN_P_NET": "+3V3",
+                  "PDN_N_NET": "GND", "PDN_SENSE_DES": "U1", "PDN_SENSE_PINS": "3",
+                  "PDN_SENSE_NET": "+5V"},
+           [("1", P3V3), ("2", GND)])
+    result = parse_annotations(_proj([src, LOAD]), enabled_layers=[1])
+    assert result.ok, result.errors
+    s = next(d for d in result.directives if isinstance(d, SourceSpec))
+    assert [(p.pad_designator, p.net_index) for p in s.sense_p.pins] == [("3", P5V)]
+
+
+def test_without_sense_net_the_pads_must_be_on_the_output_net():
+    src = ("J1", {"PDN_ROLE": "SOURCE", "PDN_V": "5", "PDN_P_NET": "+3V3",
+                  "PDN_N_NET": "GND", "PDN_SENSE_DES": "U1", "PDN_SENSE_PINS": "3"},
+           [("1", P3V3), ("2", GND)])
+    result = parse_annotations(_proj([src, LOAD]), enabled_layers=[1])
+    assert result.errors

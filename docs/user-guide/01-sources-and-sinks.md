@@ -292,6 +292,8 @@ copper drops on the way. Tell FYPA where the sense line lands:
 | `PDN_SENSE_PINS`   | `12`   | Optional: only these pins of the sense part(s) |
 | `PDN_SENSE_N_DES`  | `U5`   | − sense: U5's pads on the N net (two-terminal only) |
 | `PDN_SENSE_N_PINS` | `13`   | Optional: only these pins |
+| `PDN_SENSE_NET`    | `+5V`  | Optional: the net the + sense pads are on, when it is not the output P net — a regulator's feedback divider on the rail past its output inductor (a `SERIES` part) |
+| `PDN_SENSE_N_NET`  | `GND`  | Optional: likewise for the − sense pads |
 
 Either side may be left out; it then senses locally, at the source's own
 pins. The solve holds `V(sense+) − V(sense−) = PDN_V` exactly, so the
