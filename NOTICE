@@ -33,7 +33,8 @@ Tomachie LLC
 * License:  Contributed under the GNU Affero General Public License v3.0
 * Contributions:
   - Tomachie pdn.json power-tree import (fypa/tomachie_pdn.py,
-    fypa/viewer/tomachie_menu.py, --pdn-json / --pdn-corner CLI options)
+    fypa/viewer/tomachie_menu.py, --pdn-json / --pdn-corner CLI options),
+    with the board temperature taken from the file's maximum ambient
   - Series diodes with a forward drop and datasheet Vf-vs-If curve, solved
     open when reverse-biased (fypa/altium/diode_curve.py, PDN_VF,
     PDN_VF_CURVE)

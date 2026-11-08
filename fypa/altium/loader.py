@@ -5632,9 +5632,10 @@ def load_project(prjpcb_path: str | Path,
     # the designer did not annotate (fypa.tomachie_pdn).
     pdn_notes: list[str] = []
     pdn_designators: set[str] = set()
+    pdn_ambient: float | None = None
     if pdn_json is not None:
         from fypa.tomachie_pdn import (apply_to_project, applied_designators,
-                                       read_pdn_for_board)
+                                       read_pdn_ambient, read_pdn_for_board)
         # Any failure reading or applying the file (missing, malformed, an
         # unexpected shape anywhere in it) must leave the design loadable: the
         # path is saved in the .fypa and applied on every Resolve, so a raise
@@ -5644,12 +5645,13 @@ def load_project(prjpcb_path: str | Path,
             params, read_notes = read_pdn_for_board(pdn_json, pdn_corner, extracted)
             applied = applied_designators(params, extracted)
             new_extracted, more = apply_to_project(extracted, params)
+            ambient = read_pdn_ambient(pdn_json)
         except Exception as e:
             pdn_notes = [f"pdn.json: {Path(pdn_json).name} not applied "
                          f"({type(e).__name__}: {e}); the design is loaded without it"]
             log.warning("  %s", pdn_notes[0])
         else:
-            extracted, pdn_designators = new_extracted, applied
+            extracted, pdn_designators, pdn_ambient = new_extracted, applied, ambient
             pdn_notes = [f"pdn.json: {n}" for n in read_notes + more]
             log.info("  %s: PDN_* parameters for %d component(s), %s corner",
                      Path(pdn_json).name, len(params), pdn_corner)
@@ -5733,6 +5735,9 @@ def load_project(prjpcb_path: str | Path,
     # Designators whose directives came from the Tomachie file, so the Setup tab
     # says where they came from instead of naming a schematic sheet.
     loaded.pdn_designators = frozenset(pdn_designators)
+    # The board's maximum ambient the Tomachie file gives (°C), or None: the
+    # headless solve takes it as the board temperature.
+    loaded.pdn_ambient_c = pdn_ambient
     return loaded
 
 

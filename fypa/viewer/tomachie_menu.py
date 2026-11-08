@@ -49,6 +49,20 @@ def pdn_choice(window, prjpcb=None) -> tuple[Path | None, str]:
     return (Path(path) if path else None), getattr(project, "pdn_corner", "typ") or "typ"
 
 
+def take_board_ambient(window, pdn: dict) -> None:
+    """Set the board temperature to the file's maximum ambient, in the settings and the Settings tab."""
+    from fypa.tomachie_pdn import ambient_max_c
+    from fypa.viewer.project_open import _resync_settings_fields
+
+    t = ambient_max_c(pdn)
+    settings = getattr(window, "_solve_settings", None)
+    if t is None or settings is None:
+        return
+    settings.temperature_c = t
+    _resync_settings_fields(window, {"temperature_c": t})
+    log.info("Tomachie pdn.json: board temperature set to %g °C, the board's maximum ambient", t)
+
+
 def _read(pdn_path: Path) -> dict:
     try:
         return json.loads(pdn_path.read_text(encoding="utf-8"))
@@ -145,6 +159,7 @@ def on_load_tomachie_pdn(window) -> None:
     if prj is None or not _confirm_project(window, pdn_path, pdn, prj):
         return
     window._tomachie_pdn = (pdn_path, corner, prj)
+    take_board_ambient(window, pdn)
     project = getattr(window, "_project", None)
     if project is not None and hasattr(project, "pdn_json"):
         project.pdn_json, project.pdn_corner = str(pdn_path), corner

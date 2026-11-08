@@ -979,7 +979,16 @@ class TomachiePdn:
         self._loads()
         self._not_fitted()
         self._switched_paths()
+        self._ambient()
         return dict(self.ch.params), self.notes
+
+    def _ambient(self):
+        t = ambient_max_c(self.pdn)
+        self.notes.append(
+            f"Temperature: the board's maximum ambient is {t:g} °C; the board temperature "
+            "is set to it" if t is not None else
+            "Temperature: the file states no maximum ambient; the board temperature "
+            "setting is kept")
 
     def _switched_paths(self):
         for sp in self.pdn.get("switched_paths") or []:
@@ -1038,6 +1047,14 @@ class TomachiePdn:
                               + ", ".join(opened))
         if left:
             self.notes.append("Not fitted, left out: " + ", ".join(left))
+
+
+def ambient_max_c(pdn: dict) -> float | None:
+    return _number(pdn.get("ambient_max_c")) if isinstance(pdn, dict) else None
+
+
+def read_pdn_ambient(path) -> float | None:
+    return ambient_max_c(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def read_pdn_parameters(path, corner: str = "typ") -> tuple[dict[str, dict[str, str]], list[str]]:
