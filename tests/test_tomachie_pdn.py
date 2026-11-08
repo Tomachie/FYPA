@@ -933,15 +933,20 @@ def test_a_regulator_regulates_at_its_feedback_divider_on_its_output_net():
     p, notes = _sensed({"pins": ["U2_5"], "pin_names": ["FB"], "net": "FB",
                         "at": {"pins": ["R20_2"], "net": "SW"}})
     assert (p["U2"]["PDN1_SENSE_DES"], p["U2"]["PDN1_SENSE_PINS"]) == ("R20", "2")
-    assert "PDN1_SENSE_N_DES" not in p["U2"]
+    assert "PDN1_SENSE_NET" not in p["U2"] and "PDN1_SENSE_N_DES" not in p["U2"]
+    assert float(p["L1"]["PDN1_R"]) == pytest.approx(0.001)
     assert any("U2 (+3V3): regulated at its feedback point, R20_2 on SW" in n for n in notes)
 
 
-def test_a_feedback_point_past_the_output_inductor_is_not_a_sense():
-    # +3V3 is the far side of L1, a separate net in FYPA: a sense must be on OUT_P.
+def test_a_feedback_point_past_the_output_inductor_is_the_sense():
+    # U2's divider top R20_2 is on +3V3, past L1 from the switch node: the sense
+    # net is +3V3, and L1 takes its own DCR (64 mOhm typical) - the loop holds
+    # +3V3 at R20_2 and makes L1's drop up at the switch pins.
     p, notes = _sensed({"pins": ["U2_5"], "net": "FB", "at": {"pins": ["R20_2"], "net": "+3V3"}})
-    assert "PDN1_SENSE_DES" not in p["U2"]
-    assert any("R20_2 on +3V3, not on its output net SW" in n for n in notes)
+    assert (p["U2"]["PDN1_SENSE_DES"], p["U2"]["PDN1_SENSE_PINS"],
+            p["U2"]["PDN1_SENSE_NET"]) == ("R20", "2", "+3V3")
+    assert float(p["L1"]["PDN1_R"]) == pytest.approx(0.064)
+    assert any("L1: inside U2's regulation loop, before its feedback point" in n for n in notes)
 
 
 def test_a_return_sense_on_the_ground():
@@ -953,4 +958,4 @@ def test_a_return_sense_on_the_ground():
 def test_a_feedback_point_off_the_output_copper_is_not_a_sense():
     p, notes = _sensed({"pins": ["U2_5"], "net": "FB", "at": {"pins": ["R20_2"], "net": "+3V3A"}})
     assert "PDN1_SENSE_DES" not in p["U2"]
-    assert any("R20_2 on +3V3A, not on its output net SW" in n for n in notes)
+    assert any("R20_2 on +3V3A is not on its output or its rail" in n for n in notes)

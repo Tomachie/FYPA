@@ -14,10 +14,10 @@ SCHEMA_VERSION = 1
 SOURCE_ROLES = ("board_input", "battery", "generator")
 REGULATOR_TYPE = {"linear": "LDO", "switching": "SMPS", "isolated": "SMPS"}
 NOT_FITTED_OHMS = 5e8
-# A part inside a switcher's regulation loop (its output inductor): above FYPA's 0.9 mOhm
-# net-merge threshold, so it stays a SERIES part joined across its pads; a merged link
-# is re-made as a resistor between two points, whose spreading resistance at the full
-# output current is larger than the part's.
+# A part inside a switcher's regulation loop (its output inductor) when the file gives no
+# feedback point: above FYPA's 0.9 mOhm net-merge threshold, so it stays a SERIES part
+# joined across its pads. With the feedback point given, the part takes its own DC
+# resistance and the regulator holds the set voltage past it.
 LOOP_BRIDGE_OHMS = 0.001
 OPEN_CLASSES = ("capacitor", "device", "connector")
 DC_RESISTANCE_SPECS = ("dcr", "dc_resistance", "resistance", "rds_on", "jumper_resistance",
@@ -618,6 +618,11 @@ class TomachiePdn:
             for e in path:
                 if not (e.get("net_in") and e.get("net_out")):
                     continue
+                if values["REGULATOR_TYPE"] == "SMPS" and "SENSE_NET" in values:
+                    self.notes.append(f"{e['refdes']}: inside {ref}'s regulation loop, before its "
+                                      "feedback point; its own DC resistance, made up by the loop")
+                    self._series(e)
+                    continue
                 if values["REGULATOR_TYPE"] == "SMPS":
                     self.notes.append(f"{e['refdes']}: inside {ref}'s regulation loop; bridged "
                                       "(its loss is in the efficiency)")
@@ -633,17 +638,24 @@ class TomachiePdn:
             return
         point = sense.get("at") if isinstance(sense.get("at"), dict) else sense
         pins = [p for p in point.get("pins") or [] if "_" in p]
-        if not pins or point.get("net") != values["OUT_P_NET"]:
+        net = point.get("net")
+        path = {e["net_out"] for e in src.get("output_path") or [] if e.get("net_out")}
+        if not pins or net not in path | {values["OUT_P_NET"], rail}:
             self.notes.append(f"{ref} ({rail}): feedback point {', '.join(point.get('pins') or [])}"
-                              f" on {point.get('net')}, not on its output net "
-                              f"{values['OUT_P_NET']}; regulated at its output pins")
+                              f" on {net} is not on its output or its rail; regulated at its "
+                              "output pins")
             return
+        if net != values["OUT_P_NET"]:
+            values["SENSE_NET"] = net
         values["SENSE_DES"] = ",".join(sorted({p.rpartition("_")[0] for p in pins}))
         values["SENSE_PINS"] = ",".join(sorted({p.rpartition("_")[2] for p in pins}))
         what = f"{', '.join(pins)} on {point['net']}"
-        ret = sense.get("return") if isinstance(sense.get("return"), dict) else None
-        rpins = [p for p in (ret or {}).get("pins") or [] if "_" in p]
-        if rpins and ret.get("net") == values["OUT_N_NET"]:
+        ret = sense.get("return") if isinstance(sense.get("return"), dict) else {}
+        rpins = [p for p in ret.get("pins") or [] if "_" in p]
+        rnet = ret.get("net")
+        if rpins and rnet:
+            if rnet != values["OUT_N_NET"]:
+                values["SENSE_N_NET"] = rnet
             values["SENSE_N_DES"] = ",".join(sorted({p.rpartition("_")[0] for p in rpins}))
             values["SENSE_N_PINS"] = ",".join(sorted({p.rpartition("_")[2] for p in rpins}))
             what += f", return at {', '.join(rpins)}"
