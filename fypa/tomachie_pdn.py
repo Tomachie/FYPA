@@ -428,7 +428,10 @@ class TomachiePdn:
                 self._load_switch(reg, name, src)
                 continue
             v = _number(r.get("voltage", {}).get("nominal"))
-            kind = REGULATOR_TYPE.get((reg or {}).get("type"))
+            # A part with both kinds of output (a PMIC's bucks beside its LDOs) types each
+            # output: a linear one draws its output current, not its power over an efficiency.
+            own = ((reg or {}).get("output_kinds") or {}).get(name)
+            kind = REGULATOR_TYPE.get(own or (reg or {}).get("type"))
             vin, vin_pins, vin_rail = self._input(reg) if reg else (None, [], None)
             if reg is not None and v is not None and src.get("pins") and (
                     kind is None or vin is None):

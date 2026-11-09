@@ -138,6 +138,16 @@ def test_switcher_without_efficiency_is_said():
     assert any("U2 (+3V3): efficiency not read" in n for n in notes)
 
 
+def test_a_pmics_linear_output_is_an_ldo():
+    # A PMIC with bucks and LDOs (STPMIC2L) types each output in output_kinds: an LDO
+    # output draws its own current from the input, whatever the part's efficiency.
+    pdn = copy.deepcopy(PDN)
+    pdn["regulators"][0].update(efficiency="unknown", output_kinds={"+3V3": "linear"})
+    p, notes = params(pdn=pdn)
+    assert p["U2"]["PDN1_REGULATOR_TYPE"] == "LDO"
+    assert not any("U2 (+3V3): efficiency not read" in n for n in notes)
+
+
 def test_wrong_schema_and_corner_are_refused():
     with pytest.raises(PdnImportError):
         TomachiePdn({"schema": "x"})
