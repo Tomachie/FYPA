@@ -875,11 +875,19 @@ def test_two_rails_from_one_connector_pin_are_one_source():
     assert any("J5's output, placed with VBAT" in n for n in notes)
 
 
-def test_a_cable_allowance_is_named_in_the_worst_case():
+def test_a_cable_allowance_lowers_the_worst_case_source():
+    """USB Type-C guarantees its minimum at the source's receptacle, not this board's:
+    the worst case takes the allowance times the rail's current off the source."""
     pdn = _board_input_pdn()
     pdn["rails"][0]["source"]["cable"] = {"resistance_ohm": 0.25}
+    pdn["rails"][0]["voltage"]["min"] = 4.75
+    pdn["rails"][0]["total_current_max"] = {"amps": 0.6815, "basis": "rollup"}
+    p, notes = params(pdn=pdn, corner="max")
+    assert float(p["J5"]["PDN1_V"]) == pytest.approx(4.75 - 0.25 * 0.6815, abs=1e-4)
+    assert any("cable allowance 250 mOhm at the rail's 681.5 mA" in n for n in notes)
+    del pdn["rails"][0]["total_current_max"]
     _, notes = params(pdn=pdn, corner="max")
-    assert any("cable allowance 250 mOhm" in n for n in notes)
+    assert any("is not in the solve (the rail's current is not stated)" in n for n in notes)
     _, notes = params(pdn=pdn)
     assert not any("cable allowance" in n for n in notes)
 

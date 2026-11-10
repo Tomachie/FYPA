@@ -255,9 +255,26 @@ class TomachiePdn:
         self.source_outputs: dict[tuple[str, str], str] = {}
 
     def _source_volts(self, rail: dict) -> float | None:
+        """The source's voltage at this corner. Worst case: its minimum, less its cable
+        allowance (a USB Type-C source guarantees 4.75 V at its own receptacle, not at
+        this board's)."""
         v = rail.get("voltage", {})
         lo = _number(v.get("min"))
-        return lo if self.corner == "max" and lo is not None else _number(v.get("nominal"))
+        if self.corner != "max":
+            return _number(v.get("nominal"))
+        volts = lo if lo is not None else _number(v.get("nominal"))
+        ohms, amps = self._cable(rail)
+        return volts - ohms * amps if volts is not None and ohms and amps else volts
+
+    @staticmethod
+    def _cable(rail: dict) -> tuple[float | None, float | None]:
+        """A board input's cable allowance (ohms) and the rail's worst-case current."""
+        src = rail.get("source") or {}
+        cable = src.get("cable")
+        ohms = _number(cable.get("resistance_ohm")) if isinstance(cable, dict) else None
+        cur = rail.get("total_current_max") or rail.get("total_current") or {}
+        amps = _number(cur.get("amps")) if isinstance(cur, dict) else None
+        return ohms, amps
 
     def _supply_volts(self, rail_name: str | None) -> float | None:
         if self.corner != "max" or rail_name not in self.rails:
@@ -333,11 +350,19 @@ class TomachiePdn:
                 self.powered.add(name)
 
     def _cable_note(self, rail: str, src: dict):
-        cable = src.get("cable")
-        ohms = _number(cable.get("resistance_ohm")) if isinstance(cable, dict) else None
-        if ohms and self.corner == "max":
+        if self.corner != "max":
+            return
+        ohms, amps = self._cable(self.rails[rail])
+        if not ohms:
+            return
+        if amps:
             self.notes.append(f"Rail {rail}: {src['refdes']}'s cable allowance {ohms * 1e3:g} mOhm "
-                              "is not in the solve; the rail reads that much high")
+                              f"at the rail's {amps * 1e3:.4g} mA: the source is set "
+                              f"{ohms * amps * 1e3:.4g} mV below its minimum")
+        else:
+            self.notes.append(f"Rail {rail}: {src['refdes']}'s cable allowance {ohms * 1e3:g} mOhm "
+                              "is not in the solve (the rail's current is not stated); the rail "
+                              "reads that much high")
 
     def _ideal_source(self, ref: str, rail: str, src: dict, v: float, why: str):
         self.notes.append(f"{ref} ({rail}): {why}; modeled as an ideal source, drawing "
