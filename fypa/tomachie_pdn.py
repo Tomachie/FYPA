@@ -754,6 +754,12 @@ class TomachiePdn:
             if e.get("net_in") and e.get("net_out"):
                 self._series(e)
         amps = self._sink_current(l)
+        if amps is None and self._estimated_only(l):
+            # No figure of its own (an FPGA's VCCO banks): its estimated banks are its SINKs.
+            net = l.get("input_net") or rail
+            self._bank_sinks(rail, l, net, {"ROLE": "SINK", "P_NET": net, "N_NET": self.gnd},
+                             own_current=False)
+            return
         if amps is None:
             why = l.get("load_dependent_reason") if l.get("load_dependent") else "current not known"
             self.notes.append(f"{l['refdes']} on {rail}: {why}; no SINK, so {rail}'s drop is a "
@@ -823,12 +829,22 @@ class TomachiePdn:
                           + (f"; {', '.join(others)} draw none stated (no SINK)" if others else ""))
         return _pads(l["refdes"], owners[0].get("pins", []))
 
-    def _bank_sinks(self, rail: str, l: dict, net: str, values: dict[str, str]):
+    @staticmethod
+    def _estimated_only(l: dict) -> bool:
+        die = l.get("die_supplies")
+        if not isinstance(die, list):
+            return False
+        return (any(g.get("current_is") == "estimated" for g in die)
+                and not any(g.get("current_is") == "this_supply" for g in die))
+
+    def _bank_sinks(self, rail: str, l: dict, net: str, values: dict[str, str],
+                    own_current: bool = True):
         """A SINK for each I/O bank Tomachie estimated (current_is "estimated": its
         connected bank pins x an assumed drive and duty) at that supply's own pins - the
         designer's to change, named in the notes."""
         die = l.get("die_supplies")
-        if not isinstance(die, list) or not any(g.get("current_is") == "this_supply" for g in die):
+        if not isinstance(die, list) or (
+                own_current and not any(g.get("current_is") == "this_supply" for g in die)):
             return
         for g in die:
             if g.get("current_is") != "estimated":

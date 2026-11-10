@@ -1008,3 +1008,13 @@ def test_an_estimated_bank_gets_its_own_sink_and_is_named():
     assert p["U5"]["PDN1_P_PINS"] == "8" and p["U5"]["PDN2_P_PINS"] == "7"
     assert p["U5"]["PDN2_I"] == "0.011"
     assert any("[VDDIO3]" in n and "ESTIMATED" in n for n in notes)
+
+
+def test_a_load_with_no_current_of_its_own_gets_sinks_for_its_estimated_banks():
+    pdn = copy.deepcopy(PDN)
+    u6 = pdn["rails"][1]["loads"][1]          # U6: current unknown
+    u6["die_supplies"] = [{"name": "VCCO_43", "pins": ["U6_1"], "current_is": "estimated",
+                           "current": {"amps": 0.005, "basis": "estimated", "conditions": "5 pins"}}]
+    p, notes = params(pdn=pdn)
+    assert p["U6"]["PDN1_I"] == "0.005" and p["U6"]["PDN1_P_PINS"] == "1"
+    assert any("[VCCO_43]" in n and "ESTIMATED" in n for n in notes)
