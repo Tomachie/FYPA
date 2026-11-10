@@ -755,10 +755,9 @@ class TomachiePdn:
                 self._series(e)
         amps = self._sink_current(l)
         if amps is None and self._estimated_only(l):
-            # No figure of its own (an FPGA's VCCO banks): its estimated banks are its SINKs.
+            # No figure of its own (an FPGA's VCCO banks): its I/O currents are its SINKs.
             net = l.get("input_net") or rail
-            self._bank_sinks(rail, l, net, {"ROLE": "SINK", "P_NET": net, "N_NET": self.gnd},
-                             own_current=False)
+            self._bank_sinks(rail, l, net, {"ROLE": "SINK", "P_NET": net, "N_NET": self.gnd})
             return
         if amps is None:
             why = l.get("load_dependent_reason") if l.get("load_dependent") else "current not known"
@@ -823,41 +822,48 @@ class TomachiePdn:
                               "as the current's; drawn at all its pins")
             return []
         others = [g.get("name", "?") for g in die
-                  if g is not owners[0] and g.get("current_is") != "estimated"]
+                  if g is not owners[0] and not self._io_current(g, self.corner)]
         self.notes.append(f"{l['refdes']} on {rail}: its current is {owners[0].get('name')}'s, "
                           "drawn at those pins"
                           + (f"; {', '.join(others)} draw none stated (no SINK)" if others else ""))
         return _pads(l["refdes"], owners[0].get("pins", []))
 
     @staticmethod
-    def _estimated_only(l: dict) -> bool:
+    def _io_current(g: dict, corner: str) -> float | None:
+        """A die supply's I/O current (revision 19 ``io_current`` / ``io_current_max``;
+        revision 18 wrote it as ``current`` with ``current_is`` "estimated")."""
+        if isinstance(g.get("io_current"), dict):
+            return _amps(g.get("io_current_max") if corner == "max" else g.get("io_current"))
+        if g.get("current_is") == "estimated":
+            return _amps(g.get("current_max") if corner == "max" else g.get("current"))
+        return None
+
+    def _estimated_only(self, l: dict) -> bool:
         die = l.get("die_supplies")
         if not isinstance(die, list):
             return False
-        return (any(g.get("current_is") == "estimated" for g in die)
+        return (any(self._io_current(g, self.corner) for g in die)
                 and not any(g.get("current_is") == "this_supply" for g in die))
 
-    def _bank_sinks(self, rail: str, l: dict, net: str, values: dict[str, str],
-                    own_current: bool = True):
-        """A SINK for each I/O bank Tomachie estimated (current_is "estimated": its
-        connected bank pins x an assumed drive and duty) at that supply's own pins - the
+    def _bank_sinks(self, rail: str, l: dict, net: str, values: dict[str, str]):
+        """A SINK for each die supply's I/O current (what its bank pins drive, Tomachie's
+        estimate) at that supply's own pins, on top of the load's own SINK - a data-sheet
+        supply current is measured without it (STM32MP215 data sheet 5.3.5.2). The
         designer's to change, named in the notes."""
         die = l.get("die_supplies")
-        if not isinstance(die, list) or (
-                own_current and not any(g.get("current_is") == "this_supply" for g in die)):
+        if not isinstance(die, list):
             return
         for g in die:
-            if g.get("current_is") != "estimated":
-                continue
-            amps = _amps(g.get("current_max") if self.corner == "max" else g.get("current"))
-            if amps is None:
+            amps = self._io_current(g, self.corner)
+            if not amps:
                 continue
             bank = dict(values, I=f"{amps:g}", P_PINS=",".join(_pads(l["refdes"], g.get("pins", []))))
             self.ch.add(l["refdes"], ("SINK", net, g.get("name")), bank)
-            why = g["current"].get("conditions", "") if isinstance(g.get("current"), dict) else ""
-            self.notes.append(f"{l['refdes']} [{g.get('name')}] on {rail}: {amps * 1e3:g} mA "
-                              f"ESTIMATED, not a data-sheet figure ({why}); change it to the "
-                              "bank's real current")
+            cur = g.get("io_current") if isinstance(g.get("io_current"), dict) else g.get("current")
+            why = cur.get("conditions", "") if isinstance(cur, dict) else ""
+            self.notes.append(f"{l['refdes']} [{g.get('name')}] on {rail}: I/O current "
+                              f"{amps * 1e3:g} mA ESTIMATED, not a data-sheet figure ({why}); "
+                              "change it to the bank's real current")
 
     def _out_before_copper(self, rail: str, l: dict):
         cm = l.get("copper_margin")

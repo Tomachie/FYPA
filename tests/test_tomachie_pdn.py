@@ -1018,3 +1018,24 @@ def test_a_load_with_no_current_of_its_own_gets_sinks_for_its_estimated_banks():
     p, notes = params(pdn=pdn)
     assert p["U6"]["PDN1_I"] == "0.005" and p["U6"]["PDN1_P_PINS"] == "1"
     assert any("[VCCO_43]" in n and "ESTIMATED" in n for n in notes)
+
+
+def test_io_current_is_its_own_sink_beside_the_supply_s_own_figure():
+    # Revision 19: VDD's IDD (Table 24) is measured without the I/O load current, so VDD
+    # gets its IDD SINK and a second SINK for its io_current at the same pins
+    # (STM32MP215 data sheet 5.3.5.2); VDDIO3 draws its io_current alone.
+    pdn = copy.deepcopy(PDN)
+    u5 = pdn["rails"][1]["loads"][0]
+    u5["die_supplies"] = [
+        {"name": "VDDIO3", "pins": ["U5_7"], "current_is": "not_stated",
+         "io_current": {"amps": 0.0009, "basis": "estimated", "conditions": "SPI1_SCK"},
+         "io_current_max": {"amps": 0.0009, "basis": "estimated"}},
+        {"name": "VDD", "pins": ["U5_8"], "current_is": "this_supply",
+         "io_current": {"amps": 0.012, "basis": "estimated"},
+         "io_current_max": {"amps": 0.012, "basis": "estimated"}}]
+    p, notes = params(pdn=pdn)
+    assert p["U5"]["PDN1_P_PINS"] == "8"
+    sinks = {(p["U5"][f"PDN{k}_P_PINS"], p["U5"][f"PDN{k}_I"]) for k in (2, 3)}
+    assert sinks == {("7", "0.0009"), ("8", "0.012")}
+    assert any("[VDD]" in n and "I/O current" in n for n in notes)
+    assert not any("VDDIO3 draw none stated" in n for n in notes)
