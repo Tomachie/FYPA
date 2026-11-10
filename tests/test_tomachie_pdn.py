@@ -993,3 +993,18 @@ def test_die_supplies_with_no_owner_draw_at_every_pin():
     p, notes = params(pdn=pdn)
     assert p["U5"]["PDN1_P_PINS"] == "7,8"
     assert any("none named as the current's" in n for n in notes)
+
+
+def test_an_estimated_bank_gets_its_own_sink_and_is_named():
+    # MB2059 U7 VDDIO3: 11 connected bank pins x 2 mA x 50 % = 11 mA, Tomachie's estimate.
+    pdn = copy.deepcopy(PDN)
+    u5 = pdn["rails"][1]["loads"][0]
+    u5["die_supplies"] = [
+        {"name": "VDDIO3", "pins": ["U5_7"], "current_is": "estimated",
+         "current": {"amps": 0.011, "basis": "estimated", "conditions": "11 of 12 pins"},
+         "current_max": {"amps": 0.011, "basis": "estimated"}},
+        {"name": "VDD", "pins": ["U5_8"], "current_is": "this_supply"}]
+    p, notes = params(pdn=pdn)
+    assert p["U5"]["PDN1_P_PINS"] == "8" and p["U5"]["PDN2_P_PINS"] == "7"
+    assert p["U5"]["PDN2_I"] == "0.011"
+    assert any("[VDDIO3]" in n and "ESTIMATED" in n for n in notes)
