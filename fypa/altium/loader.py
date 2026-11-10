@@ -1054,8 +1054,9 @@ def _directive_to_network(
     #   package internal pin-to-pin resistance AND suppresses the
     #   "equalising-current" pathology that small couplings cause when a
     #   sink's pads sit on copper with natural IR drops.
-    # * SERIES is almost always single-pin per terminal (an SMT resistor's
-    #   two pads), so coupling resistance doesn't kick in.
+    # * SERIES: a resistor's terminals are single-pin, but a load switch's
+    #   are not (MB2059 U14: two pins a side). Its resistance is terminal to
+    #   terminal, package included, so its pins tie at the source's 1 uOhm.
     # * REGULATOR sense pair (in_p/in_n) carries no current — leave on the
     #   default; the value doesn't matter numerically.
     def _sense_nodes(term_p, term_n):
@@ -1118,9 +1119,16 @@ def _directive_to_network(
         node_a, node_b = _pp.NodeID(), _pp.NodeID()
         element = _pp.Resistor(a=node_a, b=node_b, resistance=d.resistance,
                                heat_source=True)
+        # A series part's resistance is terminal to terminal, its package
+        # included (a load switch's RDS(on) is measured pin to pin), so the
+        # pins of one terminal are one node: the sink's 100 mOhm star
+        # coupling would add 100 mOhm / pin count per side (a two-pin-per-side
+        # 48 mOhm switch solved as 148 mOhm).
+        series_coupling = (getattr(d, "pin_coupling_ohm", None)
+                           or SOURCE_COUPLING_RESISTANCE_OHM)
         conns, aux = _gather(
-            (d.p, node_a, COUPLING_RESISTANCE_OHM, "P"),
-            (d.n, node_b, COUPLING_RESISTANCE_OHM, "N"),
+            (d.p, node_a, series_coupling, "P"),
+            (d.n, node_b, series_coupling, "N"),
         )
         if getattr(d, "forward_v", None):
             # A conducting diode, I = (Va - Vb - Vf) / R: the resistor plus Vf / R

@@ -220,3 +220,27 @@ def test_a_reverse_biased_diode_is_reported_open():
     assert rec["is_open"]
     assert rec["value_str"] == "open (reverse-biased)"
     assert resistor_bridge_pairs(rec) == []
+
+
+def test_a_series_part_with_two_pins_a_side_solves_at_its_own_resistance():
+    """MB2059 U14 (STEF05, RDS(on) 48 mOhm, pins 7/8 in and 5/6 out): its terminals
+    are tied by a near-zero coupling, not the sink's 100 mOhm per pin - which put
+    50 mOhm on each side and solved the switch at 148 mOhm."""
+    import types
+    from fypa.altium.annotations import TerminalPin, TerminalSpec
+    from fypa.altium.extract import Pt2D
+    from fypa.altium.loader import SOURCE_COUPLING_RESISTANCE_OHM, _directive_to_network
+
+    layer = types.SimpleNamespace(shape=types.SimpleNamespace(is_empty=False))
+
+    def term(net, *pads):
+        return TerminalSpec(pins=tuple(TerminalPin(p, 1, net, Pt2D(float(i), 0.0))
+                                       for i, p in enumerate(pads)))
+
+    u14 = ResistorSpec(designator="U14", schdoc_name="", resistance=0.048,
+                       p=term(0, "7", "8"), n=term(1, "5", "6"))
+    net = _directive_to_network(u14, {(1, 0): layer, (1, 1): layer})
+    couplings = [e.resistance for e in net.elements
+                 if isinstance(e, pp.Resistor) and e.resistance != 0.048]
+    assert len(couplings) == 4
+    assert all(r == SOURCE_COUPLING_RESISTANCE_OHM for r in couplings)
