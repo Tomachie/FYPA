@@ -718,6 +718,12 @@ class TomachiePdn:
                 if isinstance(current, dict) and current.get("basis") in NOT_A_LOAD:
                     not_supplied.append(f"{l['refdes']} ({name})")
                     continue
+                if isinstance(current, dict) and current.get("basis") == "counted_in":
+                    # Revision 17: its current flows in another part's own circuit and is
+                    # in that part's figure (MB2059 R46 47R on U14 ILIM) - no SINK of its own.
+                    self.notes.append(f"{l['refdes']} on {name}: its current is counted in "
+                                      f"{current.get('counted_in', '?')}'s figure; no SINK")
+                    continue
                 self._sink(name, l)
             for pin in r.get("offboard_pins", []):
                 self.notes.append(f"{name}: power leaves the board at {pin}; that load is not "

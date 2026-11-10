@@ -1039,3 +1039,14 @@ def test_io_current_is_its_own_sink_beside_the_supply_s_own_figure():
     assert sinks == {("7", "0.0009"), ("8", "0.012")}
     assert any("[VDD]" in n and "I/O current" in n for n in notes)
     assert not any("VDDIO3 draw none stated" in n for n in notes)
+
+
+def test_a_part_counted_in_another_gets_no_sink():
+    # Revision 17: MB2059 R46 47R from 5V_VIN to U14 ILIM is U14's own circuit; its current
+    # is in U14's figure, and it has no pad on ground for a SINK to return through.
+    pdn = copy.deepcopy(PDN)
+    u5 = pdn["rails"][1]["loads"][0]
+    u5["current"] = {"amps": 0.0, "basis": "counted_in", "counted_in": "U14"}
+    p, notes = params(pdn=pdn)
+    assert "PDN1_I" not in p.get("U5", {})
+    assert any("U5 on" in n and "counted in U14's figure" in n for n in notes)
