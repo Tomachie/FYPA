@@ -110,6 +110,10 @@ class LoadResult:
     worst_pin: str = ""
     worst_layer: str = ""
     worst_xy: tuple[float, float] | None = None
+    # The return path's drop on the mean of the load's N pins (not the worst one),
+    # from the source's return: the load's ground node as a whole, the figure a solver
+    # that ties a part's ground pins reports.
+    return_drop_mean_v: float | None = None
 
 
 @dataclass

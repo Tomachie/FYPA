@@ -447,6 +447,7 @@ class _Context:
                 load.v_load = v_p - v_ret
                 load.drop_v = setpoint - load.v_load
                 load.return_drop_v = (max(n_volts) - src_ret) if n_volts else 0.0
+                load.return_drop_mean_v = (_mean(n_volts) - src_ret) if n_volts else 0.0
                 load.worst_pin = pin_display_pad(worst_pin)
                 load.worst_layer = self.sampler.layer_name(
                     worst_pin.get("layer_id"))

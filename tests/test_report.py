@@ -203,6 +203,9 @@ def test_load_voltage_matches_the_solved_pins(sandbox_solve, sandbox_report):
     assert load.drop_v == pytest.approx(1.0 - expected, abs=1e-12)
     # 100 squares of ~0.47 mΩ/□ copper at 1 A, plus the return path.
     assert 0.045 < load.drop_v < 0.06
+    # The return on the mean N pin is never above the worst N pin's.
+    assert load.return_drop_mean_v is not None
+    assert load.return_drop_mean_v <= load.return_drop_v + 1e-12
     # Every bit of the rail's loss is on the one layer it's drawn on.
     assert sum(lr.share for lr in rail.layers) == pytest.approx(1.0)
 
