@@ -969,3 +969,27 @@ def test_a_feedback_point_off_the_output_copper_is_not_a_sense():
     p, notes = _sensed({"pins": ["U2_5"], "net": "FB", "at": {"pins": ["R20_2"], "net": "+3V3A"}})
     assert "PDN1_SENSE_DES" not in p["U2"]
     assert any("R20_2 on +3V3A is not on its output or its rail" in n for n in notes)
+
+
+def test_die_supplies_draw_the_current_at_its_own_supplys_pins():
+    # MB2059 U7 on VDDIO: IDD is VDD's; VDDIO3's balls on the same net draw none stated.
+    pdn = copy.deepcopy(PDN)
+    u5 = pdn["rails"][1]["loads"][0]
+    u5["die_supplies"] = [
+        {"name": "VDDIO3", "pins": ["U5_7"], "grouped_by": "pin_name", "current_is": "not_stated"},
+        {"name": "VDD", "pins": ["U5_8"], "grouped_by": "pin_name", "current_is": "this_supply"}]
+    p, notes = params(pdn=pdn)
+    assert p["U5"]["PDN1_P_PINS"] == "8"
+    assert any("U5 on +3V3: its current is VDD's" in n and "VDDIO3 draw none stated" in n
+               for n in notes)
+
+
+def test_die_supplies_with_no_owner_draw_at_every_pin():
+    pdn = copy.deepcopy(PDN)
+    u5 = pdn["rails"][1]["loads"][0]
+    u5["die_supplies"] = [
+        {"name": "A", "pins": ["U5_7"], "current_is": "the_load_s"},
+        {"name": "B", "pins": ["U5_8"], "current_is": "the_load_s"}]
+    p, notes = params(pdn=pdn)
+    assert p["U5"]["PDN1_P_PINS"] == "7,8"
+    assert any("none named as the current's" in n for n in notes)

@@ -793,9 +793,32 @@ class TomachiePdn:
         if isinstance(sm, dict) and _number(sm.get("volts")) is not None:
             values["MIN_V"] = f"{_number(sm['volts']):g}"
         self._out_before_copper(rail, l)
+        own = self._die_supply_pins(rail, l)
+        if own:
+            values["P_PINS"] = ",".join(own)
         self.ch.add(l["refdes"], ("SINK", net), values)
         if l["role"] == "pull_resistor":
             self.pull_sinks[l["refdes"].upper()] = rail
+
+    def _die_supply_pins(self, rail: str, l: dict) -> list[str]:
+        """The pads a load's current is drawn at when its balls are several die supplies
+        (revision 18 die_supplies): the supply whose row the current is
+        (current_is "this_supply") - MB2059 U7 on VDDIO: IDD at VDD's 1G1/1G3/1H2/1H4, not
+        at VDDIO3's F8/F10. The others draw none stated and get no SINK. Empty: all the
+        load's pins (one supply, or none named as the current's). The package resistance
+        the file may give is not modelled here: a SINK's pins are one node."""
+        die = l.get("die_supplies")
+        if not isinstance(die, list) or len(die) < 2:
+            return []
+        owners = [g for g in die if g.get("current_is") == "this_supply"]
+        if len(owners) != 1:
+            self.notes.append(f"{l['refdes']} on {rail}: {len(die)} die supplies, none named "
+                              "as the current's; drawn at all its pins")
+            return []
+        others = [g.get("name", "?") for g in die if g is not owners[0]]
+        self.notes.append(f"{l['refdes']} on {rail}: its current is {owners[0].get('name')}'s, "
+                          f"drawn at those pins; {', '.join(others)} draw none stated (no SINK)")
+        return _pads(l["refdes"], owners[0].get("pins", []))
 
     def _out_before_copper(self, rail: str, l: dict):
         cm = l.get("copper_margin")
