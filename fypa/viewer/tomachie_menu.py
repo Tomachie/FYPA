@@ -63,6 +63,22 @@ def take_board_ambient(window, pdn: dict) -> None:
     log.info("Tomachie pdn.json: board temperature set to %g °C, the board's maximum ambient", t)
 
 
+def take_board_via_plating(window, pdn: dict) -> None:
+    """Set the via plating to the file's, in the settings and the Settings tab."""
+    from fypa.tomachie_pdn import via_plating_mm
+    from fypa.viewer.project_open import _resync_settings_fields
+
+    mm = via_plating_mm(pdn)
+    settings = getattr(window, "_solve_settings", None)
+    if not mm or settings is None:
+        return
+    for name, value in mm.items():
+        setattr(settings, name, value)
+    _resync_settings_fields(window, mm)
+    log.info("Tomachie pdn.json: via plating set to the file's (%s)",
+             ", ".join(f"{k} {v * 1000:g} um" for k, v in mm.items()))
+
+
 def _read(pdn_path: Path) -> dict:
     try:
         return json.loads(pdn_path.read_text(encoding="utf-8"))
@@ -160,6 +176,7 @@ def on_load_tomachie_pdn(window) -> None:
         return
     window._tomachie_pdn = (pdn_path, corner, prj)
     take_board_ambient(window, pdn)
+    take_board_via_plating(window, pdn)
     project = getattr(window, "_project", None)
     if project is not None and hasattr(project, "pdn_json"):
         project.pdn_json, project.pdn_corner = str(pdn_path), corner

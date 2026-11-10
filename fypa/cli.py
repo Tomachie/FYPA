@@ -435,6 +435,9 @@ def _solve_loaded(loaded, args) -> tuple[LeanSolution, dict]:
     ambient = getattr(loaded, "pdn_ambient_c", None)
     if ambient is not None:
         settings.temperature_c = float(ambient)
+    for name, mm in (getattr(loaded, "pdn_via_plating", None) or {}).items():
+        setattr(settings, name, mm)
+    if ambient is not None or getattr(loaded, "pdn_via_plating", None):
         settings.apply_to_modules()
     settings.mesh_min_angle_deg = float(args.mesh_angle)
     settings.mesh_max_size_mm = float(args.mesh_size)

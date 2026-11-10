@@ -407,8 +407,10 @@ def _schedule_cli_altium_import(window, target: dict) -> None:
         window._tomachie_pdn = (Path(target["pdn_json"]).resolve(),
                                 target.get("pdn_corner") or "typ",
                                 Path(target["prjpcb_path"]))
-        from fypa.viewer.tomachie_menu import _read, take_board_ambient
-        take_board_ambient(window, _read(window._tomachie_pdn[0]))
+        from fypa.viewer.tomachie_menu import _read, take_board_ambient, take_board_via_plating
+        pdn = _read(window._tomachie_pdn[0])
+        take_board_ambient(window, pdn)
+        take_board_via_plating(window, pdn)
     pcbdoc = target.get("pcbdoc_path")
     window._cli_import_pending = True
     _open_altium_project_at(

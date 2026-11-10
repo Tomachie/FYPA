@@ -5641,9 +5641,11 @@ def load_project(prjpcb_path: str | Path,
     pdn_notes: list[str] = []
     pdn_designators: set[str] = set()
     pdn_ambient: float | None = None
+    pdn_via_plating: dict[str, float] = {}
     if pdn_json is not None:
         from fypa.tomachie_pdn import (apply_to_project, applied_designators,
-                                       read_pdn_ambient, read_pdn_for_board)
+                                       read_pdn_ambient, read_pdn_for_board,
+                                       read_pdn_via_plating)
         # Any failure reading or applying the file (missing, malformed, an
         # unexpected shape anywhere in it) must leave the design loadable: the
         # path is saved in the .fypa and applied on every Resolve, so a raise
@@ -5654,12 +5656,14 @@ def load_project(prjpcb_path: str | Path,
             applied = applied_designators(params, extracted)
             new_extracted, more = apply_to_project(extracted, params)
             ambient = read_pdn_ambient(pdn_json)
+            via_plating = read_pdn_via_plating(pdn_json)
         except Exception as e:
             pdn_notes = [f"pdn.json: {Path(pdn_json).name} not applied "
                          f"({type(e).__name__}: {e}); the design is loaded without it"]
             log.warning("  %s", pdn_notes[0])
         else:
             extracted, pdn_designators, pdn_ambient = new_extracted, applied, ambient
+            pdn_via_plating = via_plating
             pdn_notes = [f"pdn.json: {n}" for n in read_notes + more]
             log.info("  %s: PDN_* parameters for %d component(s), %s corner",
                      Path(pdn_json).name, len(params), pdn_corner)
@@ -5746,6 +5750,8 @@ def load_project(prjpcb_path: str | Path,
     # The board's maximum ambient the Tomachie file gives (°C), or None: the
     # headless solve takes it as the board temperature.
     loaded.pdn_ambient_c = pdn_ambient
+    # The via barrel plating the file states, as SolveSettings fields ({} = none).
+    loaded.pdn_via_plating = pdn_via_plating
     return loaded
 
 

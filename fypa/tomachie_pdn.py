@@ -1122,7 +1122,19 @@ class TomachiePdn:
         self._not_fitted()
         self._switched_paths()
         self._ambient()
+        self._via_plating()
         return dict(self.ch.params), self.notes
+
+    def _via_plating(self):
+        mm = via_plating_mm(self.pdn)
+        if not mm:
+            return
+        basis = (self.pdn.get("via_plating") or {}).get("basis") or "not stated"
+        self.notes.append(
+            "Via plating from the file (" + str(basis) + "): " + ", ".join(
+                f"{k.replace('plating_', '').replace('_mm', '').replace('thickness', 'through')} "
+                f"{v * 1000:g} um" for k, v in mm.items()) +
+            "; set on the Settings tab")
 
     def _ambient(self):
         t = ambient_max_c(self.pdn)
@@ -1197,6 +1209,29 @@ def ambient_max_c(pdn: dict) -> float | None:
 
 def read_pdn_ambient(path) -> float | None:
     return ambient_max_c(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+# pdn.json via_plating (revision 20) key -> SolveSettings field, um.
+_VIA_PLATING = {"through_um": "plating_thickness_mm", "blind_um": "plating_blind_mm",
+                "buried_um": "plating_buried_mm", "microvia_um": "plating_microvia_mm"}
+
+
+def via_plating_mm(pdn: dict) -> dict[str, float]:
+    """The via barrel plating the file states, as SolveSettings fields in mm ({} = none):
+    no board file carries it, so Tomachie writes the IPC-6012 class it assumes."""
+    vp = pdn.get("via_plating") if isinstance(pdn, dict) else None
+    if not isinstance(vp, dict):
+        return {}
+    out = {}
+    for key, field_name in _VIA_PLATING.items():
+        um = _number(vp.get(key))
+        if um is not None and um > 0:
+            out[field_name] = um / 1000.0
+    return out
+
+
+def read_pdn_via_plating(path) -> dict[str, float]:
+    return via_plating_mm(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def read_pdn_parameters(path, corner: str = "typ") -> tuple[dict[str, dict[str, str]], list[str]]:
