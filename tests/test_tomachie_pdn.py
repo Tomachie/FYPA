@@ -5,7 +5,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from fypa.tomachie_pdn import PdnImportError, TomachiePdn, apply_to_project, dc_resistance
+from fypa.tomachie_pdn import (
+    PdnImportError, TomachiePdn, ambient_max_c, apply_to_project, dc_resistance, via_plating_mm,
+)
 
 V = {"min": "not_specified", "max": "not_specified", "basis": "net_name"}
 
@@ -1058,3 +1060,43 @@ def test_a_part_counted_in_another_gets_no_sink():
     p, notes = params(pdn=pdn)
     assert "PDN1_I" not in p.get("U5", {})
     assert any("U5 on" in n and "counted in U14's figure" in n for n in notes)
+
+
+def _nest_details(node, groups):
+    """The revision-21 form of a file: each key named in ``groups`` ({key: group}) moved
+    under ``details.<group>`` at the level it sits on."""
+    if isinstance(node, list):
+        return [_nest_details(x, groups) for x in node]
+    if not isinstance(node, dict):
+        return node
+    out, details = {}, {}
+    for k, v in node.items():
+        if k in groups:
+            details.setdefault(groups[k], {})[k] = _nest_details(v, groups)
+        else:
+            out[k] = _nest_details(v, groups)
+    if details:
+        out["details"] = details
+    return out
+
+
+REVISION_21_GROUPS = {"via_plating": "process", "ambient_max_c": "temp",
+                      "total_current_max": "worst_case", "total_max_complete": "worst_case",
+                      "loads_without_max_current": "worst_case", "die_supplies": "die",
+                      "copper_margin": "margin", "datasheet_currents": "datasheet",
+                      "ac": "ac", "esl": "esl", "dc_bias": "dc_bias"}
+
+
+def test_a_revision_21_file_reads_as_its_flat_form_did():
+    """What a DC import need not read sits under ``details`` from revision 21; FYPA lifts
+    it and reads the file exactly as the flat form before it, in both corners."""
+    pdn = copy.deepcopy(PDN)
+    pdn["ambient_max_c"] = 55
+    pdn["via_plating"] = {"through_um": 25, "blind_um": 20, "buried_um": 13, "microvia_um": 12,
+                          "basis": "user"}
+    nested = _nest_details(pdn, REVISION_21_GROUPS)
+    assert "ambient_max_c" not in nested and nested["details"]["temp"]["ambient_max_c"] == 55
+    for corner in ("typ", "max"):
+        assert TomachiePdn(copy.deepcopy(nested), corner).parameters() ==             TomachiePdn(copy.deepcopy(pdn), corner).parameters()
+    assert ambient_max_c(nested) == 55
+    assert via_plating_mm(nested)["plating_thickness_mm"] == pytest.approx(0.025)
