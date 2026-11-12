@@ -1084,7 +1084,7 @@ REVISION_21_GROUPS = {"via_plating": "process", "ambient_max_c": "temp",
                       "total_current_max": "worst_case", "total_max_complete": "worst_case",
                       "loads_without_max_current": "worst_case", "die_supplies": "die",
                       "copper_margin": "margin", "datasheet_currents": "datasheet",
-                      "ac": "ac", "esl": "esl", "dc_bias": "dc_bias"}
+                      "ac": "ac", "esl": "ac", "dc_bias": "ac"}
 
 
 def test_a_revision_21_file_reads_as_its_flat_form_did():

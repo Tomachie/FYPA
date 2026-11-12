@@ -32,8 +32,8 @@ class PdnImportError(ValueError):
 
 def hoist_details(node):
     """``node`` with every ``details`` object's groups lifted beside it (pdn.json revision
-    21: what a DC import need not read - die, worst_case, margin, datasheet, ac, esl,
-    dc_bias, process, temp - sits under one ``details`` object per level). FYPA wants
+    21: what a DC import need not read - die, worst_case, margin, datasheet, ac (with esl
+    and dc_bias), process, temp - sits under one ``details`` object per level). FYPA wants
     those groups, so it reads the file as if they were flat; a key already present beside
     ``details`` is kept. Files written before revision 21 come back unchanged."""
     if isinstance(node, list):
