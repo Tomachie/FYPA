@@ -30,26 +30,6 @@ class PdnImportError(ValueError):
     pass
 
 
-def hoist_details(node):
-    """``node`` with every ``details`` object's groups lifted beside it (pdn.json revision
-    21: what a DC import need not read - die, worst_case, margin, datasheet, ac (with esl
-    and dc_bias), process, temp - sits under one ``details`` object per level). FYPA wants
-    those groups, so it reads the file as if they were flat; a key already present beside
-    ``details`` is kept. Files written before revision 21 come back unchanged."""
-    if isinstance(node, list):
-        return [hoist_details(x) for x in node]
-    if not isinstance(node, dict):
-        return node
-    out = {k: hoist_details(v) for k, v in node.items() if k != "details"}
-    details = node.get("details")
-    if isinstance(details, dict):
-        for group in details.values():
-            if isinstance(group, dict):
-                for k, v in group.items():
-                    out.setdefault(k, hoist_details(v))
-    return out
-
-
 def without_bypass_diodes(parts: list) -> list:
     """``parts`` (an ``output_path``, ``series_from_parent`` or ``input_filter`` list) with
     a diode dropped wherever another part spans the same two nets beside it. Such a diode
@@ -282,7 +262,7 @@ class _Channels:
 
 class TomachiePdn:
     def __init__(self, pdn: dict, corner: str = "typ"):
-        pdn = hoist_details(pdn)            # revision 21 details, read as flat
+        # The flat power tree only: a ``details`` object (revision 21) is not read.
         if isinstance(pdn, dict):
             pdn = drop_bypass_diodes(pdn)   # a diode beside a fuse carries none of the current
         if pdn.get("schema") != SCHEMA or pdn.get("schema_version") != SCHEMA_VERSION:
@@ -1263,7 +1243,7 @@ class TomachiePdn:
 
 
 def ambient_max_c(pdn: dict) -> float | None:
-    return _number(hoist_details(pdn).get("ambient_max_c")) if isinstance(pdn, dict) else None
+    return _number(pdn.get("ambient_max_c")) if isinstance(pdn, dict) else None
 
 
 def read_pdn_ambient(path) -> float | None:
@@ -1278,7 +1258,7 @@ _VIA_PLATING = {"through_um": "plating_thickness_mm", "blind_um": "plating_blind
 def via_plating_mm(pdn: dict) -> dict[str, float]:
     """The via barrel plating the file states, as SolveSettings fields in mm ({} = none):
     no board file carries it, so Tomachie writes the IPC-6012 class it assumes."""
-    vp = hoist_details(pdn).get("via_plating") if isinstance(pdn, dict) else None
+    vp = pdn.get("via_plating") if isinstance(pdn, dict) else None
     if not isinstance(vp, dict):
         return {}
     out = {}

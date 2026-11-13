@@ -1087,19 +1087,20 @@ REVISION_21_GROUPS = {"via_plating": "process", "ambient_max_c": "temp",
                       "ac": "ac", "esl": "ac", "dc_bias": "ac"}
 
 
-def test_a_revision_21_file_reads_as_its_flat_form_did():
-    """What a DC import need not read sits under ``details`` from revision 21; FYPA lifts
-    it and reads the file exactly as the flat form before it, in both corners."""
+def test_a_revision_21_file_reads_its_flat_power_tree_only():
+    """From revision 21 a file may carry ``details`` objects; FYPA does not read them and
+    imports the file exactly as the same file without them, in both corners."""
     pdn = copy.deepcopy(PDN)
     pdn["ambient_max_c"] = 55
     pdn["via_plating"] = {"through_um": 25, "blind_um": 20, "buried_um": 13, "microvia_um": 12,
                           "basis": "user"}
     nested = _nest_details(pdn, REVISION_21_GROUPS)
     assert "ambient_max_c" not in nested and nested["details"]["temp"]["ambient_max_c"] == 55
+    bare = {k: v for k, v in pdn.items() if k not in ("ambient_max_c", "via_plating")}
     for corner in ("typ", "max"):
-        assert TomachiePdn(copy.deepcopy(nested), corner).parameters() ==             TomachiePdn(copy.deepcopy(pdn), corner).parameters()
-    assert ambient_max_c(nested) == 55
-    assert via_plating_mm(nested)["plating_thickness_mm"] == pytest.approx(0.025)
+        assert TomachiePdn(copy.deepcopy(nested), corner).parameters() ==             TomachiePdn(copy.deepcopy(bare), corner).parameters()
+    assert ambient_max_c(nested) is None
+    assert ambient_max_c(pdn) == 55
 
 
 def test_a_diode_beside_the_fuse_is_a_bypass_and_is_not_placed():
