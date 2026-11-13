@@ -610,7 +610,7 @@ def test_a_series_diode_carries_its_forward_drop():
     """A series diode is a SERIES with PDN_VF from its datasheet, not a 1 mOhm bridge; the
     worst-case corner takes the maximum. With no forward voltage it stays bridged, said."""
     pdn = copy.deepcopy(PDN)
-    diode = {"refdes": "D1", "class": "diode", "net_in": "+3V3", "net_out": "+3V3A",
+    diode = {"refdes": "D1", "class": "diode", "net_in": "+3V3A", "net_out": "+3V3A_D",
              "resistance_ohm": "unknown",
              "datasheet_figures": [{"spec": "vf", "typ": "0.40", "unit": "V", "if": "1A"},
                                    {"spec": "vf", "typ": "0.50", "unit": "V", "if": "3A"},
@@ -713,7 +713,7 @@ def test_a_series_diode_with_a_vf_curve_is_fitted_on_it():
     """The 25 C curve, a line through its points above a tenth of its highest current."""
     pdn = copy.deepcopy(PDN)
     pdn["rails"][2]["series_from_parent"].append({
-        "refdes": "D1", "class": "diode", "net_in": "+3V3", "net_out": "+3V3A",
+        "refdes": "D1", "class": "diode", "net_in": "+3V3A", "net_out": "+3V3A_D",
         "resistance_ohm": "unknown", "datasheet_figures": [],
         "vf_curves": [{"label": "TJ=125C", "points": [[0.1, 0.20], [1, 0.30], [3, 0.40]]},
                       {"label": "TJ=25C", "points": [[0.01, 0.15], [0.5, 0.375], [1, 0.40],
@@ -1100,3 +1100,25 @@ def test_a_revision_21_file_reads_as_its_flat_form_did():
         assert TomachiePdn(copy.deepcopy(nested), corner).parameters() ==             TomachiePdn(copy.deepcopy(pdn), corner).parameters()
     assert ambient_max_c(nested) == 55
     assert via_plating_mm(nested)["plating_thickness_mm"] == pytest.approx(0.025)
+
+
+def test_a_diode_beside_the_fuse_is_a_bypass_and_is_not_placed():
+    """cm4-robo-controller D29 sits across the motor fuse F1, anode on V_MOTOR: a
+    regeneration path, reverse-biased for the supply current. Files before Tomachie 5.210
+    list it in the output_path beside F1; placed as a SERIES element it shared the motors'
+    6.1 A (a user, 2026-11-12: 3.67 W, 253 C). Only F1 is placed; a diode alone between
+    two nets is still the path."""
+    pdn = copy.deepcopy(PDN)
+    src = pdn["rails"][0]["source"]
+    src["output_net"], src["output_path"] = "PRE", [
+        {"refdes": "D29", "class": "diode", "net_in": "PRE", "net_out": "VBUS",
+         "forward_voltage": {"typ": 0.7, "unit": "V"}},
+        {"refdes": "F1", "class": "fuse", "net_in": "PRE", "net_out": "VBUS",
+         "resistance_ohm": 0.01}]
+    p, _ = TomachiePdn(copy.deepcopy(pdn)).parameters()
+    assert "F1" in p and "D29" not in p
+    src["output_path"] = src["output_path"][:1]
+    p, _ = TomachiePdn(copy.deepcopy(pdn)).parameters()
+    assert "D29" in p
+    from fypa.tomachie_pdn import without_bypass_diodes
+    assert without_bypass_diodes([]) == []

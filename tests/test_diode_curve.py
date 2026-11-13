@@ -165,7 +165,7 @@ def test_the_series_directive_carries_the_curve():
 def test_the_reader_writes_the_curve_lifted_in_the_worst_case():
     pdn = copy.deepcopy(PDN)
     pdn["rails"][2]["series_from_parent"].append({
-        "refdes": "D1", "class": "diode", "net_in": "+3V3", "net_out": "+3V3A",
+        "refdes": "D1", "class": "diode", "net_in": "+3V3A", "net_out": "+3V3A_D",
         "resistance_ohm": "unknown",
         "datasheet_figures": [{"spec": "v_forward", "max": "0.85", "unit": "V",
                                "if": "5A"}],

@@ -50,6 +50,42 @@ def hoist_details(node):
     return out
 
 
+def without_bypass_diodes(parts: list) -> list:
+    """``parts`` (an ``output_path``, ``series_from_parent`` or ``input_filter`` list) with
+    a diode dropped wherever another part spans the same two nets beside it. Such a diode
+    is a bypass for the other direction - cm4-robo-controller D29 across the motor fuse
+    F1, anode on V_MOTOR, a regeneration path - reverse-biased for the supply current and
+    carrying none of it. Placed as a SERIES element in parallel with the fuse it would
+    share the motors' current (a user, 2026-11-12: 6.1 A through it, 3.67 W, 253 C). A
+    diode alone between two nets is the path and stays. Files written by Tomachie
+    5.210 and later no longer list the bypass; earlier files do."""
+    if not isinstance(parts, list):
+        return parts
+    spans = {}
+    for e in parts:
+        if isinstance(e, dict) and e.get("net_in") and e.get("net_out"):
+            key = frozenset((e["net_in"], e["net_out"]))
+            if e.get("class") != "diode":
+                spans[key] = e.get("refdes")
+    return [e for e in parts
+            if not (isinstance(e, dict) and e.get("class") == "diode"
+                    and frozenset((e.get("net_in"), e.get("net_out"))) in spans)]
+
+
+def drop_bypass_diodes(pdn: dict) -> dict:
+    """``pdn`` with every series list passed through :func:`without_bypass_diodes`."""
+    for r in pdn.get("rails") or []:
+        if isinstance(r.get("series_from_parent"), list):
+            r["series_from_parent"] = without_bypass_diodes(r["series_from_parent"])
+        src = r.get("source")
+        if isinstance(src, dict) and isinstance(src.get("output_path"), list):
+            src["output_path"] = without_bypass_diodes(src["output_path"])
+        for l in r.get("loads") or []:
+            if isinstance(l, dict) and isinstance(l.get("input_filter"), list):
+                l["input_filter"] = without_bypass_diodes(l["input_filter"])
+    return pdn
+
+
 def _number(v) -> float | None:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
@@ -247,6 +283,8 @@ class _Channels:
 class TomachiePdn:
     def __init__(self, pdn: dict, corner: str = "typ"):
         pdn = hoist_details(pdn)            # revision 21 details, read as flat
+        if isinstance(pdn, dict):
+            pdn = drop_bypass_diodes(pdn)   # a diode beside a fuse carries none of the current
         if pdn.get("schema") != SCHEMA or pdn.get("schema_version") != SCHEMA_VERSION:
             raise PdnImportError(f"Not a {SCHEMA} version {SCHEMA_VERSION} file")
         if corner not in ("typ", "max"):
